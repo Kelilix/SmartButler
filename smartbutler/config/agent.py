@@ -28,7 +28,9 @@ class AgentSettings(BaseSettings):
     )
 
     # Agent 通用运行时参数
-    default_timeout: float = Field(default=60.0, gt=0.0, description="Agent.handle() 默认超时（秒）")
+    default_timeout: float = Field(
+        default=60.0, gt=0.0, description="Agent.handle() 默认超时（秒）"
+    )
     default_max_retries: int = Field(default=3, ge=0, description="Agent 失败重试次数")
     max_concurrent_agents: int = Field(default=8, gt=0, description="并发 Agent 数上限")
 
