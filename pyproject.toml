@@ -18,6 +18,7 @@ dependencies = [
     "pydantic>=2.6,<3.0",
     "pydantic-settings>=2.2,<3.0",
     "structlog>=24.1,<25.0",
+    "httpx>=0.27,<1.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +27,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
     "mypy>=1.10",
+    "respx>=0.21,<1.0",
 ]
 all = []
 
@@ -67,3 +69,7 @@ addopts = "-ra -q --strict-markers"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["."]
+markers = [
+    "integration: end-to-end tests that hit external services (skipped by default; opt-in via -m integration)",
+    "e2e: end-to-end streaming/connectivity tests against live LLM APIs (skipped by default; opt-in via -m e2e)",
+]
