@@ -19,6 +19,12 @@ dependencies = [
     "pydantic-settings>=2.2,<3.0",
     "structlog>=24.1,<25.0",
     "httpx>=0.27,<1.0",
+    # Phase 1.5: LangChain LLM 适配器依赖。
+    # langchain-core: BaseChatModel / 消息类型 / 工具绑定抽象。
+    # langchain-openai: ChatOpenAI 实现,DeepSeek / Qwen / OpenRouter 等
+    #                  OpenAI 兼容协议厂商均可复用该类（通过 base_url 切换）。
+    "langchain-core>=0.3,<1.0",
+    "langchain-openai>=0.3,<1.0",
 ]
 
 [project.optional-dependencies]

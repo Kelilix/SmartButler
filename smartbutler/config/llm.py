@@ -34,6 +34,14 @@ class LLMSettings(BaseSettings):
         default="openai",
         description="LLM 厂商标识：openai / anthropic / ollama / ...",
     )
+    backend: str = Field(
+        default="http",
+        description=(
+            "LLM 实现后端：http（自建 httpx 直调）/ langchain（包装 langchain-openai 的 ChatOpenAI）。"
+            "默认 http 保留原有行为；切到 langchain 后由 LangChain 负责协议适配、流式"
+            "tool_calls、reasoning content 透传、structured output 等场景。"
+        ),
+    )
     model: str = Field(
         default="gpt-4o-mini",
         description="provider 下的具体模型名",
