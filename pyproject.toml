@@ -79,6 +79,11 @@ addopts = "-ra -q --strict-markers"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["."]
+# TestTimeAgent 这个名字 (以 Test 开头) 是有意义的产品命名 —— "Test" 表示脚手架。
+# pytest 默认会把它当成 test class 收集,但它不是测试,抑制这条警告。
+filterwarnings = [
+    "ignore:cannot collect test class:pytest.PytestCollectionWarning",
+]
 markers = [
     "integration: end-to-end tests that hit external services (skipped by default; opt-in via -m integration)",
     "e2e: end-to-end streaming/connectivity tests against live LLM APIs (skipped by default; opt-in via -m e2e)",

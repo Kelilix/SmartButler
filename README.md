@@ -13,13 +13,14 @@
 | `smartbutler/capabilities/llm/` | ✅ 能力层（LLM 双后端） | BaseLLM 抽象 + **两个可切换实现**：① `OpenAICompatibleLLM`（httpx 直调，**默认 backend**）；② `LangChainLLMAdapter`（包装 `langchain-openai.ChatOpenAI`，env 切 `backend=langchain` 启用）。覆盖 DeepSeek/Qwen/OpenRouter/Azure 兼容模式。**已实测端到端连通**（chat / stream / tool_calls 三个 e2e 用例通过，且 60→84 个单测全绿） |
 | `smartbutler/capabilities/tools/` | ✅ 已完成 | BaseTool + ToolRegistry + Decorator + LangChain Adapter + 2 个 common tool（`get_current_time` / `web_fetch`）；92 单测全绿 |
 | `smartbutler/capabilities/memory/` | ⏳ 待开发 | 远期：长期记忆存储与检索 |
-| `smartbutler/agents/` | ⏳ 待开发 | **Phase 3**：BaseAgent + AgentManager + 示例 SubAgent（详见 TECHNICAL_DESIGN §3.2.3 + ADR-005） |
+| `smartbutler/agents/` | ✅ 已完成 | **Phase 3**：BaseAgent + AgentManager + `TestTimeAgent`（注册 `get_current_time` 全局 tool，验证 Sub-Agent→BaseTool 路径）；`to_langchain_tool()` 暴露 `delegate_to_test_time_agent`；最小 LLM 循环（decide → tool → 收集，最多 5 轮）+ 失败回流到 LLM + 重试/超时。**40 agent 单测全绿 + 1 集成测试**（默认 skip，`-m integration` 启用） | ADR-005 |
 | `smartbutler/skills/` | ⏳ 待开发 | **Phase 5**：Anthropic Skills loader，SKILL.md → 能力包（详见 §3.2.6 + ADR-006/007） |
 | `smartbutler/thinking/` | ⏳ 待开发 | **Phase 4**：LangGraph Loop + Supervisor（StateGraph + ToolNode） |
-| `smartbutler/emotion/` | ⏳ 待开发 | Personality / Memory |
+| `smartbutler/emotion/` | ⏳ 待开发 | **Phase 6**：Personality + Memory |
+| `smartbutler/core_sub_agents/` | ⏳ 待开发 | **Phase 3.5**：核心业务 Sub-Agent（HomeAgent + HomeAssistant 接入 / ScheduleAgent / SearchAgent 等）。仅 Phase 4 + 真实 HomeAssistant 环境就绪后启动；具体技术方案到时再定 | - |
 | `smartbutler/interface/` | ⏳ 待开发 | HTTP / WebSocket / CLI / MCP |
 
-**测试统计**：176 单元测试 + 3 集成测试 + 5 e2e 流式测试（默认 skip，需 `pytest -m integration` / `-m e2e` 启用）
+**测试统计**：201 单元测试（其中 40 个 Phase 3 agent 测试）+ 2 集成测试 + 5 e2e 流式测试（默认 skip，需 `pytest -m integration` / `-m e2e` 启用）
 
 ## 架构约束（实现时必须遵守）
 
@@ -112,9 +113,10 @@ SMARTBUTLER_LLM_BACKEND=langchain
 ```
 用户消息 → LangGraph Loop (管家 LLM 推理)
               ↓ 工具集
-              ├─ delegate_to_home_agent  → HomeAgent (Haiku)
-              ├─ delegate_to_schedule_agent → ScheduleAgent (Haiku)
-              ├─ delegate_to_search_agent → SearchAgent (Haiku)
+              ├─ delegate_to_test_time_agent → TestTimeAgent (Phase 3)
+              ├─ delegate_to_home_agent  → HomeAgent (Phase 3.5,Haiku)
+              ├─ delegate_to_schedule_agent → ScheduleAgent (Phase 3.5,Haiku)
+              ├─ delegate_to_search_agent → SearchAgent (Phase 3.5,Haiku)
               ├─ pdf_extract (Skill 工具，管家直接调)
               ├─ get_today_digest (管家元工具)
               └─ ... (其他 Skill 工具,管家直接调)

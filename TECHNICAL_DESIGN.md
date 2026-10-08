@@ -84,8 +84,9 @@ SmartButler（大管家）是一个**通用智能体**，旨在为用户提供�
 |------|------|------|----------|----------|
 | **Phase 1** | 基础设施 + LLM | ✅ 已完成 | Pydantic Settings / structlog / BaseStorage / BaseLLM（双后端） | ADR-003 |
 | **Phase 2** | Tool 能力层 | ⏳ **当前** | BaseTool + ToolRegistry + Decorator + LangChain Adapter | ADR-002 |
-| **Phase 3** | Sub-Agent 层 | ⏳ | BaseAgent + AgentManager + 1 个示例 SubAgent（Home）+ Butler 骨架 | ADR-005 |
-| **Phase 4** | LangGraph Loop + Supervisor | ⏳ | StateGraph + ToolNode + Checkpointer + Skill Prompt 注入 | ADR-005 |
+| **Phase 3** | Sub-Agent 层 | ✅ 已完成 | BaseAgent + AgentManager + `TestTimeAgent` 示例（注册 capabilities 已有 tool，0 失败） | ADR-005 |
+| **Phase 3.5** | 核心 Sub-Agent 落地 | ⏳ 待开发 | HomeAgent（接入 HomeAssistant）/ ScheduleAgent / SearchAgent 等。仅 Phase 4 + HomeAssistant 环境就绪后启动；具体技术方案到时再定 | - |
+| **Phase 4** | LangGraph Loop + Supervisor | ⏳ 待开发 | StateGraph + ToolNode + Checkpointer + Skill Prompt 注入 | ADR-005 |
 | **Phase 5** | Anthropic Skills loader | ⏳ | SKILL.md → 能力包 → 注入 Butler system prompt + 注册 tools | ADR-006 / ADR-007 |
 | **Phase 6** | 情感层 | ⏳ | Personality + Memory | - |
 | **Phase 7** | 多模态感知 | ⏳ | ASR + TTS + Vision | - |
