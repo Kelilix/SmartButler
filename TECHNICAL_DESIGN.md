@@ -86,9 +86,10 @@ SmartButler（大管家）是一个**通用智能体**，旨在为用户提供�
 | **Phase 2** | Tool 能力层 | ⏳ **当前** | BaseTool + ToolRegistry + Decorator + LangChain Adapter | ADR-002 |
 | **Phase 3** | Sub-Agent 层 | ✅ 已完成 | BaseAgent + AgentManager + `TestTimeAgent` 示例（注册 capabilities 已有 tool，0 失败） | ADR-005 |
 | **Phase 4** | LangGraph Loop + Supervisor | ✅ 已完成 | StateGraph + ToolNode + Checkpointer + Skill Prompt 注入 | ADR-005 |
-| **Phase 5** | Anthropic Skills loader | ⏳ | SKILL.md → 能力包 → 注入 Butler system prompt + 注册 tools | ADR-006 / ADR-007 |
+| **Phase 5** | Anthropic Skills loader + ProactiveLoop 框架 | ⏳ | SKILL.md → 能力包 → 注入 Butler system prompt + 注册 tools；**+ ProactiveLoop 框架**（ProactiveReasoning **降级后备** + 沉默支持 + 最小可用场景）| ADR-006 / ADR-007 / **ADR-009** |
 | **Phase 6** | 情感层 | ⏳ | Personality + Memory | - |
-| **Phase 7** | 事件驱动（被动触发） | 🆕 **当前** | 事件总线 + 设备接入协议 + EventNormalizer + EventTrigger + AnswerRouter（**只放协议 + 抽象接口，Phase 4-6 阶段 0 行实现**）| ADR-008 |
+| **Phase 6b** | ProactiveLoop 真实化 | ⏳ **待 Phase 6 完成** | 降级后备 → LLM 综合判断 + 读 Memory + 读 Persona + dedup；**降级后备永久保留** | **ADR-009** |
+| **Phase 7** | 事件驱动（被动触发）+ Proactive 路由 | 🆕 **当前** | 事件总线 + 设备接入协议 + EventNormalizer + **EventTrigger.route()**（**显式路由**到 Reactive/Proactive） + AnswerRouter（**只放协议 + 抽象接口，Phase 5-6 阶段 0 行实现**）| ADR-008 / **ADR-009** |
 | **Phase 8** | 核心业务 Sub-Agent | ⏳ | HomeAgent（接入 HomeAssistant）/ ScheduleAgent / SearchAgent 等。**与事件驱动联动**：HomeAgent 通过 EventBus 订阅 `device.*` 主题。仅 Phase 7 + 真实 HomeAssistant 环境就绪后启动；具体技术方案到时再定 | - |
 | **Phase 9** | 多模态感知 | ⏳ | ASR + TTS + Vision（原 Phase 7 顺延）| - |
 | **Phase 10** | 主动服务 | ⏳ | 摄像头 / 麦克风监听 / 计划任务（**与 Phase 7 事件总线联动**）| - |
@@ -337,8 +338,18 @@ SmartButler/
 │   │   └── memory/                    # 记忆系统（短期、长期、情景、语义、检索、持久化）
 │   │
 │   ├── thinking/                      # 思考层：核心认知与决策
-│   │   ├── loop/                      # LangGraph 循环编排（图定义、状态、节点、检查点）
-│   │   │   └── nodes/                 # 循环节点（评估/决策/执行/收集/回复）
+│   │   ├── loop/                      # 循环编排（Reactive + Proactive 双循环）
+│   │   │   ├── reactive/              # ReactiveLoop（Phase 4 已有）:用户驱动
+│   │   │   ├── proactive/             # ProactiveLoop（Phase 5+）:事件驱动
+│   │   │   ├── base.py                # BaseLoop 抽象(共享 ReAct 模式)
+│   │   │   ├── graph.py               # LangGraph StateGraph(Reactive 专用)
+│   │   │   ├── state.py               # ButlerState Schema
+│   │   │   ├── nodes/                 # 业务节点(decide / ToolNode)
+│   │   │   └── orchestrator.py        # ButlerOrchestrator 双入口
+│   │   ├── proactive/                 # 🆕 主动专属逻辑
+│   │   │   ├── reasoning.py           # ProactiveReasoning:该不该主动
+│   │   │   ├── decision.py            # ProactiveDecision / ProactiveResult 模型
+│   │   │   └── triggers.py            # 触发条件配置
 │   │   ├── reasoning/                 # 推理业务（任务规划、任务分解、反思）
 │   │   ├── decision/                  # 决策业务（意图识别、路由选择）
 │   │   ├── prompt/                    # Prompt 工程（构造、组装、模板）
@@ -464,14 +475,25 @@ class AgentManager:
 
 #### 3.2.5 思考层 (thinking/)
 
+> **核心结构（Phase 5+）**：`thinking/loop/` 下有**两条并列循环**——
+> `ReactiveLoop`（用户驱动，Phase 4 已有）和 `ProactiveLoop`（事件驱动，Phase 5+ 新建）。
+> 两条循环**共享** `thinking/reasoning/` `thinking/decision/` `thinking/memory_access/` `thinking/prompt/` `thinking/context/` 的能力
+> ——**不重复造轮子**。详见 §5.9（ADR-009）。
+
 | 模块 | 职责 |
 |------|------|
-| **loop/graph** | LangGraph 图定义，编排整个 Agent 循环（StateGraph + ToolNode + Checkpointer） |
-| **loop/state** | State Schema 定义，描述循环中流转的状态结构（MessagesState 派生） |
-| **loop/nodes/decide** | 决策节点：LLM 推理 + 决定调 tool 或直接回复 |
-| **loop/nodes/tools** | ToolNode：LangGraph 原生工具执行节点（Sub-Agent `delegate_to_xxx` + 普通 Tool） |
+| **loop/reactive/** | `ReactiveLoop`：用户输入驱动的 ReAct 循环；用户问 → 管家思考 → 调 tool → 答用户（**永远不沉默**）|
+| **loop/proactive/** | `ProactiveLoop`（🆕）：事件/状态驱动循环；管家观察 → 触发判断 → 沉默/主动推送（**支持沉默**）|
+| **loop/base** | `BaseLoop` 抽象类（🆕）：两条循环共享 ReAct 模式的最小契约（run / should_run / get_tools）|
+| **loop/graph** | LangGraph `StateGraph` + `ToolNode` + `InMemorySaver`（**Reactive 专用**）|
+| **loop/state** | `ButlerState` Schema：`messages / user_id / session_id / parent_agent / iteration_count / max_iterations / skill_prompt_snippets` |
+| **loop/nodes/decide** | 决策节点：LLM 推理 + 决定调 tool 或直接回复（Reactive 唯一业务节点）|
+| **loop/nodes/tools** | ToolNode：LangGraph 原生工具执行节点（Sub-Agent `delegate_to_xxx` + 普通 Tool）|
 | **loop/skill_injector** | Skill Prompt 注入器：把加载的 Skills 的 `system_prompt` 片段拼接到管家 system prompt |
-| **reasoning/planner** | 任务规划，将复杂任务拆解为可执行的子任务 |
+| **loop/orchestrator** | `ButlerOrchestrator` 双入口：`ainvoke(user_msg)` Reactive + `proactive_tick(event)` Proactive |
+| **proactive/reasoning** | `ProactiveReasoning`（🆕）：判断"该不该主动开口"——查 memory / persona / event urgency（**Phase 5 占位，Phase 6 接真实数据**）|
+| **proactive/decision** | `ProactiveDecision` / `ProactiveResult` Pydantic 模型（🆕）|
+| **proactive/triggers** | 触发条件配置（🆕）：哪些 event.source 走 Proactive |
 | **reasoning/reflector** | 反思器，检查执行结果是否正确 |
 | **prompt/builder** | Prompt 构造器，组装各种组件生成最终 Prompt |
 | **prompt/templates** | Prompt 模板库 |
@@ -1064,6 +1086,11 @@ When NOT to use: 反例（避免误触发）。
 
 ### 5.8 事件驱动架构（ADR-008，Phase 7）
 
+> **修订（2026-10-08）**：原 §5.8 "复用 ainvoke + parent_agent 路由"方案**已废弃**。
+> 替换为 **Proactive / Reactive 双循环架构**（详见 §5.9 / `smartbutler/thinking/ADR-009-proactive-reactive-dual-loop.md`）。
+> 本节保留**事件协议**与**总线选型**——这两部分不受双循环改动影响。
+> 路由部分请直接看 §5.9。
+
 #### 5.8.1 背景
 
 SmartButler 当前只支持**主动调用模式**（用户发请求 → 管家回答）。
@@ -1074,18 +1101,18 @@ SmartButler 当前只支持**主动调用模式**（用户发请求 → 管家�
 - 早晨 7 点 → 管家主动叫人起床
 - 烟雾报警 → 管家紧急通知
 
-#### 5.8.2 核心决策
+#### 5.8.2 核心决策（保留部分）
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
 | 触发模式 | **事件驱动**（不轮询） | 100 个设备时轮询 100 QPS，事件驱动 0 QPS |
 | 事件总线 | **Redis Streams** | smartbutler/storage/redis_backend.py 已有基础；轻量；ACK；可回放 |
-| 管家调用 | **复用 ainvoke** | 一行不改 ButlerOrchestrator 主体；只改 return type 为 ButlerResponse |
-| parent_agent 协议 | **`trigger:<source>.<subtype>`** | LLM 通过这个字段知道"我是被事件叫起的，不是人在说话" |
 | 归一化 | **EventNormalizer 必走** | 不归一化直接喂 LLM = 事件风暴把管家打挂 |
 | 触发模式工具白名单 | **只读工具** | 禁止写操作（避免"事件→管家→写设备→又发事件"循环）|
 
-#### 5.8.3 与现有架构的关系
+#### 5.8.3 ❌ 废弃的"复用 ainvoke"方案
+
+原方案：
 
 ```
 events/ (Phase 7)
@@ -1097,52 +1124,423 @@ events/ (Phase 7)
     └──► interface/       HTTP/WebSocket 用户入口        ← 共存,事件走事件口
 ```
 
-**唯一对现有代码的侵入**：
+**问题**：
 
-```python
-# Phase 7.2 改造点
-# 当前 (Phase 4):
-async def ainvoke(...) -> str:                              # 只返 string
+1. **语义错位**：把"事件触发"伪装成"用户消息"——ainvoke 假设有 user_input，事件触发常常没用户
+2. **沉默困难**：ainvoke 永远不沉默，但 Proactive 70%+ 应该沉默
+3. **路由不灵活**：ainvoke 走 HTTP/WebSocket 入口，但事件应该走 AnswerRouter
+4. **parent_agent 字段双重职责**：既是路由依据又是信息字段——混了
 
-# Phase 7.2 改造:
-class ButlerResponse(TypedDict):
-    answer: str
-    target_device: str
-    priority: str
+#### 5.8.4 ✅ 替代方案
 
-async def ainvoke(...) -> ButlerResponse:                   # 返结构
+**ButlerOrchestrator 双入口 + EventTrigger 显式路由**：
+
 ```
+events/ (Phase 7)
+    │
+    ├──► EventTrigger.route(event)              ← 🆕 显式路由
+    │       │
+    │       ├── source == user  →  ReactiveLoop.ainvoke(msg)
+    │       └── source == *     →  ProactiveLoop.tick(event)
+    │
+    ├──► ReactiveLoop   ← Phase 4 已有,一行不改
+    │
+    ├──► ProactiveLoop  ← 🆕 Phase 5 新建,ADR-009
+    │
+    └──► AnswerRouter   ← 主动推送渠道(音响/手机/邮件)
+```
+
+**对现有代码的侵入**：
+
+| 文件 | 改动 |
+|------|------|
+| `ButlerOrchestrator.ainvoke()` | **不改**（保持 `-> str`）|
+| `ButlerOrchestrator.proactive_tick()` | **新增**（`-> ProactiveResult`）|
+| `EventTrigger.handle()` | **改**为 `route()` 方法 + 双分支 |
 
 **主体循环逻辑 / decide 节点 / ToolNode / Checkpointer 一行不动**。
 
-#### 5.8.4 Phase 7 子阶段
+#### 5.8.5 Phase 7 子阶段（修订后）
 
-| 子阶段 | 内容 | 工作量 |
-|--------|------|--------|
-| 7.0 | 协议 + 抽象接口（已落库）| ✅ 已完成 |
-| 7.1 | EventNormalizer + 简单 dedup | 1 周 |
-| 7.2 | ainvoke 返 ButlerResponse | 1 天 |
-| 7.3 | Redis Streams EventBus 实现 | 1 周 |
-| 7.4 | HomeAssistant DeviceAdapter | 2 周 |
-| 7.5 | PresenceService + AnswerRouter | 2 周 |
-| 7.6 | 端到端测试 + 误触发兜底 | 1 周 |
+| 子阶段 | 内容 | 工作量 | 状态 |
+|--------|------|--------|------|
+| 7.0 | 协议 + 抽象接口 | ✅ 已完成 | 落库 |
+| 7.1 | EventNormalizer + 简单 dedup | 1 周 | 待启动 |
+| 7.2 | EventTrigger.route() 实现 | 1 天 | 待启动 |
+| 7.3 | ProactiveLoop 框架（**降级后备** reasoning） | 1 周 | 🆕 与 7.1 并行 |
+| 7.4 | ReactiveLoop → ProactiveLoop 内部通道 | 2 天 | 🆕 |
+| 7.5 | Redis Streams EventBus 实现 | 1 周 | 待启动 |
+| 7.6 | HomeAssistant DeviceAdapter | 2 周 | 待启动 |
+| 7.7 | PresenceService + AnswerRouter | 2 周 | 待启动 |
+| 7.8 | 端到端测试 + 误触发兜底 | 1 周 | 待启动 |
 
-**总计 8 周**。**不是 1 天**。
+**总计 ~8 周**。**不是 1 天**。
 
-#### 5.8.5 不变量
+#### 5.8.6 不变量
 
-1. ButlerOrchestrator 主体只在 Phase 7.2 改 return type,**不改逻辑**
-2. 事件触发不绕过 EventNormalizer
-3. parent_agent 协议一旦敲定**不修改**
-4. 写操作工具不暴露给 trigger 模式
+1. **`ainvoke(user_msg) -> str` 签名不变**——所有现有 e2e 测试零修改
+2. `proactive_tick(event) -> ProactiveResult` 是新方法——不替代 ainvoke
+3. 事件触发不绕过 EventNormalizer
+4. parent_agent 协议**保留**（`trigger:<source>.<subtype>`），但**不再作为路由依据**
+5. 写操作工具不暴露给 Proactive 触发的工具
 
-#### 5.8.6 完整 ADR
+#### 5.8.7 完整 ADR
 
-详见 `smartbutler/events/ADR-008-event-driven.md`。
+详见：
+- `smartbutler/events/ADR-008-event-driven.md`（事件协议 + 总线，本节保留）
+- `smartbutler/thinking/ADR-009-proactive-reactive-dual-loop.md`（🆕 双循环架构，替代本节原路由方案）
 
 ---
 
+### 5.9 Proactive / Reactive 双循环架构（ADR-009，Phase 5+）
 
+#### 5.9.1 背景
+
+§5.8 原方案试图用 `parent_agent="trigger:..."` 字段把"事件触发"伪装成"用户消息"，
+**复用 ainvoke 入口**。这导致 4 个根本性冲突（详见 ADR-009 §1.2）：
+
+- **触发者错位**：ainvoke 假设有 user_input，事件触发常常没
+- **沉默困难**：ainvoke 永远不沉默，Proactive 70%+ 应该沉默
+- **路由不灵活**：ainvoke 走 HTTP/WebSocket，事件应走 AnswerRouter
+- **parent_agent 双重职责**：混了"路由依据"和"信息字段"
+
+#### 5.9.2 核心决策
+
+**ProactiveLoop 和 ReactiveLoop 是 `thinking/loop/` 下的两条并列循环**。
+**EventTrigger 显式路由**——不再靠 parent_agent 字段。
+
+```
+                          ┌──────────────────────────┐
+                          │   EventBus (events)      │
+                          └────────────┬─────────────┘
+                                       │
+                            EventTrigger.route(event)
+                                       │
+                          ┌────────────┴────────────┐
+                          ▼                          ▼
+              ┌────────────────────┐    ┌────────────────────────┐
+              │  ReactiveLoop      │    │  ProactiveLoop         │
+              │  (Phase 4 已有)     │    │  (Phase 5+ 新建)        │
+              │                    │    │                        │
+              │  Trigger: user     │    │  Trigger: device/timer │
+              │  Output: 答用户     │    │  Output: 主动推送/沉默  │
+              └────────────────────┘    └────────────────────────┘
+                          │                          │
+                          │ (允许内部调用)            │
+                          └──────────┬───────────────┘
+                                     ▼
+                             AnswerRouter
+                        (音响 / 推送 / 邮件)
+```
+
+> **本图与下方 §5.9.3 路由规则有 4 处旧版本残留**，统一以本节最新分层图为准。
+> 旧版错把"用户消息"也走 EventBus，再靠 `source==user` 路由回 Reactive。
+> 正确分层是：**用户消息永远不进 EventBus**——见下方 §5.9.2a "两种触发器分层"。
+
+---
+
+#### 5.9.2a 🆕 两种触发器分层（MessageIngress vs EventSource）
+
+**核心原则**：**用户消息 = Reactive 入口 = 不经过 EventBus**。
+
+EventBus 只承载"非用户来源"的事件（设备状态 / 定时器 / 唤醒 / 外部回调）。
+用户消息（文字 / 语音）由 `interface/` 层的 HTTP / WebSocket handler **直接调 `ainvoke()`**。
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Layer 1: 用户消息入口（MessageIngress）= Reactive，不经 EventBus         │
+│  位置: smartbutler/interface/                                             │
+│                                                                          │
+│   ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────┐  │
+│   │ HTTP handler         │  │ WebSocket handler    │  │ 小程序入口   │  │
+│   │ (App 文字消息)        │  │ (App 语音 / 音响)    │  │ (Phase 9)    │  │
+│   │ POST /chat/{user}    │  │ /ws/{user}           │  │              │  │
+│   └──────────┬───────────┘  └──────────┬───────────┘  └──────┬───────┘  │
+│              │                         │                     │         │
+│              └─────────────────────────┴─────────────────────┘         │
+│                                       │                                  │
+│                          orch.ainvoke(msg, user_id)  ← 直接调          │
+│                                       │                                  │
+│                                       ▼                                  │
+│                              ReactiveLoop (Phase 4 已有)                │
+│                                                                          │
+│  ✅ 跟 EventBus 无关    ✅ 跟 BaseEvent 无关                              │
+│  ❌ 不构造 EventSource  ❌ 不调 EventTrigger.route()                      │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Layer 2: 设备事件源（EventSourceAdapter）= 推 EventBus = Proactive       │
+│  位置: smartbutler/events/adapters/                                       │
+│                                                                          │
+│   ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐  │
+│   │ soundbox_    │ │ device_      │ │ timer_       │ │ webhook_     │  │
+│   │ adapter      │ │ adapter      │ │ adapter      │ │ adapter      │  │
+│   │ 音响 wakeup  │ │ 门锁/灯/空调 │ │ 定时器/闹钟  │ │ 外部回调     │  │
+│   └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘  │
+│          │                │                │                │          │
+│          └────────────────┴────────────────┴────────────────┘          │
+│                                       │                                  │
+│         BaseEvent(source=DEVICE/VOICE/TIMER/WEBHOOK, ...) 构造          │
+│                                       │                                  │
+│                          event_bus.publish(event)                        │
+│                                       │                                  │
+│                                       ▼                                  │
+│                  EventTrigger.route(event) → ProactiveLoop              │
+│                                                                          │
+│  ✅ 跟 ainvoke 无关       ❌ 不构造 user_input                            │
+│  ❌ 不返回响应给发件人     ✅ fire-and-forget                             │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**为什么"用户消息"不进 EventBus？** 因为 EventBus 上 `BaseEvent.source` 枚举只有
+`DEVICE / VOICE / TIMER / WEBHOOK`（见 `smartbutler/events/core/event.py:EventSource`），
+**没有 USER / INTERFACE**——这是设计上的有意排除。
+
+**为什么不让 EventBus 收到"用户消息"再路由回 Reactive？** 三个理由：
+
+1. **响应链路错位**：用户问"开灯"必须 1 秒内 TTS 回复，但 EventBus → ProactiveLoop →
+   AnswerRouter 链路太重，且 Proactive 70%+ 应该沉默
+2. **失败语义不同**：HTTP 失败要 500 给前端；EventBus 失败要 silent 不能骚扰
+3. **EventTrigger 失去单职责**：它本来只管"非用户事件"路由，硬塞"用户消息"会让
+   `route()` 函数的 source 枚举从 4 个变成 6 个，引入 USER/INTERFACE 两个空分支
+
+**所以 EventTrigger.route() 的真实职责只有一条**：判断 `source ∈ {DEVICE/VOICE/TIMER/WEBHOOK}`
+的事件应该走 ProactiveLoop 的哪个决策分支（沉默 / 主动）——**不判断"是不是用户消息"**。
+
+---
+
+#### 5.9.3 EventTrigger 路由规则（修订版）
+
+```python
+# smartbutler/thinking/proactive/triggers.py
+_PROACTIVE_SOURCES = frozenset({"device", "voice", "timer", "webhook"})
+
+def route(event: BaseEvent) -> LoopType:
+    # EventBus 上不出现 USER/INTERFACE 事件
+    # 用户消息走 interface/handler.py 直接 ainvoke(),不进 EventBus
+    if event.source in _PROACTIVE_SOURCES:
+        return LoopType.PROACTIVE
+    return LoopType.PROACTIVE  # 兜底:未识别 source 也走 Proactive
+```
+
+| EventSource | 路由 | 理由 |
+|---|---|---|
+| `device`（智能门锁/灯/空调/热水器/烟雾）| **Proactive** | 设备事件,无人问 |
+| `voice`（音响 wakeup 状态）| **Proactive** | 唤醒可能静默 |
+| `timer`（定时器/闹钟）| **Proactive** | 定时器触发 |
+| `webhook`（外部回调）| **Proactive** | 外部系统回调 |
+| **未识别 source** | **Proactive**（兜底）| 宁可沉默不可骚扰 |
+| `user` / `interface` | ❌ **根本不在 EventSource 枚举里** | 用户消息走 `interface/handler.py` → `ainvoke()`，**不经过 EventBus** |
+
+**修订要点（vs 旧版）**：
+
+- ❌ **删除**旧版 "user/interface → Reactive" 分支——这条是死代码，EventSource 枚举里没这两个值
+- ✅ **保留** `_PROACTIVE_SOURCES` 集合——4 个 source 全部走 Proactive
+- ✅ **新增**未识别 source 兜底——避免枚举扩展时漏路由
+
+**验证用例**（`tests/unit/proactive/test_proactive_triggers.py`）：
+
+```python
+def test_route_all_known_sources_go_proactive():
+    for source in ("device", "voice", "timer", "webhook"):
+        assert route(BaseEvent(source=source, ...)) == LoopType.PROACTIVE
+
+def test_route_unknown_source_defaults_proactive():
+    assert route(BaseEvent(source="future_source", ...)) == LoopType.PROACTIVE
+```
+
+> **架构不变量**：**用户消息永远不进 EventBus**。
+> 如果未来某个事件源的 source 字段取 "user" / "interface"，必须先在 `EventSource` 枚举里
+> 注册，**并**修改 `interface/handler.py` 让它不构造这种事件（双保险）。
+
+#### 5.9.4 ProactiveLoop 结构
+
+```python
+class ProactiveLoop:
+    """主动循环——管家自己观察、思考、决定要不要开口。"""
+
+    async def tick(self, event: BaseEvent) -> ProactiveResult:
+        # 1. 触发判断: 这事儿要不要主动说?
+        decision = await self.reasoning.should_respond(event)
+
+        if not decision.should_respond:
+            return ProactiveResult.silent()      # ← 沉默是默认
+
+        # 2. 决定说什么: 走 ReAct 拿工具
+        message = await self.react_chain.run(
+            trigger=decision,
+            event=event,
+        )
+
+        # 3. 主动推送
+        return ProactiveResult.acted(
+            message=message, urgency=decision.urgency
+        )
+```
+
+#### 5.9.5 沉默是一等公民
+
+```python
+class ProactiveResult(BaseModel):
+    acted: bool
+    message: str | None = None
+    push_channel: str | None = None
+    silence_reason: str | None = None
+
+    @classmethod
+    def silent(cls, reason: str = "default_silent") -> "ProactiveResult":
+        return cls(acted=False, silence_reason=reason)
+```
+
+**默认 70%+ 应该 silent**——"好管家话不多"。
+
+#### 5.9.6 Reactive → Proactive 内部通道
+
+Reactive 链尾**允许**调 Proactive 拿"主动建议"——但**仅在规则触发**：
+
+```python
+class ReactiveLoop:
+    async def run(self, user_msg):
+        answer = await self.react_chain.run(user_msg)
+
+        # 规则触发: 用户问"该做什么" / "吃什么" → 追加建议
+        if self._should_request_proactive(user_msg):
+            advice = await self.proactive_loop.advise(
+                context=user_msg, current_answer=answer
+            )
+            if advice:
+                return answer + advice
+        return answer
+```
+
+**判定规则**（不调 LLM——避免开销）：
+
+| 用户消息模式 | 触发 Proactive 建议 |
+|---|---|
+| "该吃/做/喝什么" / "我该做/怎么办" | ✅ |
+| "几点了" / "天气" | ❌ |
+| 其他 | ❌ |
+
+**未来升级**：Phase 6 emotion 上线后，规则可升级为 Persona 驱动判断。
+
+#### 5.9.7 共享与独占
+
+| 能力 | ReactiveLoop | ProactiveLoop |
+|------|--------------|---------------|
+| LLM 调用 / Tool / Memory / Personality / Skill | ✅ 共享 | ✅ 共享 |
+| **沉默支持** | ❌ | ✅ |
+| **主动推送路由 (AnswerRouter)** | ❌ | ✅ |
+| **触发判断 (ProactiveReasoning)** | ❌ | ✅ |
+| **写操作** | ✅ | ⚠️ 建议只读（防循环）|
+
+#### 5.9.8 现在实现 vs Phase 6b 推迟
+
+| 内容 | 现在实现 | 推迟 |
+|------|---------|------|
+| ProactiveLoop 框架 + ProactiveReasoning **降级后备** | ✅ | |
+| EventTrigger.route() | ✅ | |
+| ButlerOrchestrator.proactive_tick() 入口 | ✅ | |
+| Reactive → Proactive 内部调用（规则触发）| ✅ | |
+| 最小可用场景（定时器沉默判断）| ✅ | |
+| LLM 综合判断（查 Memory + 读 Persona + 调 LLM）| | ✅ **Phase 6b**（待 Phase 6 完成）|
+| Persona 驱动主动建议 | | ✅ **Phase 6b** |
+| 多模态感知 | | ✅ Phase 9 |
+| 真实设备接入 | | ✅ Phase 8 |
+
+**理由**：ProactiveLoop 是 ReactiveLoop 的**镜像**结构，复用现有 thinking/ 底层，
+**不依赖** emotion/memory 真实数据。Phase 6b 上线后**不重构**——只填实现，且
+**保留降级后备**作为 LLM 故障时的安全网（见架构约束 #9：降级契约）。
+
+#### 5.9.9 不变量
+
+1. **ProactiveLoop 不调 ReactiveLoop**——主动不打断自己
+2. **ReactiveLoop 可调 ProactiveLoop**——在用户对话中追加建议（规则触发，opt-in）
+3. **沉默是一等公民**——`ProactiveResult.acted=False` 必须被上游正确处理
+4. **写操作不暴露给 Proactive 触发的工具**——防"事件→管家→写设备→又发事件"循环
+5. **parent_agent 字段语义不变**——只是不再作为路由依据
+6. **两条循环共享** `thinking/reasoning/` `decision/` `memory_access/` `prompt/` `context/`
+7. **🆕 用户消息永远不进 EventBus**——`interface/handler.py` 直接调 `ainvoke()`；
+   `EventSource` 枚举里**不包含** USER/INTERFACE，从类型层面拒绝"用户消息"进 EventBus
+8. **🆕 EventTrigger.route() 只为 Proactive 服务**——不存在"路由到 Reactive"分支，
+   因为 EventBus 上根本没有 user 源事件；路由函数的单职责是"判断 4 种 Proactive source 的沉默/主动"
+9. **🆕 ProactiveReasoning 降级契约**——`RuleBasedProactiveReasoning` 是**降级后备**而非临时占位，**永不被删**。LLM 故障/timeout/key 失效时自动降级，URGENT 事件不依赖 LLM 也能主动。详见 README 架构约束 #9。
+
+#### 5.9.10 验证
+
+- [ ] `EventTrigger.route()` 单测：4 个 source 全部 → Proactive；未识别 source 兜底 Proactive
+- [ ] `EventSource` 枚举不包含 USER/INTERFACE（架构不变量 #7 单测）
+- [ ] `interface/handler.py` 单测：HTTP/WS handler 直接调 `ainvoke()`，**不构造 BaseEvent**
+- [ ] `ProactiveLoop.tick()` 单测：默认 silent；`should_respond=True` 调 react
+- [ ] `ReactiveLoop._should_request_proactive()` 单测：规则匹配
+- [ ] 1 e2e：定时器事件 → ProactiveLoop → 沉默
+- [ ] 1 e2e：定时器事件 → ProactiveLoop → 主动推送
+
+#### 5.9.11 完整 ADR
+
+详见 `smartbutler/thinking/ADR-009-proactive-reactive-dual-loop.md`。
+
+#### 5.9.12 🆕 分层设计原则（MessageIngress vs EventSource）
+
+为了让团队对"什么进 EventBus、什么走 HTTP/WS"有**单一共识**，把上一节的分层图
+抽象为 5 条设计原则：
+
+**原则 1：触发器分两种，分别属于不同模块**
+
+| 触发器类型 | 实现位置 | 入口 | 调谁 |
+|---|---|---|---|
+| **MessageIngress**（用户消息）| `smartbutler/interface/`（HTTP/WS）| HTTP/WS handler | `ButlerOrchestrator.ainvoke()` |
+| **EventSourceAdapter**（设备事件）| `smartbutler/events/adapters/` | `soundbox/device/timer/webhook` adapter | `event_bus.publish()` → `EventTrigger.route()` |
+
+**原则 2：EventSource 枚举从类型层面拒绝"用户消息"**
+
+```python
+# smartbutler/events/core/event.py
+class EventSource(StrEnum):
+    """事件来源分类——不包含 USER/INTERFACE,因为用户消息不进 EventBus。"""
+    DEVICE  = "device"
+    VOICE   = "voice"    # 音响 wakeup 状态,不是语音指令
+    TIMER   = "timer"
+    WEBHOOK = "webhook"
+```
+
+**类型层面**就拒绝让"用户消息"伪装成 EventSource——这是"用户消息永远不进 EventBus"的
+**机器可验证**保障。
+
+**原则 3：EventTrigger.route() 单职责——只为 Proactive 服务**
+
+```python
+def route(event: BaseEvent) -> LoopType:
+    # EventBus 上不出现 USER/INTERFACE 事件,所以这里没有"路由到 Reactive"分支
+    if event.source in _PROACTIVE_SOURCES:
+        return LoopType.PROACTIVE
+    return LoopType.PROACTIVE  # 兜底
+```
+
+EventTrigger **不知道** ReactiveLoop 的存在。它的存在意义是：让 ProactiveLoop
+**收到事件后**决定"沉默 / 主动 / 怎么主动"——**不**决定"这是不是用户消息"。
+
+**原则 4：失败语义不同源，必须分开处理**
+
+| 失败来源 | 用户消息入口 | 设备事件入口 |
+|---|---|---|
+| 管家 LLM 报错 | HTTP 500 / WS 错误帧（**必须让前端知道**）| log + silent（**不能骚扰**）|
+| 工具调用失败 | 错误信息返回给用户 | silent（**不能让用户被吵醒**）|
+| EventBus 断流 | 不受影响（HTTP/WS 独立）| EventSource adapter 重试 + log |
+| 管家 5xx | 用户看到"服务暂不可用"| 静默 + 事件回灌队列等恢复 |
+
+**原则 5：双设备协议的入口分离——同一硬件可以两个触发器**
+
+智能音响这种"既是用户输入设备又是状态源"的硬件，**自然有两个 adapter**：
+
+| 入口 | 协议 | 触发器类型 | 处理路径 |
+|---|---|---|---|
+| 音响 **WebSocket**（用户说话）| WS 音频流 | **MessageIngress** | ASR → `ainvoke()` → Reactive |
+| 音响 **状态事件**（wakeup / 空闲）| MQTT / HTTP 回调 | **EventSourceAdapter** | `soundbox.py` → EventBus → Proactive |
+
+**两者同一设备、不同协议入口、不同处理路径**——这才是 EventSource 枚举里
+"voice"只表示"wakeup 状态变化"而不是"用户语音指令"的原因。
+
+---
 
 ## 6. 未来扩展方向
 
@@ -1156,7 +1554,7 @@ async def ainvoke(...) -> ButlerResponse:                   # 返结构
 ### 6.2 中期扩展
 
 - [ ] 多 Agent 协作机制
-- [ ] 主动服务能力
+- [x] 主动服务能力（**已提前到 Phase 5+ 双循环架构**，详见 §5.9 / ADR-009）
 - [ ] 个性化模型微调
 - [ ] 分布式部署支持
 

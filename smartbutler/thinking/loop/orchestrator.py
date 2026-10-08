@@ -5,13 +5,18 @@
 2. 暴露简单 ``ainvoke(user_input) -> str`` 接口,业务方不用关心 LangGraph 细节。
 3. 支持 skill_prompt_snippets 注入(Phase 5 占位,Phase 4 接 list[str])。
 4. 支持 per-call config 覆盖(temperature / max_iterations 等)。
+5. **Phase 5+**:暴露 ``proactive_tick(event) -> ProactiveResult`` 主动循环入口
+   (参考 ADR-009)。
 
 设计原则(参考 TECHNICAL_DESIGN.md §3.2.5):
-- **业务层零 LangChain**: 业务方只看到 ``ainvoke`` / ``astream``,
+- **业务层零 LangChain**: 业务方只看到 ``ainvoke`` / ``astream`` / ``proactive_tick``,
   不 import ``StateGraph`` / ``ToolNode``。
 - **可单测**: orchestrator 接受 ``ButlerGraphBuilder`` 注入,
   单测里换成 mock 编译图。
 - **可演进**: Phase 5/6 在这里追加 Skill / Personality 注入,不动 Graph。
+- **Proactive 不污染 Reactive** (ADR-009 §5.9.7):
+  ``ainvoke()`` 签名零修改(新增可选参数 ``enable_advice``),
+  ``proactive_tick()`` 是新方法,两条入口独立。
 """
 from __future__ import annotations
 
@@ -25,14 +30,45 @@ from smartbutler.agents.manager.manager import AgentManager
 from smartbutler.capabilities.llm.base import BaseLLM
 from smartbutler.capabilities.llm.langgraph_adapter import ButlerChatModelAdapter
 from smartbutler.capabilities.tools.registry import ToolRegistry
+from smartbutler.events.core.event import BaseEvent
 from smartbutler.thinking.loop.graph import ButlerGraphBuilder
+from smartbutler.thinking.loop.proactive_loop import ProactiveLoop
 from smartbutler.thinking.loop.state import (
     DEFAULT_MAX_ITERATIONS,
     ButlerState,
 )
 from smartbutler.thinking.prompt.builder import ButlerPromptBuilder
+from smartbutler.thinking.proactive import ProactiveReasoning, ProactiveResult
 
 _logger = structlog.get_logger(__name__)
+
+# Reactive → Proactive 内部调用的规则触发模式(参考 ADR-009 §5.9.6)
+# Phase 5 简化:字符串前缀匹配,后续可换 LLM 判定
+_PROACTIVE_TRIGGER_PREFIXES: tuple[str, ...] = (
+    "该吃",
+    "该做",
+    "该喝",
+    "吃什么",
+    "做什么",
+    "喝什么",
+    "怎么办",
+    "我该",
+)
+
+
+def _should_request_proactive(user_msg: str) -> bool:
+    """Reactive 链尾是否应该追加 Proactive 建议(参考 ADR-009 §5.9.6)。
+
+    规则(不调 LLM,避免开销):
+    - 用户消息以"该吃/该做/吃什么/怎么办"等开头 → 触发
+    - 其他 → 不触发
+
+    Phase 6 emotion 上线后,这里可升级为 Persona 驱动判断。
+    """
+    if not user_msg or not user_msg.strip():
+        return False
+    msg = user_msg.strip()
+    return any(msg.startswith(prefix) for prefix in _PROACTIVE_TRIGGER_PREFIXES)
 
 
 class ButlerOrchestrator:
@@ -60,6 +96,8 @@ class ButlerOrchestrator:
         agent_manager: AgentManager | None = None,
         llm_settings: Any = None,
         graph_builder: ButlerGraphBuilder | None = None,
+        proactive_reasoning: ProactiveReasoning | None = None,
+        enable_proactive_advice: bool = False,
     ) -> None:
         """构造 orchestrator。
 
@@ -70,6 +108,11 @@ class ButlerOrchestrator:
             llm_settings: 可选,用于构造 ``ButlerChatModelAdapter`` 时读 model/api_key/base_url。
                 允许 None,此时会从 ``llm`` 实例反射。
             graph_builder: 可选,注入自定义 builder(测试用)。
+            proactive_reasoning: 🆕 Phase 5+,主动循环的触发判断逻辑。
+                None → ProactiveLoop 内部默认 ``RuleBasedProactiveReasoning``。
+            enable_proactive_advice: 🆕 Phase 5+,是否在 ``ainvoke`` 链尾追加
+                Proactive 主动建议。**默认 False**——保持现有 e2e 测试零修改。
+                调成 True 后,Reactive 链尾会按规则触发 Proactive 建议追加。
         """
         self._llm = llm
         self._tool_registry = tool_registry or ToolRegistry.get_default()
@@ -82,6 +125,11 @@ class ButlerOrchestrator:
         self._skill_prompt_snippets: list[str] = []
         self._compiled: Any = None  # CompiledStateGraph,首次 ainvoke 时 lazy 构建
         self._chat_adapter: ButlerChatModelAdapter | None = None
+
+        # Phase 5+: Proactive 主动循环
+        self._proactive_reasoning = proactive_reasoning
+        self._proactive_loop: ProactiveLoop | None = None  # 懒构建
+        self._enable_proactive_advice = enable_proactive_advice
 
     # ---------- Skill 注入(Phase 5 占位) ----------
 
@@ -212,8 +260,22 @@ class ButlerOrchestrator:
         user_id: str = "user",
         session_id: str = "default",
         parent_agent: str = "user",
+        enable_advice: bool | None = None,
     ) -> str:
-        """同步阻塞调用,返回最终回复的 content 字符串。"""
+        """同步阻塞调用,返回最终回复的 content 字符串。
+
+        Args:
+            user_input: 用户消息文本。
+            user_id: 用户 ID(透传到 state)。
+            session_id: 会话 ID(checkpointer 用)。
+            parent_agent: 父调用方标识(默认 ``"user"``)。
+            enable_advice: 🆕 本次调用是否允许追加 Proactive 建议。
+                ``None`` → 用构造时的 ``enable_proactive_advice`` 默认值;
+                ``True/False`` → 显式覆盖。
+
+        Returns:
+            最终回复文本(可能包含 Proactive 追加的建议)。
+        """
         if not user_input or not user_input.strip():
             return ""
 
@@ -229,7 +291,22 @@ class ButlerOrchestrator:
         }
         config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
         result = await compiled.ainvoke(initial_state, config=config)
-        return _extract_final_content(result)
+        base_answer = _extract_final_content(result)
+
+        # 链尾挂载点:Proactive 主动建议(默认 disabled,零影响)
+        effective_enable = (
+            enable_advice if enable_advice is not None else self._enable_proactive_advice
+        )
+        if effective_enable and _should_request_proactive(user_input):
+            advice = await self._request_proactive_advice(
+                user_input=user_input,
+                base_answer=base_answer,
+                user_id=user_id,
+            )
+            if advice:
+                return f"{base_answer}\n\n💡 {advice}"
+
+        return base_answer
 
     async def astream(
         self,
@@ -260,6 +337,91 @@ class ButlerOrchestrator:
             if messages:
                 yield messages[-1]
 
+    # ---------- Phase 5+ : Proactive 主动循环入口 ----------
+
+    async def proactive_tick(
+        self,
+        event: BaseEvent,
+        *,
+        user_id: str | None = None,
+    ) -> ProactiveResult:
+        """Proactive 主动循环入口(参考 ADR-009 §5.9.4)。
+
+        接收一个归一化后的事件,产出 ``ProactiveResult``:
+        - ``acted=False`` —— 沉默
+        - ``acted=True`` —— 主动推送,message 字段填推送内容
+
+        Args:
+            event: 归一化后的事件(来自 EventNormalizer)。
+            user_id: 覆盖默认 user_id(默认从 event.user_id 拿)。
+
+        Returns:
+            ProactiveResult(不可变,带 acted / message / urgency / silence_reason)。
+        """
+        effective_user_id = user_id or event.user_id
+        loop = self._get_or_build_proactive_loop(
+            user_id=effective_user_id,
+            session_id=f"proactive-{event.event_id}",
+        )
+        return await loop.tick(event)
+
+    def _get_or_build_proactive_loop(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> ProactiveLoop:
+        """懒构建 ProactiveLoop(首次调用时构造,后续复用)。"""
+        if self._proactive_loop is None:
+            # ProactiveLoop 需要 graph;优先用 _ensure_graph 出来的 compiled
+            graph = self._compiled if self._compiled is not None else None
+            self._proactive_loop = ProactiveLoop(
+                reasoning=self._proactive_reasoning,
+                graph=graph,
+                user_id=user_id,
+                session_id=session_id,
+            )
+        return self._proactive_loop
+
+    async def _request_proactive_advice(
+        self,
+        *,
+        user_input: str,
+        base_answer: str,
+        user_id: str,
+    ) -> str | None:
+        """Reactive → Proactive 内部通道(参考 ADR-009 §5.9.6)。
+
+        规则触发时调 ProactiveLoop 拿"主动建议"文本。
+        Phase 5 占位:构造一个虚拟的 BaseEvent 给 ProactiveLoop。
+        Phase 6 emotion 上线后,可基于 user_input / base_answer 拼更丰富的 context。
+        """
+        from datetime import UTC, datetime
+
+        from smartbutler.events.core.event import EventPriority, EventSource
+
+        # 构造一个虚拟的 BaseEvent 走 ProactiveLoop 触发判断
+        # 注意:user/interface 不在 EventBus 里,这里是 Reactive 内部调用,
+        # 所以走 ProactiveLoop 拿"主动建议"——这个 event 是合成事件。
+        # Phase 5:用 DEVICE 兜底(ProactiveLoop 关心的是 payload,不是 source)。
+        synthetic_event = BaseEvent(
+            event_id=f"advice-{datetime.now(UTC).strftime('%Y%m%d_%H%M%S_%f')}",
+            source=EventSource.DEVICE,
+            topic="internal.reactive.advice_request",
+            user_id=user_id,
+            timestamp=datetime.now(UTC),
+            priority=EventPriority.NORMAL,
+            payload={"user_input": user_input, "base_answer": base_answer},
+        )
+        loop = self._get_or_build_proactive_loop(
+            user_id=user_id,
+            session_id=f"advice-{synthetic_event.event_id}",
+        )
+        result = await loop.tick(synthetic_event)
+        if result.acted and result.message:
+            return result.message
+        return None
+
 
 def _extract_final_content(result: dict[str, Any]) -> str:
     """从 LangGraph 返回的 state 字典里提取最后一条 AIMessage 的 content。"""
@@ -273,4 +435,8 @@ def _extract_final_content(result: dict[str, Any]) -> str:
     return ""
 
 
-__all__ = ["ButlerOrchestrator"]
+__all__ = [
+    "ButlerOrchestrator",
+    "_should_request_proactive",
+    "_PROACTIVE_TRIGGER_PREFIXES",
+]

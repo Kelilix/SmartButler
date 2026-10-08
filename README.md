@@ -5,28 +5,66 @@
 
 ## 当前进度
 
-| 层级 | 状态 | 备注 |
-|------|------|------|
-| `smartbutler/config/` | ✅ 基础设施层 | Pydantic Settings 子模块化配置（LLM / Storage / Logging / Agent） |
-| `smartbutler/utils/logging.py` | ✅ 基础设施层 | structlog 结构化日志 |
-| `smartbutler/storage/` | ✅ 基础设施层（接口） | BaseStorage Protocol；具体后端按需实现 |
-| `smartbutler/capabilities/llm/` | ✅ 能力层（LLM 双后端） | BaseLLM 抽象 + **两个可切换实现**：① `OpenAICompatibleLLM`（httpx 直调，**默认 backend**）；② `LangChainLLMAdapter`（包装 `langchain-openai.ChatOpenAI`，env 切 `backend=langchain` 启用）。覆盖 DeepSeek/Qwen/OpenRouter/Azure 兼容模式。**已实测端到端连通**（chat / stream / tool_calls 三个 e2e 用例通过，且 60→84 个单测全绿） |
-| `smartbutler/capabilities/tools/` | ✅ 已完成 | BaseTool + ToolRegistry + Decorator + LangChain Adapter + 2 个 common tool（`get_current_time` / `web_fetch`）；92 单测全绿 |
-| `smartbutler/capabilities/memory/` | ⏳ 待开发 | 远期：长期记忆存储与检索 |
-| `smartbutler/agents/` | ✅ 已完成 | **Phase 3**：BaseAgent + AgentManager + `TestTimeAgent`（注册 `get_current_time` 全局 tool，验证 Sub-Agent→BaseTool 路径）；`to_langchain_tool()` 暴露 `delegate_to_test_time_agent`；最小 LLM 循环（decide → tool → 收集，最多 5 轮）+ 失败回流到 LLM + 重试/超时。**40 agent 单测全绿 + 1 集成测试**（默认 skip，`-m integration` 启用） | ADR-005 |
-| `smartbutler/skills/` | ⏳ 待开发 | **Phase 5**：Anthropic Skills loader，SKILL.md → 能力包（详见 §3.2.6 + ADR-006/007） |
-| `smartbutler/thinking/` | ✅ 已完成 | **Phase 4**：ButlerOrchestrator（LangGraph `StateGraph` + 原生 `ToolNode` + `InMemorySaver` checkpointer）+ `decide_node`（唯一业务节点，LLM 推理 + 迭代上限防御）+ `ButlerPromptBuilder`（系统 prompt + Skill snippets 注入点，Phase 5 占位）+ `ButlerChatModelAdapter`（`BaseLLM` → `langchain_core.BaseChatModel`，复用 Phase 1 双后端）。**24 thinking 单测全绿 + 3 E2E 用例**（默认 skip，`-m e2e` 启用）走通"用户 → 管家 LLM → delegate_to_test_time_agent → TestTimeAgent → get_current_time → 反馈用户"完整链路 | ADR-005 |
-| `smartbutler/emotion/` | ⏳ 待开发 | **Phase 6**：Personality + Memory |
-| `smartbutler/events/` | ✅ 骨架已就位 | **Phase 7**：事件驱动（被动触发）—— EventBus + 设备/语音/定时器事件协议 + EventNormalizer + EventTrigger + AnswerRouter。**Phase 7 当前只放协议 + 抽象接口 + ADR，0 行实现代码**（待 Phase 7 真正启动时填充）。详见 [§5.8](./TECHNICAL_DESIGN.md) + [`smartbutler/events/ADR-008-event-driven.md`](./smartbutler/events/ADR-008-event-driven.md) | ADR-008 |
-| `smartbutler/core_sub_agents/` | ⏳ 待开发 | **Phase 8**：核心业务 Sub-Agent（HomeAgent + HomeAssistant 接入 / ScheduleAgent / SearchAgent 等）。仅 Phase 7 + 真实 HomeAssistant 环境就绪后启动；具体技术方案到时再定 | - |
-| `smartbutler/interface/` | ⏳ 待开发 | HTTP / WebSocket / CLI / MCP |
+> 实施阶段对应 [`TECHNICAL_DESIGN.md` §1.4](./TECHNICAL_DESIGN.md)，按 phase 落地。
+> 每完成一阶段回来更新本节（commit 一起提交，不要拖）。
 
-**测试统计**：201 单元测试（其中 40 个 Phase 3 agent 测试）+ 2 集成测试 + 5 e2e 流式测试（默认 skip，需 `pytest -m integration` / `-m e2e` 启用）
+### 实施阶段
 
-### Phase 4 之后 — 部署后优化（待办回填）
+| 阶段 | 模块 | 状态 | 主要交付 | 关联 ADR |
+|------|------|------|----------|----------|
+| **Phase 1** | 基础设施 + LLM | ✅ | Pydantic Settings / structlog / BaseStorage / BaseLLM（双后端 http+langchain） | ADR-003 |
+| **Phase 2** | Tool 能力层 | ✅ | BaseTool + ToolRegistry + Decorator + LangChain Adapter + 2 个 common tool | ADR-002 |
+| **Phase 3** | Sub-Agent 层 | ✅ | BaseAgent + AgentManager + `TestTimeAgent` 示例 | ADR-005 |
+| **Phase 4** | LangGraph Loop + Supervisor | ✅ | StateGraph + ToolNode + Checkpointer + ButlerPromptBuilder（Skill 注入点占位） | ADR-005 |
+| **Phase 4b** | ProactiveLoop 框架 | ✅ | 框架 + `ProactiveReasoning` 降级后备 + 沉默默认 + 最小可用场景 | 硬编码实现 | ADR-009 |
+| **Phase 5** | Skill loader | ⏳ 下一站 | SKILL.md → 能力包 → 注入 Butler system prompt + 注册 tools | ADR-006 / ADR-007 |
+| **Phase 6** | 情感层 | ⏳ | Personality + Memory（短期 / 长期 / 情景记忆） | - |
+| **Phase 6b** | ProactiveLoop 真实化 | ⏳ **待 Phase 6 完成** | 降级后备 → 接 Memory + Persona + LLM 推理 | 从硬编码判断是否主动建议改成通过Memory/Personality + LLM判断 | ADR-009 |
+| **Phase 7** | 事件驱动 + 路由 | 🟡 骨架 | 协议 + 抽象接口已就位（`smartbutler/events/`）；**0 行实现**——EventNormalizer / EventTrigger.route() 真实路由 / 设备适配器全部待补 | ADR-008 / ADR-009 |
+| **Phase 8** | 核心 Sub-Agent | ⏳ | HomeAgent（接 HomeAssistant）/ ScheduleAgent / SearchAgent 等 | - |
+| **Phase 9** | 多模态感知 | ⏳ | ASR + TTS + Vision | - |
+| **Phase 10** | 主动服务 | ⏳ | 摄像头 / 麦克风监听 / 计划任务（与 Phase 7 事件总线联动） | - |
+| **Phase 11** | 性格演化 + 反馈学习 | ⏳ | - | - |
+
+### 当前已交付的代码模块
+
+| 模块 | 路径 | 状态 | 说明 |
+|------|------|------|------|
+| 配置 | `smartbutler/config/` | ✅ | Pydantic Settings 子模块化（LLM / Storage / Logging / Agent） |
+| 日志 | `smartbutler/utils/logging.py` | ✅ | structlog 结构化日志 |
+| 存储接口 | `smartbutler/storage/` | ✅ | BaseStorage Protocol；具体后端按需实现 |
+| LLM 能力 | `smartbutler/capabilities/llm/` | ✅ | BaseLLM 抽象 + `OpenAICompatibleLLM`（httpx 直调，**默认**） + `LangChainLLMAdapter`（env 切 `backend=langchain`）。覆盖 DeepSeek/Qwen/OpenRouter/Azure 兼容模式。已实测端到端连通 |
+| Tool 能力 | `smartbutler/capabilities/tools/` | ✅ | BaseTool + ToolRegistry + Decorator + LangChain Adapter + 2 个 common tool（`get_current_time` / `web_fetch`） |
+| Sub-Agent | `smartbutler/agents/` | ✅ | BaseAgent + AgentManager + `TestTimeAgent`；`to_langchain_tool()` 暴露 `delegate_to_test_time_agent`；最小 LLM 循环（decide → tool → 收集，最多 5 轮）+ 失败回流 + 重试/超时 |
+| Thinking（Reactive） | `smartbutler/thinking/loop/` | ✅ | ButlerOrchestrator（LangGraph `StateGraph` + 原生 `ToolNode` + `InMemorySaver` checkpointer）+ `decide_node`（唯一业务节点，LLM 推理 + 迭代上限防御）+ `ButlerPromptBuilder`（系统 prompt + Skill snippets 注入点）+ `ButlerChatModelAdapter`（`BaseLLM` → LangChain 适配） |
+| Thinking（Proactive） | `smartbutler/thinking/proactive/` + `thinking/loop/proactive_loop.py` | ✅ | ProactiveReasoning（**降级后备**——硬编码 4 条规则：URGENT 主动、5 分钟 dedup、其他沉默；用于 LLM 故障时降级）+ ProactiveDecision/Result + EventTrigger（明确区分 MessageIngress vs EventSource） + 双循环架构 EventTrigger.route() 显式路由。**真实化（接 Memory + Persona + LLM 推理）见 Phase 6b**。详见 [§5.9](./TECHNICAL_DESIGN.md) + [`smartbutler/thinking/ADR-009-proactive-reactive-dual-loop.md`](./smartbutler/thinking/ADR-009-proactive-reactive-dual-loop.md) |
+| 事件总线骨架 | `smartbutler/events/` | 🟡 骨架 | EventBus + 设备/语音/定时器事件协议 + EventNormalizer（**接口**）+ EventTrigger.route()（**接口**）+ AnswerRouter。**只放协议 + 抽象接口，0 行实现**——真实路由逻辑等 Phase 7 启动时填充。详见 [§5.8](./TECHNICAL_DESIGN.md) + [`smartbutler/events/ADR-008-event-driven.md`](./smartbutler/events/ADR-008-event-driven.md) |
+
+### 测试统计（实测）
+
+| 类别 | 数量 | 启用方式 |
+|------|------|----------|
+| 单元测试 | **101** | `pytest tests/unit`（默认全跑） |
+| 集成测试 | **5** | `pytest -m integration`（默认 skip） |
+| E2E 测试 | **5** | `pytest -m e2e`（默认 skip） |
+
+> 上述数字基于 `tests/unit/**/*.py` 函数体数 + `pytest -m integration` / `pytest -m e2e` 收集结果实测。
+> 每次合入新 PR 后**务必重新跑一遍**更新本节，不要等季度复盘。
+
+### 下次开工的待办（按 phase 排序）
+
+> 这里只列**下一站**开始的工作，**不要**塞进所有远期任务。
+
+- [ ] **Phase 5a：Skill loader**（1-2 周）—— `smartbutler/skills/` 目录；`SkillLoader.scan()` 扫 builtin + `~/.smartbutler/skills/`；`ButlerOrchestrator` 在 `ainvoke()` 入口前调 `_inject_skills_into_prompt()`。**唯一 Phase 5 剩余工作**。
+- [ ] **Phase 6：Personality + Memory**（2-3 周）—— `smartbutler/emotion/personality.py`（Personality 类：语气 / 称呼 / 禁忌 / 风格）+ `smartbutler/emotion/memory/`（short_term / long_term / episodic）。
+- [ ] **Phase 6b：ProactiveLoop 真实化**（2-3 周，**必须等 Phase 6 完成后启动**）—— `RuleBasedProactiveReasoning` 是降级后备永久保留，**不是** Phase 6b 完成后要删的"占位"。真实化版 = `LLMProactiveReasoning`：调 LLM 综合判断 + 读 Personality + 查 Memory + 5 分钟内同 topic dedup。LLM 故障/timeout/key 失效时降级到 `RuleBasedProactiveReasoning`——URGENT 事件必须能在 LLM 不可用时主动开口。
+- [ ] **Phase 7 真实实现**（与 Phase 5a 串行，3-4 周）—— EventNormalizer 真实实现（设备原始消息 → BaseEvent）+ EventTrigger.route() 真实实现（user → Reactive，设备/定时器 → Proactive）+ 至少 1 个设备适配器（建议先做 timer.remind，最小可用）+ 架构不变量 #7/#8 单测钉死。
+- [ ] **Phase 8 预研**（不启动）—— HomeAgent 接入 HomeAssistant 的可行性，**仅**在 Phase 7 真实实现 + 真实 HomeAssistant 环境就绪后才启动。
+
+### 部署后优化（Phase 4 收尾，跨 phase 待办）
 
 > 部署场景：管家在家中部署，全家共享唯一一个实例，无并发问题。
-> 基础功能（Phase 1 ~ Phase 4）已能跑通，下面列出**尚未实现**的优化项，下次回到项目时一目了然。
+> 这些是**横切关注点**——任何 phase 落地时都可以顺手补，不强求在某个 phase 内集中做完。
 
 **待实现**：
 
@@ -50,6 +88,7 @@
 6. **依赖方向**：Interface → Thinking → Emotion → Agents；capabilities 被 Thinking/Agents 消费。✅ LLM 已通过 `create_llm(settings) -> BaseLLM` 暴露接口，便于后续节点消费。
 7. **Skill ≠ Sub-Agent（ADR-006）**：Skill 是 **Anthropic Skills 格式的能力包**，由管家（强模型）执行；Sub-Agent 是 **代码实现的领域智能体**，有自己的 LLM（便宜模型）。两者概念独立，禁止混淆。
 8. **Multi-Agent 走 LangGraph Supervisor + Tool-Calling（ADR-005）**：管家作为中央调度器，通过 LangChain `StructuredTool` 机制调用 Sub-Agent；不使用 `create_supervisor` 高层封装，保留性格注入 / 记忆检索等定制空间。
+9. **ProactiveReasoning 降级契约（ADR-009）**：ProactiveLoop 的 `ProactiveReasoning` 必须**双轨部署**——`LLMProactiveReasoning`（主路，Phase 6b 实现）+ `RuleBasedProactiveReasoning`（降级后备，已落库）。**任何 LLM 故障（服务挂、key 失效、timeout、解析失败）必须降级到后备**，URGENT 事件（漏水/烟雾/门铃等安全相关）不依赖 LLM 也能主动开口。`RuleBasedProactiveReasoning` **永不被删**——它是安全网，不是临时占位。
 
 ## LLM 双后端决策（Phase 1.5）
 
