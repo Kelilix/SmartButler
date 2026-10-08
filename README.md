@@ -15,12 +15,30 @@
 | `smartbutler/capabilities/memory/` | ⏳ 待开发 | 远期：长期记忆存储与检索 |
 | `smartbutler/agents/` | ✅ 已完成 | **Phase 3**：BaseAgent + AgentManager + `TestTimeAgent`（注册 `get_current_time` 全局 tool，验证 Sub-Agent→BaseTool 路径）；`to_langchain_tool()` 暴露 `delegate_to_test_time_agent`；最小 LLM 循环（decide → tool → 收集，最多 5 轮）+ 失败回流到 LLM + 重试/超时。**40 agent 单测全绿 + 1 集成测试**（默认 skip，`-m integration` 启用） | ADR-005 |
 | `smartbutler/skills/` | ⏳ 待开发 | **Phase 5**：Anthropic Skills loader，SKILL.md → 能力包（详见 §3.2.6 + ADR-006/007） |
-| `smartbutler/thinking/` | ⏳ 待开发 | **Phase 4**：LangGraph Loop + Supervisor（StateGraph + ToolNode） |
+| `smartbutler/thinking/` | ✅ 已完成 | **Phase 4**：ButlerOrchestrator（LangGraph `StateGraph` + 原生 `ToolNode` + `InMemorySaver` checkpointer）+ `decide_node`（唯一业务节点，LLM 推理 + 迭代上限防御）+ `ButlerPromptBuilder`（系统 prompt + Skill snippets 注入点，Phase 5 占位）+ `ButlerChatModelAdapter`（`BaseLLM` → `langchain_core.BaseChatModel`，复用 Phase 1 双后端）。**24 thinking 单测全绿 + 3 E2E 用例**（默认 skip，`-m e2e` 启用）走通"用户 → 管家 LLM → delegate_to_test_time_agent → TestTimeAgent → get_current_time → 反馈用户"完整链路 | ADR-005 |
 | `smartbutler/emotion/` | ⏳ 待开发 | **Phase 6**：Personality + Memory |
-| `smartbutler/core_sub_agents/` | ⏳ 待开发 | **Phase 3.5**：核心业务 Sub-Agent（HomeAgent + HomeAssistant 接入 / ScheduleAgent / SearchAgent 等）。仅 Phase 4 + 真实 HomeAssistant 环境就绪后启动；具体技术方案到时再定 | - |
+| `smartbutler/events/` | ✅ 骨架已就位 | **Phase 7**：事件驱动（被动触发）—— EventBus + 设备/语音/定时器事件协议 + EventNormalizer + EventTrigger + AnswerRouter。**Phase 7 当前只放协议 + 抽象接口 + ADR，0 行实现代码**（待 Phase 7 真正启动时填充）。详见 [§5.8](./TECHNICAL_DESIGN.md) + [`smartbutler/events/ADR-008-event-driven.md`](./smartbutler/events/ADR-008-event-driven.md) | ADR-008 |
+| `smartbutler/core_sub_agents/` | ⏳ 待开发 | **Phase 8**：核心业务 Sub-Agent（HomeAgent + HomeAssistant 接入 / ScheduleAgent / SearchAgent 等）。仅 Phase 7 + 真实 HomeAssistant 环境就绪后启动；具体技术方案到时再定 | - |
 | `smartbutler/interface/` | ⏳ 待开发 | HTTP / WebSocket / CLI / MCP |
 
 **测试统计**：201 单元测试（其中 40 个 Phase 3 agent 测试）+ 2 集成测试 + 5 e2e 流式测试（默认 skip，需 `pytest -m integration` / `-m e2e` 启用）
+
+### Phase 4 之后 — 部署后优化（待办回填）
+
+> 部署场景：管家在家中部署，全家共享唯一一个实例，无并发问题。
+> 基础功能（Phase 1 ~ Phase 4）已能跑通，下面列出**尚未实现**的优化项，下次回到项目时一目了然。
+
+**待实现**：
+
+- [ ] 8.1 Tool 重试 & 熔断（单 tool 粒度）
+- [ ] 8.2 LLM 重试（限流 / 超时，exponential backoff + jitter）
+- [ ] 8.3 流式输出（token 级，astream_events）
+- [ ] 8.4 错误分类 & 友好回复（ButlerErrorKind 枚举 → 文案映射）
+- [ ] 8.5 可观测性（ButlerCallTrace → structlog）
+
+**不做**（家用场景不需要）：
+
+- ~~并发安全~~ / ~~多 LLM 后端切换~~ / ~~Postgres Checkpointer~~ / ~~OpenTelemetry / Prometheus 上报~~
 
 ## 架构约束（实现时必须遵守）
 
@@ -114,9 +132,9 @@ SMARTBUTLER_LLM_BACKEND=langchain
 用户消息 → LangGraph Loop (管家 LLM 推理)
               ↓ 工具集
               ├─ delegate_to_test_time_agent → TestTimeAgent (Phase 3)
-              ├─ delegate_to_home_agent  → HomeAgent (Phase 3.5,Haiku)
-              ├─ delegate_to_schedule_agent → ScheduleAgent (Phase 3.5,Haiku)
-              ├─ delegate_to_search_agent → SearchAgent (Phase 3.5,Haiku)
+              ├─ delegate_to_home_agent  → HomeAgent (Phase 8,Haiku)
+              ├─ delegate_to_schedule_agent → ScheduleAgent (Phase 8,Haiku)
+              ├─ delegate_to_search_agent → SearchAgent (Phase 8,Haiku)
               ├─ pdf_extract (Skill 工具，管家直接调)
               ├─ get_today_digest (管家元工具)
               └─ ... (其他 Skill 工具,管家直接调)

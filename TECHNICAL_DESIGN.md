@@ -85,13 +85,16 @@ SmartButler（大管家）是一个**通用智能体**，旨在为用户提供�
 | **Phase 1** | 基础设施 + LLM | ✅ 已完成 | Pydantic Settings / structlog / BaseStorage / BaseLLM（双后端） | ADR-003 |
 | **Phase 2** | Tool 能力层 | ⏳ **当前** | BaseTool + ToolRegistry + Decorator + LangChain Adapter | ADR-002 |
 | **Phase 3** | Sub-Agent 层 | ✅ 已完成 | BaseAgent + AgentManager + `TestTimeAgent` 示例（注册 capabilities 已有 tool，0 失败） | ADR-005 |
-| **Phase 3.5** | 核心 Sub-Agent 落地 | ⏳ 待开发 | HomeAgent（接入 HomeAssistant）/ ScheduleAgent / SearchAgent 等。仅 Phase 4 + HomeAssistant 环境就绪后启动；具体技术方案到时再定 | - |
-| **Phase 4** | LangGraph Loop + Supervisor | ⏳ 待开发 | StateGraph + ToolNode + Checkpointer + Skill Prompt 注入 | ADR-005 |
+| **Phase 4** | LangGraph Loop + Supervisor | ✅ 已完成 | StateGraph + ToolNode + Checkpointer + Skill Prompt 注入 | ADR-005 |
 | **Phase 5** | Anthropic Skills loader | ⏳ | SKILL.md → 能力包 → 注入 Butler system prompt + 注册 tools | ADR-006 / ADR-007 |
 | **Phase 6** | 情感层 | ⏳ | Personality + Memory | - |
-| **Phase 7** | 多模态感知 | ⏳ | ASR + TTS + Vision | - |
-| **Phase 8** | 主动服务 | ⏳ | 事件驱动 / 摄像头 / 麦克风监听 | - |
-| **Phase 9** | 性格演化、反馈学习 | ⏳ | - | - |
+| **Phase 7** | 事件驱动（被动触发） | 🆕 **当前** | 事件总线 + 设备接入协议 + EventNormalizer + EventTrigger + AnswerRouter（**只放协议 + 抽象接口，Phase 4-6 阶段 0 行实现**）| ADR-008 |
+| **Phase 8** | 核心业务 Sub-Agent | ⏳ | HomeAgent（接入 HomeAssistant）/ ScheduleAgent / SearchAgent 等。**与事件驱动联动**：HomeAgent 通过 EventBus 订阅 `device.*` 主题。仅 Phase 7 + 真实 HomeAssistant 环境就绪后启动；具体技术方案到时再定 | - |
+| **Phase 9** | 多模态感知 | ⏳ | ASR + TTS + Vision（原 Phase 7 顺延）| - |
+| **Phase 10** | 主动服务 | ⏳ | 摄像头 / 麦克风监听 / 计划任务（**与 Phase 7 事件总线联动**）| - |
+| **Phase 11** | 性格演化、反馈学习 | ⏳ | - | - |
+
+> **修订说明（2026-10-08）**：原"事件驱动"原本排在 Phase 8，按用户决策提前为 Phase 7（独立模块 `smartbutler/events/`，详见 ADR-008）。原"核心 Sub-Agent 落地"原编号 Phase 3.5 取消，并入 Phase 8（HomeAgent 等）；原 Phase 7（多模态）→ Phase 9；原 Phase 8（主动服务）→ Phase 10。Phase 7 骨架已落库（协议 + 抽象接口），实现留到 Phase 7 真正启动时填充。
 
 ---
 
@@ -341,7 +344,13 @@ SmartButler/
 │   │   ├── prompt/                    # Prompt 工程（构造、组装、模板）
 │   │   │   └── templates/             # Prompt 模板资源
 │   │   └── context/                   # 上下文管理（窗口、压缩）
-│   │
+│
+│   ├── events/                        # 🆕 事件驱动层（Phase 7，骨架阶段）
+│   │   ├── core/                      # 核心抽象:Event基类/EventBus/Trigger/Normalizer
+│   │   ├── protocol/                  # 设备/语音/定时器事件协议
+│   │   ├── adapters/                  # 设备接入适配器(HomeAssistant/米家/Mock)
+│   │   └── routing/                   # 反馈路由(AnswerRouter/PresenceService)
+│
 │   ├── config/                        # 配置管理（主配置 + 各子模块配置）
 │   ├── storage/                       # 存储层（多种后端实现）
 │   └── utils/                         # 工具函数（日志、异步、序列化等通用工具）
@@ -1053,7 +1062,87 @@ When NOT to use: 反例（避免误触发）。
 
 具体实现细节在 Phase 5 展开。
 
+### 5.8 事件驱动架构（ADR-008，Phase 7）
+
+#### 5.8.1 背景
+
+SmartButler 当前只支持**主动调用模式**（用户发请求 → 管家回答）。
+智能家居场景需要**被动触发模式**：
+
+- 智能门锁被打开 → 管家主动打招呼
+- 热水器温度到 → 管家主动通知
+- 早晨 7 点 → 管家主动叫人起床
+- 烟雾报警 → 管家紧急通知
+
+#### 5.8.2 核心决策
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 触发模式 | **事件驱动**（不轮询） | 100 个设备时轮询 100 QPS，事件驱动 0 QPS |
+| 事件总线 | **Redis Streams** | smartbutler/storage/redis_backend.py 已有基础；轻量；ACK；可回放 |
+| 管家调用 | **复用 ainvoke** | 一行不改 ButlerOrchestrator 主体；只改 return type 为 ButlerResponse |
+| parent_agent 协议 | **`trigger:<source>.<subtype>`** | LLM 通过这个字段知道"我是被事件叫起的，不是人在说话" |
+| 归一化 | **EventNormalizer 必走** | 不归一化直接喂 LLM = 事件风暴把管家打挂 |
+| 触发模式工具白名单 | **只读工具** | 禁止写操作（避免"事件→管家→写设备→又发事件"循环）|
+
+#### 5.8.3 与现有架构的关系
+
+```
+events/ (Phase 7)
+    │
+    ├──► thinking/loop/   ButlerOrchestrator.ainvoke()  ← 复用,不修改主体
+    │
+    ├──► thinking/loop/   parent_agent="trigger:..."    ← 已有字段,直接用
+    │
+    └──► interface/       HTTP/WebSocket 用户入口        ← 共存,事件走事件口
+```
+
+**唯一对现有代码的侵入**：
+
+```python
+# Phase 7.2 改造点
+# 当前 (Phase 4):
+async def ainvoke(...) -> str:                              # 只返 string
+
+# Phase 7.2 改造:
+class ButlerResponse(TypedDict):
+    answer: str
+    target_device: str
+    priority: str
+
+async def ainvoke(...) -> ButlerResponse:                   # 返结构
+```
+
+**主体循环逻辑 / decide 节点 / ToolNode / Checkpointer 一行不动**。
+
+#### 5.8.4 Phase 7 子阶段
+
+| 子阶段 | 内容 | 工作量 |
+|--------|------|--------|
+| 7.0 | 协议 + 抽象接口（已落库）| ✅ 已完成 |
+| 7.1 | EventNormalizer + 简单 dedup | 1 周 |
+| 7.2 | ainvoke 返 ButlerResponse | 1 天 |
+| 7.3 | Redis Streams EventBus 实现 | 1 周 |
+| 7.4 | HomeAssistant DeviceAdapter | 2 周 |
+| 7.5 | PresenceService + AnswerRouter | 2 周 |
+| 7.6 | 端到端测试 + 误触发兜底 | 1 周 |
+
+**总计 8 周**。**不是 1 天**。
+
+#### 5.8.5 不变量
+
+1. ButlerOrchestrator 主体只在 Phase 7.2 改 return type,**不改逻辑**
+2. 事件触发不绕过 EventNormalizer
+3. parent_agent 协议一旦敲定**不修改**
+4. 写操作工具不暴露给 trigger 模式
+
+#### 5.8.6 完整 ADR
+
+详见 `smartbutler/events/ADR-008-event-driven.md`。
+
 ---
+
+
 
 ## 6. 未来扩展方向
 
