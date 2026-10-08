@@ -32,12 +32,13 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
 
 from smartbutler.capabilities.llm.base import (
     BaseLLM,
     LLMAuthError,
-    LLMContextLengthError,
     LLMContentFilterError,
+    LLMContextLengthError,
     LLMError,
     LLMRateLimitError,
     LLMTimeoutError,
@@ -55,7 +56,6 @@ from smartbutler.capabilities.llm.types import (
     Usage,
 )
 from smartbutler.config.llm import LLMSettings
-
 
 # ---------------------------------------------------------------------------
 # 类型转换:内部 Message / ToolSpec <-> LangChain 类型
@@ -155,8 +155,8 @@ class LangChainLLMAdapter(BaseLLM):
         self._chat = ChatOpenAI(
             model=settings.model,
             temperature=settings.temperature,
-            max_tokens=settings.max_tokens,
-            openai_api_key=api_key,
+            max_completion_tokens=settings.max_tokens,
+            api_key=SecretStr(api_key),
             base_url=self._base_url,
             timeout=self._timeout,
             max_retries=settings.max_retries,
@@ -278,7 +278,7 @@ class LangChainLLMAdapter(BaseLLM):
         if msg.tool_calls:
             tool_calls = [
                 ToolCall(
-                    id=tc["id"],
+                    id=str(tc["id"]) if tc.get("id") is not None else "",
                     type="function",
                     function=FunctionCall(
                         name=tc["name"],
@@ -298,7 +298,7 @@ class LangChainLLMAdapter(BaseLLM):
                 finish_reason = FinishReason.STOP
 
         # token usage:LangChain 0.3 用 UsageMetadata(input/output/total_tokens)
-        usage_raw = msg.usage_metadata or {}
+        usage_raw: Any = msg.usage_metadata or {}
         usage = Usage(
             prompt_tokens=usage_raw.get("input_tokens", 0),
             completion_tokens=usage_raw.get("output_tokens", 0),

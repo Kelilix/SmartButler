@@ -11,23 +11,26 @@
 | `smartbutler/utils/logging.py` | ✅ 基础设施层 | structlog 结构化日志 |
 | `smartbutler/storage/` | ✅ 基础设施层（接口） | BaseStorage Protocol；具体后端按需实现 |
 | `smartbutler/capabilities/llm/` | ✅ 能力层（LLM 双后端） | BaseLLM 抽象 + **两个可切换实现**：① `OpenAICompatibleLLM`（httpx 直调，**默认 backend**）；② `LangChainLLMAdapter`（包装 `langchain-openai.ChatOpenAI`，env 切 `backend=langchain` 启用）。覆盖 DeepSeek/Qwen/OpenRouter/Azure 兼容模式。**已实测端到端连通**（chat / stream / tool_calls 三个 e2e 用例通过，且 60→84 个单测全绿） |
-| `smartbutler/capabilities/tools/` | ⏳ 待开发 | 下一阶段：BaseTool 抽象 + ToolRegistry |
+| `smartbutler/capabilities/tools/` | ✅ 已完成 | BaseTool + ToolRegistry + Decorator + LangChain Adapter + 2 个 common tool（`get_current_time` / `web_fetch`）；92 单测全绿 |
 | `smartbutler/capabilities/memory/` | ⏳ 待开发 | 远期：长期记忆存储与检索 |
-| `smartbutler/agents/` | ⏳ 待开发 | 再下一阶段：Base / Manager / 领域 Agent |
-| `smartbutler/thinking/` | ⏳ 待开发 | LangGraph Loop + Reasoning / Decision |
+| `smartbutler/agents/` | ⏳ 待开发 | **Phase 3**：BaseAgent + AgentManager + 示例 SubAgent（详见 TECHNICAL_DESIGN §3.2.3 + ADR-005） |
+| `smartbutler/skills/` | ⏳ 待开发 | **Phase 5**：Anthropic Skills loader，SKILL.md → 能力包（详见 §3.2.6 + ADR-006/007） |
+| `smartbutler/thinking/` | ⏳ 待开发 | **Phase 4**：LangGraph Loop + Supervisor（StateGraph + ToolNode） |
 | `smartbutler/emotion/` | ⏳ 待开发 | Personality / Memory |
 | `smartbutler/interface/` | ⏳ 待开发 | HTTP / WebSocket / CLI / MCP |
 
-**测试统计**：84 单元测试 + 3 集成测试 + 5 e2e 流式测试（默认 skip，需 `pytest -m integration` / `-m e2e` 启用）
+**测试统计**：176 单元测试 + 3 集成测试 + 5 e2e 流式测试（默认 skip，需 `pytest -m integration` / `-m e2e` 启用）
 
 ## 架构约束（实现时必须遵守）
 
 1. **能力层自建抽象**：定义我们自己的 `BaseLLM` / `BaseTool`，不直接 import LangChain 的 `BaseChatModel` / `BaseTool`。✅ 已落地：`BaseLLM` + 两个实现——`OpenAICompatibleLLM`（httpx 直调）和 `LangChainLLMAdapter`（包装 `ChatOpenAI`，但所有 LangChain 类型仅在 adapter 内部出现，业务层零感知）。
 2. **LLM 实现后端可切换**：`SMARTBUTLER_LLM_BACKEND=http|langchain`。默认 `http`（保留原有行为，已有的 e2e 测试无需任何修改）；切到 `langchain` 时由 LangChain 负责消息转换 / 工具绑定 / 流式 chunk 处理 / reasoning_content 透传 / structured output。两条路线对外都是 `BaseLLM` 接口，业务层零差别。
 3. **Manager 是 Agent 唯一入口**：thinking 层**只**通过 `agents/manager/` 找 Agent，不直接 import 具体 Agent 类。
-4. **Agent 接口契约固定**：`name / description / tools / handle()` 是必实现方法。
+4. **Agent 接口契约固定**：`name / description / tools / ainvoke()` 是必实现方法；外加 `to_langchain_tool()` 用于暴露成 `delegate_to_<name>` LangChain Tool。
 5. **LangGraph State 字段固定**：`user_input / messages / current_decision / pending_tasks / tool_results / iteration / context / final_response / is_complete`。
 6. **依赖方向**：Interface → Thinking → Emotion → Agents；capabilities 被 Thinking/Agents 消费。✅ LLM 已通过 `create_llm(settings) -> BaseLLM` 暴露接口，便于后续节点消费。
+7. **Skill ≠ Sub-Agent（ADR-006）**：Skill 是 **Anthropic Skills 格式的能力包**，由管家（强模型）执行；Sub-Agent 是 **代码实现的领域智能体**，有自己的 LLM（便宜模型）。两者概念独立，禁止混淆。
+8. **Multi-Agent 走 LangGraph Supervisor + Tool-Calling（ADR-005）**：管家作为中央调度器，通过 LangChain `StructuredTool` 机制调用 Sub-Agent；不使用 `create_supervisor` 高层封装，保留性格注入 / 记忆检索等定制空间。
 
 ## LLM 双后端决策（Phase 1.5）
 
@@ -83,6 +86,54 @@ SMARTBUTLER_LLM_OPENAI_BASE_URL=https://api.deepseek.com
 # 切到 LangChain 适配器(后续 Tool / Loop 阶段建议)
 SMARTBUTLER_LLM_BACKEND=langchain
 ```
+
+## 多 Agent + Skill 架构（Phase 3-5 落地）
+
+> 完整决策记录见 [`TECHNICAL_DESIGN.md`](./TECHNICAL_DESIGN.md) §5.5 / §5.6 / §5.7。
+
+### Sub-Agent（代码实现的领域智能体）
+
+- 形态：Python 类继承 `BaseAgent`
+- 执行方：**Sub-Agent 自己的 LLM**（便宜模型，如 Haiku）
+- 触发方式：管家 LLM 通过 `delegate_to_<name>` tool call 调用
+- 典型：HomeAgent（设备控制）、ScheduleAgent（日程）、SearchAgent（搜索）
+- 适用场景：需要**状态机**、**副作用管理**、**独立推理**的任务
+
+### Skill（Anthropic Skills 格式能力包）
+
+- 形态：文件夹 + `SKILL.md`（YAML frontmatter + markdown body）
+- 执行方：**管家 LLM**（强模型，自己执行）
+- 触发方式：管家 LLM 看到 skill 注入的 system_prompt 后自主决定是否用
+- 典型：`pdf-summary/`、`stock-analysis/`、亲属拖入的 `~/.smartbutler/skills/*/`
+- 适用场景：**强模型 + 步骤提示 + 工具**就能完成的任务
+
+### 协作模式：LangGraph Supervisor + Tool-Calling
+
+```
+用户消息 → LangGraph Loop (管家 LLM 推理)
+              ↓ 工具集
+              ├─ delegate_to_home_agent  → HomeAgent (Haiku)
+              ├─ delegate_to_schedule_agent → ScheduleAgent (Haiku)
+              ├─ delegate_to_search_agent → SearchAgent (Haiku)
+              ├─ pdf_extract (Skill 工具，管家直接调)
+              ├─ get_today_digest (管家元工具)
+              └─ ... (其他 Skill 工具,管家直接调)
+```
+
+**核心**：Sub-Agent 通过 LangChain `StructuredTool` 机制暴露；管家 Loop 用 LangGraph 原生 `StateGraph + ToolNode` 编排。
+
+### Sub-Agent vs Skill 边界
+
+| 维度 | Sub-Agent | Skill |
+|------|-----------|-------|
+| 触发方 | 管家 LLM tool_call | 管家 LLM 看 system_prompt 自主判断 |
+| 执行方 | Sub-Agent 自己的 LLM | 管家 LLM |
+| 维护者 | 开发者 | 任何人（含亲属） |
+| 修改代码 | 需要 | **不需要** |
+
+**判断依据**：需要状态机 / 副作用 / 独立推理 → Sub-Agent；强模型 + 步骤提示就能搞定 → Skill。
+
+---
 
 ## 快速开始
 

@@ -75,6 +75,23 @@ SmartButler（大管家）是一个**通用智能体**，旨在为用户提供�
 - 用户反馈学习
 - 能力持续扩展
 
+#### 1.4 实施阶段规划（按模块落地顺序）
+
+> **说明**：1.3 是**产品能力演进**视角（看得到的能力），按用户体验排列。
+> 下面 1.4 是**实施阶段**视角（按代码模块落地顺序），与模块代码一一对应。每完成一阶段更新 README "当前进度" 表格。
+
+| 阶段 | 模块 | 状态 | 主要交付 | 关联 ADR |
+|------|------|------|----------|----------|
+| **Phase 1** | 基础设施 + LLM | ✅ 已完成 | Pydantic Settings / structlog / BaseStorage / BaseLLM（双后端） | ADR-003 |
+| **Phase 2** | Tool 能力层 | ⏳ **当前** | BaseTool + ToolRegistry + Decorator + LangChain Adapter | ADR-002 |
+| **Phase 3** | Sub-Agent 层 | ⏳ | BaseAgent + AgentManager + 1 个示例 SubAgent（Home）+ Butler 骨架 | ADR-005 |
+| **Phase 4** | LangGraph Loop + Supervisor | ⏳ | StateGraph + ToolNode + Checkpointer + Skill Prompt 注入 | ADR-005 |
+| **Phase 5** | Anthropic Skills loader | ⏳ | SKILL.md → 能力包 → 注入 Butler system prompt + 注册 tools | ADR-006 / ADR-007 |
+| **Phase 6** | 情感层 | ⏳ | Personality + Memory | - |
+| **Phase 7** | 多模态感知 | ⏳ | ASR + TTS + Vision | - |
+| **Phase 8** | 主动服务 | ⏳ | 事件驱动 / 摄像头 / 麦克风监听 | - |
+| **Phase 9** | 性格演化、反馈学习 | ⏳ | - | - |
+
 ---
 
 ## 2. SmartButler 架构图
@@ -298,12 +315,18 @@ SmartButler/
 │   │   ├── vision/                   # 视觉理解能力
 │   │   └── tools/                    # 工具能力（基类、注册表、Schema）
 │   │
-│   ├── agents/                        # Agent 层：垂直领域智能单元及其管理
-│   │   ├── base/                      # Agent 基类与公共抽象（接口契约）
-│   │   ├── manager/                  # Agent 管理器：注册、发现、调度的统一入口
-│   │   ├── home/                      # 智能家居 Agent（含其专属工具）
-│   │   ├── schedule/                  # 日程管理 Agent（含其专属工具）
-│   │   └── search/                    # 搜索 Agent（含其专属工具）
+│   ├── agents/                        # Sub-Agent 层：垂直领域智能单元（代码实现）
+│   │   ├── base/                      # Sub-Agent 基类与公共抽象（BaseAgent）
+│   │   ├── manager/                  # AgentManager：注册、发现、调度的统一入口
+│   │   ├── home/                      # 智能家居 Sub-Agent（含其专属工具）
+│   │   ├── schedule/                  # 日程管理 Sub-Agent（含其专属工具）
+│   │   └── search/                    # 搜索 Sub-Agent（含其专属工具）
+│   │
+│   ├── skills/                        # Skills 层：Anthropic Skills 格式能力包
+│   │   ├── loader/                   # SKILL.md 解析（YAML frontmatter + body）
+│   │   ├── runtime/                  # Skill 运行时（注入 prompt + 注册 tool）
+│   │   └── builtin/                  # 内置 Skills（pdf-summary / stock-analysis ...）
+│   │                                   # 亲属/用户可往这里拖文件夹,无需改代码
 │   │
 │   ├── emotion/                       # 情感层：性格与记忆
 │   │   ├── personality/              # 性格系统（特征定义、状态、演化、注入、持久化）
@@ -353,24 +376,69 @@ SmartButler/
 | **vision** | 视觉理解能力抽象 |
 | **tools** | 工具能力抽象，定义 Tool 的标准接口和注册机制 |
 
-#### 3.2.3 Agent 层 (agents/)
+#### 3.2.3 Sub-Agent 层 (agents/)
+
+> **关键概念区分**：本节的"Agent"特指**代码实现的 Sub-Agent**，与 §3.2.6 的
+> "Skill"（Anthropic Skills 格式能力包）是**完全不同的概念**。详见 ADR-006。
 
 | 子模块/目录 | 职责 |
 |------|------|
-| **base/** | Agent 基类与公共抽象：定义所有 Agent 必须实现的接口契约（名称、描述、可用工具、任务处理方法），是 Agent 体系的根基 |
-| **manager/** | Agent 管理器：负责 Agent 的注册、发现、调度，是其他模块调用 Agent 的统一入口；上层（thinking 层）通过 manager 找到并执行 Agent，不直接与具体 Agent 耦合 |
-| **home/** | 智能家居 Agent 及其专属工具：负责灯光、空调、家电等智能家居设备的控制 |
-| **schedule/** | 日程管理 Agent 及其专属工具：负责日程的创建、查询、提醒 |
-| **search/** | 搜索 Agent 及其专属工具：负责访问搜索引擎或内部知识库 |
+| **base/** | Sub-Agent 基类与公共抽象：定义 `BaseAgent`（name / description / tools / ainvoke / to_langchain_tool），是 Sub-Agent 体系的根基 |
+| **manager/** | `AgentManager`：负责 Sub-Agent 的注册、发现、调度；上层（thinking 层）通过 manager 找到并执行 Sub-Agent，不直接与具体 Sub-Agent 耦合 |
+| **home/** | 智能家居 Sub-Agent：封装窗帘 / 灯光 / 空调等设备的控制逻辑，独立 LLM 循环 |
+| **schedule/** | 日程管理 Sub-Agent：封装 OAuth / webhook 等副作用，独立 LLM 循环 |
+| **search/** | 搜索 Sub-Agent：封装搜索 API / 缓存 / 熔断，独立 LLM 循环 |
 
-**Agent Manager 的关键设计点：**
+**BaseAgent 核心接口**：
+
+```python
+class BaseAgent(ABC):
+    name: str                                # 唯一 ID: "home_agent"
+    description: str                         # 路由用："管理家居设备..."
+    tools: list[BaseTool]                    # 该 Sub-Agent 管辖的工具
+
+    @abstractmethod
+    async def ainvoke(self, input: AgentInput, ctx: AgentContext) -> AgentResult: ...
+
+    def to_langchain_tool(self) -> StructuredTool:
+        """把 Sub-Agent 暴露成 LangChain StructuredTool,
+           管家 LLM 通过 delegate_to_<name> 调用"""
+        async def call_agent(task: str) -> str:
+            result = await self.ainvoke(
+                AgentInput(raw=task),
+                AgentContext(parent_agent="butler"),
+            )
+            return result.output
+        return StructuredTool.from_function(
+            coroutine=call_agent,
+            name=f"delegate_to_{self.name}",
+            description=self.description,
+            args_schema=DelegateInput,
+        )
+```
+
+**AgentManager 关键 API**：
+
+```python
+class AgentManager:
+    def register(self, agent: BaseAgent) -> None: ...
+    def unregister(self, name: str) -> None: ...
+    def get(self, name: str) -> BaseAgent: ...
+    def list_all(self) -> list[BaseAgent]: ...
+    def get_delegate_tools(self) -> list[StructuredTool]:
+        """把所有 Sub-Agent 包装成 delegate_to_<name> 工具集,注入管家 LLM"""
+        return [a.to_langchain_tool() for a in self.list_all()]
+```
+
+**职责边界**：
 
 | 设计点 | 说明 |
 |--------|------|
-| **职责边界** | Manager 只负责"找到 Agent、调度 Agent"，不关心 Agent 内部如何执行 |
-| **依赖方向** | thinking/decision/router 调用 Manager；Manager 查找 Agent；Agent 内部使用 capabilities/tools |
-| **可发现性** | 其他模块（如决策路由器）能够根据任务描述找到最合适的 Agent |
-| **解耦** | 思考层不直接 import 具体 Agent 类，只与 Manager 接口交互 |
+| **职责边界** | Manager 只负责"找到 Sub-Agent、调度 Sub-Agent"，不关心 Sub-Agent 内部如何执行 |
+| **依赖方向** | thinking 层调 Manager；Manager 查找 Sub-Agent；Sub-Agent 内部用 capabilities/tools |
+| **可发现性** | 管家 LLM 通过 `delegate_to_<name>` tool description 自动路由到合适的 Sub-Agent |
+| **解耦** | thinking 层不直接 import 具体 Sub-Agent 类，只与 Manager 接口交互 |
+| **与 Skill 的关系** | Manager **不**管 Skill，Skill 由 §3.2.6 的 SkillLoader 管理 |
 
 #### 3.2.4 情感层 (emotion/)
 
@@ -388,21 +456,56 @@ SmartButler/
 
 | 模块 | 职责 |
 |------|------|
-| **loop/graph** | LangGraph 图定义，编排整个 Agent 循环 |
-| **loop/state** | State Schema 定义，描述循环中流转的状态结构 |
-| **loop/nodes/evaluate** | 评估节点，理解用户意图，评估当前状态 |
-| **loop/nodes/decide** | 决策节点，决定下一步行动（调工具 or 回复） |
-| **loop/nodes/invoke** | 执行节点，调度 Agent 执行工具 |
-| **loop/nodes/collect** | 收集节点，汇总执行结果 |
-| **loop/nodes/respond** | 回复节点，生成最终回复 |
+| **loop/graph** | LangGraph 图定义，编排整个 Agent 循环（StateGraph + ToolNode + Checkpointer） |
+| **loop/state** | State Schema 定义，描述循环中流转的状态结构（MessagesState 派生） |
+| **loop/nodes/decide** | 决策节点：LLM 推理 + 决定调 tool 或直接回复 |
+| **loop/nodes/tools** | ToolNode：LangGraph 原生工具执行节点（Sub-Agent `delegate_to_xxx` + 普通 Tool） |
+| **loop/skill_injector** | Skill Prompt 注入器：把加载的 Skills 的 `system_prompt` 片段拼接到管家 system prompt |
 | **reasoning/planner** | 任务规划，将复杂任务拆解为可执行的子任务 |
 | **reasoning/reflector** | 反思器，检查执行结果是否正确 |
-| **decision/intent** | 意图识别，理解用户真正想做什么 |
-| **decision/router** | 路由器，决定调用哪个 Agent 或 Tool |
 | **prompt/builder** | Prompt 构造器，组装各种组件生成最终 Prompt |
 | **prompt/templates** | Prompt 模板库 |
 | **context/window** | 对话窗口管理，控制历史消息数量 |
 | **context/compressor** | 上下文压缩，当窗口满时压缩历史 |
+
+> **修订说明**：原 `evaluate / invoke / collect / respond` 节点被 LangGraph 原生
+> `StateGraph + ToolNode` 模式替代（详见 ADR-005）。管家循环只保留 `decide` 一个
+> 业务节点，其余由 LangGraph 框架处理。
+
+#### 3.2.6 Skills 层 (skills/)
+
+> **重要**：**Skill 不是 Sub-Agent**。Skill 是 Anthropic Skills 格式的**能力包**，
+> 由管家（强模型）直接执行，不需要单独的 LLM 实例。详见 ADR-006 / ADR-007。
+
+| 子模块/目录 | 职责 |
+|------|------|
+| **loader/** | `SkillLoader`：扫描 `skills/builtin/` 与 `~/.smartbutler/skills/`，解析每个文件夹的 `SKILL.md`（YAML frontmatter + markdown body） |
+| **runtime/** | `SkillRuntime`：把 Skill 的 `system_prompt` 片段注入管家 system prompt；把 Skill 携带的 `scripts/*.py` 自动生成 `BaseTool` 注册到 ToolRegistry |
+| **builtin/** | 内置 Skills 目录（随项目提交，例如 `pdf-summary/`、`stock-analysis/`），作为 Skill 格式的官方示例 |
+| **~/.smartbutler/skills/** | 用户级 Skills 目录（亲属可拖入，无需改代码） |
+
+**Skill 数据结构**：
+
+```python
+@dataclass
+class Skill:
+    name: str                                # 来自 SKILL.md frontmatter
+    description: str                         # 来自 SKILL.md frontmatter（路由关键）
+    system_prompt: str                       # SKILL.md body（注入到管家 prompt）
+    tools: list[BaseTool]                    # Skill 自带的工具（自动从 scripts/ 扫描）
+    source_dir: Path                         # Skill 文件夹路径（用于热加载定位）
+```
+
+**Skill vs Sub-Agent 边界**：
+
+| 维度 | Sub-Agent（代码实现） | Skill（Anthropic Skills 文件） |
+|------|----------------------|-------------------------------|
+| 形态 | Python 类继承 `BaseAgent` | 文件夹 + `SKILL.md` |
+| 执行方 | Sub-Agent 自己的 LLM（便宜模型） | **管家 LLM**（强模型） |
+| 触发方式 | `delegate_to_<name>` tool call | 管家 LLM 自主决定是否用（system_prompt 注入） |
+| 维护者 | 开发者 | **任何人（含亲属）** |
+| 加载时机 | Python import 时 | 启动时扫描 `skills/` 目录 |
+| 失败回退 | AgentManager 启动 ERROR | SkillLoader 启动 ERROR + 跳过 |
 
 ### 3.3 模块间协作关系
 
@@ -746,6 +849,208 @@ class ThinkingModeParams:
 2. **asymmetric loss**：中间地带不确定时，默认走 on（on 有收益，off 有成本）
 3. **零成本兜底**：启发式覆盖 90% 请求，小模型仅兜底模糊 case
 4. **可观测性先于完美分类**：每次调用留痕，用数据迭代规则而非一次性设计完美规则
+
+### 5.5 多 Agent 协作：LangGraph Supervisor Pattern（ADR-005）
+
+#### 5.5.1 背景
+
+SmartButler 管家需要调度多个领域 Sub-Agent（Home / Schedule / Search 等）。
+本节确定 Sub-Agent 协作方式以及 LangGraph 多 Agent 模式选型。
+
+#### 5.5.2 LangGraph 官方多 Agent 模式
+
+LangGraph 官方文档（[Multi-Agent Systems](https://langchain-ai.github.io/langgraph/concepts/multi_agent/)）
+定义了四种标准模式：
+
+| 模式 | 描述 | 适用 |
+|------|------|------|
+| **Network** | Agent 之间对等通信，无中心调度 | 复杂协作 / 辩论 |
+| **Supervisor** | 中央调度 Agent 决定下一个调谁 | **本方案** |
+| **Hierarchical Teams** | 多层 Supervisor 嵌套 | 企业级（暂不需要） |
+| **Custom Multi-Agent** | 自定义 Graph 节点 | 特殊流程 |
+
+**决策**：SmartButler 选用 **Supervisor** 模式 —— 管家作为中央调度器，统一决策。
+
+#### 5.5.3 Supervisor 的两种实现方式
+
+| 维度 | Subgraphs（紧耦合） | **Tool-Calling（松耦合）** ✅ |
+|------|---------------------|---------------------------|
+| Worker 形态 | 独立 `StateGraph` | LangChain `StructuredTool` |
+| 状态共享 | 共享 state schema | 仅靠 tool args/results |
+| 动态增删 Agent | 困难（要重启 Supervisor graph） | **简单**（改 tools 列表即可） |
+| Anthropic Skills 适配 | 难（Skill 不是 StateGraph） | **天然适配**（Skill.tools → ToolRegistry） |
+| 错误处理 | 异常进 state，需手工处理 | LLM 看到 error，可自主决定重试/降级 |
+| 调试观测 | LangGraph trace（复杂） | LangChain tool call trace（清晰） |
+
+**决策**：选 **Tool-Calling**，因为 SmartButler 需要支持亲属添加 Skills（动态性 + 第三方格式）。
+
+#### 5.5.4 落地：BaseAgent 暴露成 LangChain StructuredTool
+
+不自己造轮子，用 LangChain 成熟的 `StructuredTool` 机制作为 Sub-Agent 与管家 LLM 的桥梁：
+
+```python
+# smartbutler/agents/base.py
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel, Field
+
+class DelegateInput(BaseModel):
+    task: str = Field(..., description="交给 Sub-Agent 的具体任务描述")
+
+class BaseAgent(ABC):
+    name: str
+    description: str       # 路由准不准的关键
+
+    @abstractmethod
+    async def ainvoke(self, input: AgentInput, ctx: AgentContext) -> AgentResult: ...
+
+    def to_langchain_tool(self) -> StructuredTool:
+        async def call_agent(task: str) -> str:
+            return (await self.ainvoke(
+                AgentInput(raw=task),
+                AgentContext(parent_agent="butler"),
+            )).output
+        return StructuredTool.from_function(
+            coroutine=call_agent,
+            name=f"delegate_to_{self.name}",
+            description=self.description,
+            args_schema=DelegateInput,
+        )
+```
+
+`StructuredTool.from_function` 由 LangChain 负责：JSON Schema 生成、tool_call 处理、结果回灌。
+
+#### 5.5.5 管家 Loop：LangGraph 原生 StateGraph + ToolNode
+
+```python
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import ToolNode
+
+graph = StateGraph(MessagesState)
+graph.add_node("decide", decide_node)        # llm_with_tools.ainvoke(messages)
+graph.add_node("tools", ToolNode(all_tools)) # LangGraph 原生,执行 delegate_to_xxx 和普通 Tool
+graph.add_edge(START, "decide")
+graph.add_conditional_edges("decide", should_continue, ["tools", END])
+graph.add_edge("tools", "decide")            # tool 结果回灌到 decide
+return graph.compile(checkpointer=PostgresCheckpointer())
+```
+
+**不**使用 `langgraph.prebuilt.create_supervisor`：
+
+| 问题 | 详情 |
+|------|------|
+| 抽象过度 | 状态流转做成内置，我们想控的（性格注入、记忆检索、并发委派）没法做 |
+| 强假设 | worker 必须都是 StateGraph，Skills 接入麻烦 |
+| 黑盒 | 出问题难调试 |
+| 代码量 | 自己组装并没有多几行 |
+
+#### 5.5.6 不变量
+
+- Sub-Agent 内部**仍可**用便宜模型（Haiku）做工具选择
+- 管家本身**仍用**强模型（Opus / Sonnet）做推理 + 路由
+- 错误信息**回流**到管家 LLM，让其自主决定后续动作
+- 失败时 LangGraph Checkpointer 保证可恢复
+
+### 5.6 Skill = 能力包，不等于 Sub-Agent（ADR-006）
+
+#### 5.6.1 背景
+
+家属用户希望不写代码就能给管家加能力。最初设计把 Skill 包装成 `SkillAgent`（独立 Sub-Agent 用小模型），
+发现这有两个问题：
+
+1. **质量问题**：复杂 Skill（PDF 摘要、股票分析）用小模型质量存疑
+2. **主流框架都没有**：Anthropic / LangChain / AutoGen / CrewAI 都没有 "Skill = Sub-Agent" 这种设计
+
+#### 5.6.2 业界主流做法
+
+| 框架 | Skill 形态 | 执行方 |
+|------|-----------|--------|
+| **Anthropic Claude** | SKILL.md + 资源文件 | **主 Agent（最强模型）** |
+| **LangChain Agent** | Tool（带 prompt 注入） | 绑定到 Agent LLM |
+| **Microsoft AutoGen** | `AssistantAgent` 持有 skill prompt | 同一个 Agent |
+| **CrewAI** | Task → Tool | TaskExecutor 绑定的 Agent |
+| **OpenAI Swarm** | Instructions + handover | 当前 Agent（可切换） |
+
+**共同规律**：Skill 本质上是"能力的描述/定义"，执行方始终是持有 SKILL 的那个 Agent 本身。
+
+#### 5.6.3 决策
+
+| 决策项 | 内容 |
+|--------|------|
+| Skill 形态 | **能力包**（含 `system_prompt` + `tools` + 资源文件） |
+| 执行方 | **管家 LLM**（强模型，不单独起 Sub-Agent） |
+| 加载机制 | `SkillLoader` 扫描 `skills/` → 注入管家 `system_prompt` + 注册 tools |
+| 与 Sub-Agent 关系 | Skill **不**继承 `BaseAgent`，独立概念 |
+| 复用模式 | 亲属只需写一个 SKILL.md 文件，扔进 `~/.smartbutler/skills/` |
+
+#### 5.6.4 边界澄清（任务划分）
+
+| 任务类型 | 走 Sub-Agent | 走 Skill |
+|----------|--------------|----------|
+| 控制具体设备（窗帘 / 灯 / 空调） | ✅ HomeAgent | - |
+| 日程 OAuth / webhook 等副作用 | ✅ ScheduleAgent | - |
+| 搜索流量控制 / 熔断 | ✅ SearchAgent | - |
+| 长时任务（盯着股票异动） | ✅ 独立 Sub-Agent | - |
+| PDF 摘要 | - | ✅ pdf-summary skill |
+| 股票分析 | - | ✅ stock-analysis skill |
+| 亲属加的"健康饮食建议" | - | ✅ my-diet skill |
+
+**判断依据**：
+- 需要**状态机**、**副作用管理**、**独立 LLM 推理** → Sub-Agent
+- 只需要**强模型 + 步骤提示 + 工具** → Skill
+
+### 5.7 Anthropic Skills 格式标准（ADR-007）
+
+#### 5.7.1 背景
+
+亲属加技能不能用项目自创格式，否则亲属要学一套新东西。
+直接对标 **Anthropic Skills** 格式，亲属在 Anthropic 生态下写过的 SKILL.md 直接能用。
+
+#### 5.7.2 标准 SKILL.md 格式
+
+```markdown
+---
+name: my-skill
+description: |
+技能描述。
+When to use: 触发场景（关键，决定管家 LLM 是否调用）。
+When NOT to use: 反例（避免误触发）。
+---
+
+# My Skill
+
+## Steps
+1. ...
+
+## Available Tools
+- tool_name(...)
+
+## Output Format
+...
+```
+
+外加可选子目录：`scripts/`（自动生成 Tool）/ `templates/` / `resources/`。
+
+#### 5.7.3 SmartButler 适配
+
+- `SkillLoader` 扫描两个目录：
+  - 项目内：`smartbutler/skills/builtin/`（随仓库提交）
+  - 用户级：`~/.smartbutler/skills/`（亲属/用户自定义，无需改代码）
+- 解析 YAML frontmatter 提取 `name` / `description`
+- body 作为 `system_prompt` 片段追加到管家 system prompt
+- `scripts/*.py` 按 `@register_tool(scope=SKILL)` 装饰器规范自动生成 `BaseTool`
+
+#### 5.7.4 失败回退
+
+| 失败类型 | 处理 |
+|----------|------|
+| SKILL.md 缺 frontmatter | 启动 ERROR 日志，跳过该 skill |
+| YAML 解析失败 | 启动 ERROR 日志，跳过该 skill |
+| tools/*.py 加载失败 | Skill 内 LLM 看到错误消息，可自主决定是否继续 |
+| Skill 整体加载失败 | 不影响其他 Skill 加载，管家继续启动 |
+
+#### 5.7.5 Phase 5 实现，本节先确定接口
+
+具体实现细节在 Phase 5 展开。
 
 ---
 
