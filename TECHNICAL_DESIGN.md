@@ -1152,9 +1152,31 @@ When NOT to use: 反例（避免误触发）。
 
 - ❌ SkillsMiddleware 真中间件(Phase 6+ 视需要再接,代价 ~200 行适配器)
 - ❌ INTERRUPT 模式的真审批(Phase 7 接 LangChain `HumanInTheLoopMiddleware`)
-- ❌ 多源 skill 加载(Phase 7+ 接 `~/.smartbutler/skills/` + 项目级)
-- ❌ Skill 热更新(Phase 8 部署时考虑)
 - ❌ Skill 自描述工具(`SkillToolResolver`,Phase 7+)
+
+> 🆕 **2026-10-09 增量**:Skill 多源加载 + 热更新均已落地(从"不做"挪到"已做")。
+>
+> **多源加载**:
+>
+> | 维度 | 落地 |
+> |---|---|
+> | 机制 | `SkillSettings.user_skills_dir` 字段 + `scan_skills_dirs()` 多根合并;冲突时 builtin 权威(user 同名被忽略 + 告警) |
+> | 关闭 | `.env` 置 `SMARTBUTLER_SKILL_USER_SKILLS_DIR=`(空字符串)= 关用户源 |
+> | 元数据 | `SkillMetadata.source: Literal["builtin", "user"]` |
+> | 排序 | builtin 先,user 后,各源内按 name 升序 |
+> | 测试 | `tests/unit/thinking/skills/test_multi_source.py` — 13 用例(合并 / 冲突 / 跳过 / 排序) |
+> | 改动文件 | `scanner.py` / `runtime.py` / `config/skills.py` / `permissions.py` / `filesystem_backend.py` |
+>
+> **热更新**:
+> | 维度 | 落地 |
+> |---|---|
+> | 机制 | 惰性 mtime 检测 + 重扫;借鉴 deepagents `before_agent` 钩子 + `state["skills_metadata"]=None` 触发重扫的设计思想 |
+> | 不接 `AgentMiddleware` | 与本节"放弃 SkillsMiddleware 抽象"决策一致(自建 `StateGraph` 不用 `create_agent`) |
+> | 触发时机 | `SkillRuntime.render_prompt_snippet()` / `find_skill_by_name()` 每次调用前检测 |
+> | 失败回退 | 重扫失败 → 保留旧缓存 + warn + 仍推进指纹(避免每次重试) |
+> | 配置开关 | `SkillSettings.enable_hot_reload: bool = True`(生产可关) |
+> | 测试 | `tests/unit/thinking/skills/test_hot_reload.py` — 13 用例(指纹 / 增删 / 失败回退 / 关闭开关) |
+> | 改动量 | `runtime.py` +90 行 / `config/skills.py` +9 行 / 新测试 1 文件 |
 
 ### 5.8 事件驱动架构（ADR-008，Phase 7）
 

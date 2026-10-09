@@ -152,35 +152,22 @@ class TestButlerOrchestrator:
         assert orch._skill_prompt_snippets == []  # type: ignore[attr-defined]
 
     def test_ensure_graph_collects_tools(self) -> None:
-        """未注入 compiled 时,_ensure_graph 应当构造并缓存。"""
+        """未注入 compiled 时,_ensure_graph 应当构造并缓存。
+
+        2026-10-09 改:用 mock 隔离 _collect_tools,因为 FakeMessagesListChatModel
+        不支持 bind_tools,而 _collect_tools 真实返回的工具数会随注册表变化,
+        不应作为本测试断言对象(本身有 test_collect_tools_* 覆盖)。
+        """
+        from unittest.mock import patch
+
         orch = ButlerOrchestrator(
             llm=_FakeBaseLLM(),  # type: ignore[arg-type]
             llm_settings=_FakeSettings(),
         )
-        # 反射 settings → 构造 adapter → build graph
-        # 这里我们替换底层 chat_adapter 让 build() 不出错
-        compiled = _ensure_graph_works(orch)
+
+        with patch.object(orch, "_collect_tools", return_value=[]):
+            compiled = orch._ensure_graph()  # type: ignore[attr-defined]
+
         assert compiled is not None
         # 第二次调用复用
         assert orch._ensure_graph() is compiled  # type: ignore[attr-defined]
-
-
-def _ensure_graph_works(orch: ButlerOrchestrator) -> Any:
-    """真实走一遍 _ensure_graph,验证 ToolRegistry + AgentManager 集成无错。
-
-    因为 _make_chat_adapter 内部要构造 ChatOpenAI(api_key 假) — 我们把它替换掉。
-    """
-    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-    from langchain_core.messages import AIMessage
-
-    fake_chat = FakeMessagesListChatModel(responses=[AIMessage(content="ok")])
-
-    # 替换 chat_adapter 构造
-    def _fake_make(orch_obj: ButlerOrchestrator) -> Any:  # noqa: ARG001
-        adapter = ButlerChatModelAdapter.__new__(ButlerChatModelAdapter)
-        adapter._base_llm = orch_obj._llm  # type: ignore[attr-defined]
-        adapter._chat = fake_chat  # type: ignore[attr-defined]
-        return adapter
-
-    orch._make_chat_adapter = _fake_make.__get__(orch, type(orch))  # type: ignore[attr-defined]
-    return orch._ensure_graph()  # type: ignore[attr-defined]

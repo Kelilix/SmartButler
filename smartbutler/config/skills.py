@@ -54,6 +54,14 @@ class SkillSettings(BaseSettings):
             "在 .env 里置空(SMARTBUTLER_SKILL_USER_SKILLS_DIR=)可关闭用户源。"
         ),
     )
+    # 🆕 2026-10-09:Skill 热更新开关(借鉴 deepagents before_agent 钩子思路,落地为惰性 mtime 检测)
+    enable_hot_reload: bool = Field(
+        default=True,
+        description=(
+            "是否启用 skill 热更新。开启后,render_prompt_snippet / find_skill_by_name "
+            "每次调用前会检测 skills_dirs 树 mtime,变化则重扫。生产环境可设为 False 关闭。"
+        ),
+    )
 
 
 def load_skill_settings() -> SkillSettings:

@@ -172,16 +172,22 @@ class ButlerOrchestrator:
     # ---------- 工具视图 ----------
 
     def _collect_tools(self) -> list[Any]:
-        """收集所有可用工具:global tool + Sub-Agent delegate tool。
+        """收集所有可用工具:管家可见 tool + Sub-Agent delegate tool。
 
         返回值已是 LangChain ``StructuredTool`` 列表(统一形态),
         不暴露内部 ``BaseTool`` / ``FunctionTool``。
+
+        范围说明(2026-10-09 改):
+        之前用 get_global() 只拿 scope=GLOBAL/COMMON 的 tool,
+        会漏掉 BUTLER scope 的 tool(如 reload_skills)。
+        改成 get_butler() → 覆盖 GLOBAL + COMMON + BUTLER + SKILL,
+        排除 AGENT(子 agent 私有,管家通过 delegate_to_* 调用)。
         """
         from smartbutler.capabilities.tools.langchain_adapter import collect_langchain_tools
 
-        # 1. 普通 tool:BaseTool → StructuredTool
+        # 1. 管家可见的普通 tool:BaseTool → StructuredTool
         tools: list[Any] = collect_langchain_tools(
-            list(self._tool_registry.get_global()),
+            list(self._tool_registry.get_butler()),
         )
         # 2. Sub-Agent delegate tool:BaseAgent.to_langchain_tool() 直接返回 StructuredTool
         tools.extend(self._agent_manager.get_delegate_tools())
