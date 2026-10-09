@@ -15,6 +15,7 @@ from smartbutler.config.agent import AgentSettings, load_agent_settings
 from smartbutler.config.base import PROJECT_ROOT, SmartButlerBaseSettings
 from smartbutler.config.llm import LLMSettings, load_llm_settings
 from smartbutler.config.logging import LoggingSettings, load_logging_settings
+from smartbutler.config.skills import SkillSettings, load_skill_settings
 from smartbutler.config.storage import StorageSettings, load_storage_settings
 
 __all__ = [
@@ -24,8 +25,10 @@ __all__ = [
     "StorageSettings",
     "LoggingSettings",
     "AgentSettings",
+    "SkillSettings",
     "load_llm_settings",
     "load_storage_settings",
     "load_logging_settings",
     "load_agent_settings",
+    "load_skill_settings",
 ]

@@ -17,7 +17,7 @@
 | **Phase 3** | Sub-Agent 层 | ✅ | BaseAgent + AgentManager + `TestTimeAgent` 示例 | ADR-005 |
 | **Phase 4** | LangGraph Loop + Supervisor | ✅ | StateGraph + ToolNode + Checkpointer + ButlerPromptBuilder（Skill 注入点占位） | ADR-005 |
 | **Phase 4b** | ProactiveLoop 框架 | ✅ | 框架 + `ProactiveReasoning` 降级后备 + 沉默默认 + 最小可用场景 | 硬编码实现 | ADR-009 |
-| **Phase 5** | Skill loader | ⏳ 下一站 | SKILL.md → 能力包 → 注入 Butler system prompt + 注册 tools | ADR-006 / ADR-007 |
+| **Phase 5** | Skill loader | ✅ | SKILL.md → 扫描解析 → 注入 Butler system prompt + 6 个文件工具 + 3 类权限 | ADR-006 / ADR-007 |
 | **Phase 6** | 情感层 | ⏳ | Personality + Memory（短期 / 长期 / 情景记忆） | - |
 | **Phase 6b** | ProactiveLoop 真实化 | ⏳ **待 Phase 6 完成** | 降级后备 → 接 Memory + Persona + LLM 推理 | 从硬编码判断是否主动建议改成通过Memory/Personality + LLM判断 | ADR-009 |
 | **Phase 7** | 事件驱动 + 路由 | 🟡 骨架 | 协议 + 抽象接口已就位（`smartbutler/events/`）；**0 行实现**——EventNormalizer / EventTrigger.route() 真实路由 / 设备适配器全部待补 | ADR-008 / ADR-009 |
@@ -55,7 +55,7 @@
 
 > 这里只列**下一站**开始的工作，**不要**塞进所有远期任务。
 
-- [ ] **Phase 5a：Skill loader**（1-2 周）—— `smartbutler/skills/` 目录；`SkillLoader.scan()` 扫 builtin + `~/.smartbutler/skills/`；`ButlerOrchestrator` 在 `ainvoke()` 入口前调 `_inject_skills_into_prompt()`。**唯一 Phase 5 剩余工作**。
+- [x] **Phase 5a：Skill loader**（1-2 周）—— `smartbutler/skills/builtin/` 目录 + `SkillRuntime.from_settings()` 一行装配 + 6 个文件工具(`read_file`/`write_file`/`edit_file`/`delete_file`/`ls`/`grep`/`glob`)+ 3 类路径 × 3 类模式权限(`allow`/`deny`/`interrupt`)+ 55 个单测 + 1 端到端集成测试。详见 TECHNICAL_DESIGN.md §5.7.6。
 - [ ] **Phase 6：Personality + Memory**（2-3 周）—— `smartbutler/emotion/personality.py`（Personality 类：语气 / 称呼 / 禁忌 / 风格）+ `smartbutler/emotion/memory/`（short_term / long_term / episodic）。
 - [ ] **Phase 6b：ProactiveLoop 真实化**（2-3 周，**必须等 Phase 6 完成后启动**）—— `RuleBasedProactiveReasoning` 是降级后备永久保留，**不是** Phase 6b 完成后要删的"占位"。真实化版 = `LLMProactiveReasoning`：调 LLM 综合判断 + 读 Personality + 查 Memory + 5 分钟内同 topic dedup。LLM 故障/timeout/key 失效时降级到 `RuleBasedProactiveReasoning`——URGENT 事件必须能在 LLM 不可用时主动开口。
 - [ ] **Phase 7 真实实现**（与 Phase 5a 串行，3-4 周）—— EventNormalizer 真实实现（设备原始消息 → BaseEvent）+ EventTrigger.route() 真实实现（user → Reactive，设备/定时器 → Proactive）+ 至少 1 个设备适配器（建议先做 timer.remind，最小可用）+ 架构不变量 #7/#8 单测钉死。

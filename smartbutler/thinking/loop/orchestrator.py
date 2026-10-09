@@ -37,8 +37,9 @@ from smartbutler.thinking.loop.state import (
     DEFAULT_MAX_ITERATIONS,
     ButlerState,
 )
-from smartbutler.thinking.prompt.builder import ButlerPromptBuilder
 from smartbutler.thinking.proactive import ProactiveReasoning, ProactiveResult
+from smartbutler.thinking.prompt.builder import ButlerPromptBuilder
+from smartbutler.thinking.skills.runtime import SkillRuntime
 
 _logger = structlog.get_logger(__name__)
 
@@ -98,6 +99,7 @@ class ButlerOrchestrator:
         graph_builder: ButlerGraphBuilder | None = None,
         proactive_reasoning: ProactiveReasoning | None = None,
         enable_proactive_advice: bool = False,
+        skill_runtime: SkillRuntime | None = None,
     ) -> None:
         """构造 orchestrator。
 
@@ -113,6 +115,10 @@ class ButlerOrchestrator:
             enable_proactive_advice: 🆕 Phase 5+,是否在 ``ainvoke`` 链尾追加
                 Proactive 主动建议。**默认 False**——保持现有 e2e 测试零修改。
                 调成 True 后,Reactive 链尾会按规则触发 Proactive 建议追加。
+            skill_runtime: 🆕 Phase 5,Skill 子系统运行时句柄。
+                注入后,管家自动获得 6 个文件工具(read_file/write_file/edit_file/
+                delete_file/ls/grep/glob)+ skill list 注入 system prompt。
+                None → 不注入 skill 能力(老行为,零影响)。
         """
         self._llm = llm
         self._tool_registry = tool_registry or ToolRegistry.get_default()
@@ -130,6 +136,19 @@ class ButlerOrchestrator:
         self._proactive_reasoning = proactive_reasoning
         self._proactive_loop: ProactiveLoop | None = None  # 懒构建
         self._enable_proactive_advice = enable_proactive_advice
+
+        # Phase 5+: Skill 子系统
+        self._skill_runtime = skill_runtime
+        if skill_runtime is not None:
+            # 注册 6 个文件工具到 default registry(幂等)
+            from smartbutler.capabilities.tools.types import ToolAlreadyRegisteredError
+
+            for tool in skill_runtime.build_file_tools():
+                try:
+                    self._tool_registry.register(tool)
+                except ToolAlreadyRegisteredError:
+                    # 单测 / 重入场景:跳过
+                    pass
 
     # ---------- Skill 注入(Phase 5 占位) ----------
 
@@ -179,10 +198,15 @@ class ButlerOrchestrator:
         self._chat_adapter = self._make_chat_adapter()
         # 2. 收集工具
         self._all_tools = self._collect_tools()
-        # 3. 拼 system prompt
+        # 3. 拼 system prompt(含 skill list 注入)
+        skill_snippets = list(self._skill_prompt_snippets)
+        if self._skill_runtime is not None:
+            skill_list_prompt = self._skill_runtime.render_prompt_snippet()
+            if skill_list_prompt:
+                skill_snippets.append(skill_list_prompt)
         system_prompt = ButlerPromptBuilder().build(
             tool_specs=self._all_tools,
-            skill_prompt_snippets=self._skill_prompt_snippets,
+            skill_prompt_snippets=skill_snippets,
         )
         # 4. build graph
         self._compiled = (

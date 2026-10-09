@@ -57,9 +57,16 @@ class TestGetCurrentTime:
         assert "+08:00" in result
 
     def test_unknown_timezone_fallback(self) -> None:
-        result = get_current_time("Mars/Olympus")
-        # 未知时区应回退到 UTC
-        assert "+00:00" in result or "已回退" in result
+        """未知时区必须 fail-loud(抛 ToolError),不静默回退 UTC。
+
+        设计决策(见 datetime.py:64-66 注释):
+        静默回退 UTC 会让 LLM 拿到误导性时间后自行 +8 兜底,
+        这种"瞎猫碰上死耗子"的成功比明确失败更危险。
+        """
+        from smartbutler.capabilities.tools.types import ToolError
+
+        with pytest.raises(ToolError, match="未知时区"):
+            get_current_time("Mars/Olympus")
 
     def test_tool_registered(self) -> None:
         # 模块导入已触发 @register_tool

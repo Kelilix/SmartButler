@@ -86,10 +86,11 @@ SmartButler（大管家）是一个**通用智能体**，旨在为用户提供�
 | **Phase 2** | Tool 能力层 | ⏳ **当前** | BaseTool + ToolRegistry + Decorator + LangChain Adapter | ADR-002 |
 | **Phase 3** | Sub-Agent 层 | ✅ 已完成 | BaseAgent + AgentManager + `TestTimeAgent` 示例（注册 capabilities 已有 tool，0 失败） | ADR-005 |
 | **Phase 4** | LangGraph Loop + Supervisor | ✅ 已完成 | StateGraph + ToolNode + Checkpointer + Skill Prompt 注入 | ADR-005 |
-| **Phase 5** | Anthropic Skills loader + ProactiveLoop 框架 | ⏳ | SKILL.md → 能力包 → 注入 Butler system prompt + 注册 tools；**+ ProactiveLoop 框架**（ProactiveReasoning **降级后备** + 沉默支持 + 最小可用场景）| ADR-006 / ADR-007 / **ADR-009** |
+| **Phase 4b** | ProactiveLoop 框架 | ✅ 已完成 | ProactiveLoop + ProactiveReasoning **降级后备**（`RuleBasedProactiveReasoning`，**永不被删**） + 沉默支持 + 最小可用场景（定时器沉默判断） + EventTrigger.route() 单测钉死。**见 §5.9 / ADR-009** | **ADR-009** |
+| **Phase 5** | Anthropic Skills loader | ⏳ 下一站 | SKILL.md → 能力包 → 注入 Butler system prompt + 注册 tools。**唯一 Phase 5 剩余工作**（ProactiveLoop 框架已并入 Phase 4b）| ADR-006 / ADR-007 |
 | **Phase 6** | 情感层 | ⏳ | Personality + Memory | - |
 | **Phase 6b** | ProactiveLoop 真实化 | ⏳ **待 Phase 6 完成** | 降级后备 → LLM 综合判断 + 读 Memory + 读 Persona + dedup；**降级后备永久保留** | **ADR-009** |
-| **Phase 7** | 事件驱动（被动触发）+ Proactive 路由 | 🆕 **当前** | 事件总线 + 设备接入协议 + EventNormalizer + **EventTrigger.route()**（**显式路由**到 Reactive/Proactive） + AnswerRouter（**只放协议 + 抽象接口，Phase 5-6 阶段 0 行实现**）| ADR-008 / **ADR-009** |
+| **Phase 7** | 事件驱动（被动触发）+ Proactive 路由 | 🟡 骨架 | 事件总线 + 设备接入协议 + EventNormalizer + **EventTrigger.route()**（**显式路由**到 Reactive/Proactive） + AnswerRouter。**当前只放协议 + 抽象接口，0 行实现**——真实路由逻辑等 Phase 7 启动时填充。**见 §5.8 / ADR-008 + §5.9 / ADR-009** | ADR-008 / **ADR-009** |
 | **Phase 8** | 核心业务 Sub-Agent | ⏳ | HomeAgent（接入 HomeAssistant）/ ScheduleAgent / SearchAgent 等。**与事件驱动联动**：HomeAgent 通过 EventBus 订阅 `device.*` 主题。仅 Phase 7 + 真实 HomeAssistant 环境就绪后启动；具体技术方案到时再定 | - |
 | **Phase 9** | 多模态感知 | ⏳ | ASR + TTS + Vision（原 Phase 7 顺延）| - |
 | **Phase 10** | 主动服务 | ⏳ | 摄像头 / 麦克风监听 / 计划任务（**与 Phase 7 事件总线联动**）| - |
@@ -1084,6 +1085,77 @@ When NOT to use: 反例（避免误触发）。
 
 具体实现细节在 Phase 5 展开。
 
+#### 5.7.6 🆕 Phase 5 Skill 实施方案（2026-10-09 决议）
+
+> **修订（2026-10-09）**：Phase 5 Skill loader **实际实施方案**与原 §5.6.3 抽象决策**有 4 点关键差异**，本节落地。
+
+**原 §5.6.3 决策**（抽象）：
+
+- Skill = 能力包(`system_prompt` + `tools` + 资源文件)
+- 由管家 LLM 加载并执行
+
+**Phase 5 实际落地**（具体）：
+
+| 维度 | 方案 D（原推） | **方案 D 实施版（最终）** |
+|---|---|---|
+| Skill 扫描 | 自写 SKILL.md 解析器 | ✅ 自写(`scanner.py`,150 行,frontmatter 完整) |
+| Skill 加载机制 | 自写 L1/L2 注入 | ✅ 自写(`prompt_renderer.py` + 6 个文件工具) |
+| LangChain 复用 | ❌ 完全自建 | ⚠️ **精简复用**——LangChain v1 抽象(`AgentMiddleware`)与 `StateGraph` 不直接兼容,放弃原推的"用 SkillsMiddleware 当中间件" |
+| Deep Agents 复用 | `deepagents.middleware.skills.SkillsMiddleware` | ⚠️ **仅复用 prompt 渲染思想**,自写 200 行 pathlib backend + 6 个 BaseTool 包装 |
+| 写文件机制 | `virtual_mode=True` 沙箱 | ✅ 同样机制,自写实现(更可控) |
+| 写文件权限 | 单一沙箱 | ✅ **3 类路径 × 3 类模式**(`allow` / `deny` / `interrupt`),参考 LangChain `FilesystemPermission` 字段定义 |
+| 工作目录 | 用户任意 | ✅ **`workspace/YYYYMMDD/`**(按日期子目录,自动建) |
+
+**为什么放弃原推的 SkillsMiddleware 方案**：
+
+1. `SkillsMiddleware` 继承 `AgentMiddleware`(LangChain v1.0+ 抽象),依赖 `ModelRequest` / `ModelResponse` 协议
+2. LangChain v1 `AgentMiddleware` **只对 `create_agent` 工作**,跟 SmartButler 自建 `StateGraph` 不直接兼容
+3. **若硬要适配,需要写 ~200 行 middleware 适配器**——比直接用 SkillsMiddleware 的工具函数还累
+4. SkillsMiddleware 内部的 L1 注入 / frontmatter 解析 / 路径加载**逻辑简单**(总计 ~300 行),自己重写更可控
+5. **不依赖中间件抽象 = 业务层零 LangChain 中间件耦合**
+
+**为什么仍值得装 deepagents 包**：
+
+1. `deepagents.middleware.permissions.FilesystemPermission` **字段定义** = 业界最佳实践(对齐 Anthropic Agent Skills spec)
+2. 后续 Phase 7 接 LangChain `HumanInTheLoopMiddleware` 时,deepagents 的权限模式是直接复用的
+3. 升级 `langchain-core <1.0` 约束到 `>=1.0` —— 跟 LangChain v1 生态对齐
+
+**3 类路径 × 3 类模式 权限规则**(参考 LangChain FilesystemPermission):
+
+| 路径类型 | mode | 行为 |
+|---|---|---|
+| `skills/builtin/<name>/**`(Skill 自有数据) | `allow` | 写不打扰 |
+| `workspace/**` / `workspace/YYYYMMDD/**`(工作目录) | `allow` | 写不打扰 |
+| 其他所有路径 | `interrupt` | Phase 5 暂以拒绝模拟(等 Phase 7 接 HITL 中间件) |
+
+**5.7.6 决策**：
+
+1. **基于 deepagents 设计思想自建精简版 Skill loader**——不复用 `SkillsMiddleware` 当中间件(抽象错位)
+2. **3 类路径 × 3 类模式 权限**——对齐 LangChain `FilesystemPermission` 字段,Phase 7 平滑接入 HITL
+3. **工作目录按日期子目录**——`workspace/YYYYMMDD/`,用户友好检索
+4. **Proactive 与 Reactive 看同一份 skill 列表**——不做 scope 过滤(2026-10-09 决策:主动建议基于已有能力)
+5. **不做 Proactive 写工具白名单**——"该不该主动做"由 Phase 11 习惯学习决定(2026-10-09 决策)
+6. **第一个内置 Skill = agent-browser**——用户提供 SKILL.md 后放在 `smartbutler/skills/builtin/agent-browser/`
+
+**5.7.6 落地文件清单**：
+
+- `smartbutler/thinking/skills/permissions.py` (180 行) — 权限规则 dataclass
+- `smartbutler/thinking/skills/filesystem_backend.py` (260 行) — pathlib 版精简 backend
+- `smartbutler/thinking/skills/scanner.py` (150 行) — SKILL.md frontmatter 解析
+- `smartbutler/thinking/skills/prompt_renderer.py` (50 行) — skill list → system prompt
+- `smartbutler/thinking/skills/runtime.py` (90 行) — `SkillRuntime` 装配入口
+- `smartbutler/capabilities/tools/skills/{read,write,fs_tools}.py` (3 个文件) — 6 个 BaseTool 包装
+- `smartbutler/config/skills.py` (45 行) — `SkillSettings` 配置
+- `tests/unit/thinking/skills/` (3 个测试文件,55 测试) — 单测 + 集成
+
+**5.7.6 不做的(留给后续 Phase)**：
+
+- ❌ SkillsMiddleware 真中间件(Phase 6+ 视需要再接,代价 ~200 行适配器)
+- ❌ INTERRUPT 模式的真审批(Phase 7 接 LangChain `HumanInTheLoopMiddleware`)
+- ❌ 多源 skill 加载(Phase 7+ 接 `~/.smartbutler/skills/` + 项目级)
+- ❌ Skill 热更新(Phase 8 部署时考虑)
+- ❌ Skill 自描述工具(`SkillToolResolver`,Phase 7+)
+
 ### 5.8 事件驱动架构（ADR-008，Phase 7）
 
 > **修订（2026-10-08）**：原 §5.8 "复用 ainvoke + parent_agent 路由"方案**已废弃**。
@@ -1450,6 +1522,146 @@ class ReactiveLoop:
 **理由**：ProactiveLoop 是 ReactiveLoop 的**镜像**结构，复用现有 thinking/ 底层，
 **不依赖** emotion/memory 真实数据。Phase 6b 上线后**不重构**——只填实现，且
 **保留降级后备**作为 LLM 故障时的安全网（见架构约束 #9：降级契约）。
+
+#### 5.9.8.1 ⚠️ Phase 4b 现状：Proactive / Reactive 之间**尚无护城河**（避免误读）
+
+> **本节是 §5.9.7"共享与独占"表 + §5.9.8"现在实现 vs 推迟"表的诚实补丁**。
+> §5.9.7 写"Proactive / Reactive 共享 LLM/Tool/Memory/Personality/Skill"是**最终目标**，
+> 但 **Phase 4b 当前实现里护城河尚未建立**——本节专门标注差距，
+> 避免 Phase 6b 启动时**误以为"护城河已经在了"而漏掉核心改造**。
+
+##### 当前实现的真实差异（实测 `proactive_loop.py` 得出）
+
+| 维度 | ReactiveLoop | ProactiveLoop | 当前真实差异 |
+|---|---|---|---|
+| 入口 | `ButlerOrchestrator.ainvoke()` | `ProactiveLoop.tick()` | ✅ 独立 |
+| **图** | `ButlerGraphBuilder.build()` | **同一张图**（注入到 ProactiveLoop）| ❌ **同一张图** |
+| **decide_node** | 同一份 | 同一份 | ❌ **完全相同** |
+| **system prompt** | `ButlerPromptBuilder.build()` | 同一份 | ❌ **完全相同** |
+| **ReAct 循环** | 同一份 | 同一份 | ❌ **完全相同** |
+| **状态 schema** | `ButlerState` | `ButlerState`（仅 `parent_agent="trigger:..."`）| ⚠️ 字段完全相同，仅 `parent_agent` 取值不同 |
+| 沉默合法 | ❌（必须答）| ✅（try/except + silent）| ✅ 真实差异 |
+| 触发判断 | ❌ | ✅（`ProactiveReasoning.should_respond`）| ✅ 真实差异 |
+| 主动推送路由 | ❌ | ✅（`ProactiveResult` + AnswerRouter）| ✅ 真实差异 |
+| **Memory 注入** | ❌（Phase 6 待实现）| ❌ **`skill_prompt_snippets: []`** | ❌ **都没有** |
+| **Personality 注入** | ❌（Phase 6 待实现）| ❌ | ❌ **都没有** |
+| **Skill 注入** | ❌（Phase 5 待实现）| ❌ | ❌ **都没有** |
+| **写工具白名单** | ✅ 全部工具 | ❌ **同样全部工具**（`proactive_loop.py:119-123` 注明"Phase 7.3 改造"但**未做**）| ❌ **完全一样** |
+
+**关键证据 1**（`smartbutler/thinking/loop/proactive_loop.py:236-251`）：
+
+```python
+input_state: dict[str, Any] = {
+    "messages": [HumanMessage(content=user_msg_text)],
+    "user_id": self._user_id,
+    "session_id": self._session_id,
+    "parent_agent": f"trigger:{event.source.value}",  # ← 唯一"差别"
+    "skill_prompt_snippets": [],                       # ← 空！
+    "iteration_count": 0,
+    "max_iterations": self._max_iterations,
+}
+```
+
+**`skill_prompt_snippets: []` 是空的**——当前 ProactiveLoop **根本不注入 Skill 清单**，
+更别提 Memory/Personality。
+
+**关键证据 2**（`smartbutler/thinking/loop/orchestrator.py:295-308`）：
+
+```python
+if effective_enable and _should_request_proactive(user_input):
+    advice = await self._request_proactive_advice(...)
+    if advice:
+        return f"{base_answer}\n\n💡 {advice}"
+```
+
+——**Proactive 建议是用"字符串拼接"塞到 Reactive 回复后面**。
+**没有进入 ReAct 链、没用上 system prompt、没读 memory**。
+
+**直接结论**：**Phase 4b 的 ProactiveLoop 与 ReactiveLoop 之间，没有护城河**。
+机制层面是**同一张图、同一份 prompt、同一份 decide_node、同一份 ReAct**。
+唯一差异只有 3 条：
+1. **入口不同**（`tick(event)` vs `ainvoke(user_input)`）
+2. **触发判断前置**（`ProactiveReasoning.should_respond`）
+3. **沉默是合法返回**（Proactive 可以返 silent，Reactive 必须答）
+
+##### 这是 Phase 4b 简化，不是最终架构
+
+> **当前"复用同图"是 Phase 4b 简化方案，不是最终设计**。
+> 不应被误读为"两条循环将来也不会分开"。
+
+理由：
+- **写工具白名单没做**——`proactive_loop.py:119-123` 注释明说"Phase 7.3 改造"但**当前未做**，
+  代码里 Proactive 与 Reactive 拿的是**同一份 `tool_registry.get_global()`**（`orchestrator.py:165-169`）。
+- **Personality 视角分流没做**——`ButlerPromptBuilder` 当前只产**一份** prompt，
+  没有 `for_proactive=True` 之类参数。
+- **Memory 检索策略没做**——Proactive 应当读"最近 N 小时事件流 + 用户偏好/习惯"，
+  Reactive 应当读"对话历史"，**两套策略**当前都没建。
+
+##### Phase 6b + Phase 7 须建立的真实护城河
+
+**护城河的本质**：**让 Proactive 不能破坏外部世界状态 + 决策视角与 Reactive 分流**。
+
+| 护城河维度 | 当前（Phase 4b）| Phase 6b + 7 目标 | 实现位置 |
+|---|---|---|---|
+| **不同的 system prompt** | ❌ 一致 | ✅ Proactive 用"主动观察/保守提醒"视角；Reactive 用"回答问题"视角 | `ButlerPromptBuilder.build()` 加 `for_proactive: bool` 参数 |
+| **不同的工具集（写隔离）** | ❌ Proactive 用全部 | ✅ Proactive 用**只读白名单**（`get_current_time` / `get_today_digest` / `web_fetch`，**禁**开灯/调日程/发邮件）| ProactiveLoop 持独立 `ToolRegistry` 子集；`BaseTool.write_op: bool` 标记 |
+| **不同的 memory 检索策略** | ❌ 都没注入 | ✅ Proactive 读"最近 N 小时事件流 + 用户偏好/习惯"；Reactive 读"对话历史 + 短期记忆" | `MemoryBackend.retrieve(scope="proactive"\|"reactive", ...)` |
+| **不同的 personality 视角** | ❌ 都没注入 | ✅ Proactive 主动时**保守**（"高情商提醒"，避免打扰）；Reactive 答问时**自然** | Personality 类暴露 `for_proactive()` 工厂方法 |
+| **不同的 ReAct 深度上限** | ⚠️ 数值差（5 vs 10）| ✅ Proactive **结构上不允许**调写工具（图层硬隔离，**不**靠数值限制）| 工具白名单强制 |
+| **错误语义** | ✅ Proactive 静默 | ✅ Proactive 静默 + 事件回灌（连续失败 3 次 → 告警主人）| `ProactiveLoop.tick()` try/except + 计数器 |
+| **沉默合规处理** | ✅ `ProactiveResult` 字段 | ✅ `AnswerRouter` 按 urgency 选推送渠道（URGENT 推音响 + App；NORMAL 仅 App）| `smartbutler/events/answer_router.py` |
+
+**最重要的两条护城河**（优先级 P0）：
+
+1. **工具集隔离**——Proactive 不能调写工具
+   - **理由**：防"事件→管家→开灯→又触发新事件→管家又主动开灯→循环"
+   - **实现**：`BaseTool` 加 `write_op: bool = False` 标记；
+     ProactiveLoop 启动时从 `ToolRegistry.get_global()` 过滤 `write_op=False` 的子集
+2. **prompt 视角分流**——Proactive 用不同的 system prompt
+   - **理由**：Reactive 的"你怎么理解这个"和 Proactive 的"你刚观察到 X，是否提醒"是**两个角色**
+   - **实现**：`ButlerPromptBuilder.build()` 增加 `role: Literal["reactive", "proactive"]` 参数
+
+##### 拆不拆图？——Phase 6b 启动时必须做的决策
+
+> **"复用同图 vs 独立图"是 Phase 6b 启动时必须明确的真问题**。
+> 当前 Phase 4b 的"复用同图"是**先行方案**，**不**等于最终决策。
+
+| 路径 | 评价 | 何时选 |
+|---|---|---|
+| **真拆图**（建 `ProactiveGraphBuilder` 独立建图）| 工具白名单 + prompt 分流**在图层硬隔离**，不靠运行时分支 | 决定走 P0 护城河 + 预计 Proactive 决策路径与 Reactive 差异大时 |
+| **不拆图**（在 `decide_node` 内根据 `parent_agent` 分支）| "复用同图"是**对的**——护城河在 decide_node 内，**不**在图层 | Proactive 决策路径与 Reactive **结构上一致**、仅视角不同时 |
+
+**本节不强制选边**——但**禁止**让 Phase 6b 启动时**默认沿用** Phase 4b 的"复用同图"而**不重新审视**。
+
+##### Phase 4b 完成定义（DoD 验收清单）
+
+为了让 Phase 4b **不被误读**为"Proactive 已具备护城河"，本节定义**最小验收线**：
+
+- [x] `ProactiveLoop.tick()` 返回 `ProactiveResult`（沉默是合法返回）
+- [x] `ProactiveReasoning.should_respond()` 触发判断可注入（默认 `RuleBasedProactiveReasoning`）
+- [x] ProactiveLoop 异常**永不抛出**给上游（try/except 全部降级 silent）
+- [x] Proactive 入口走 `_GraphLike.ainvoke()` 复用同一张图（**Phase 4b 简化决策**）
+- [ ] ⏳ **写工具白名单（推迟到 Phase 7/8 启动）**——`proactive_loop.py:119-123` 留了 placeholder。当前工程 `BaseTool` 已有 `readonly: bool` 字段（`base.py:69`），`get_current_time` / `web_fetch` 全部 `readonly=True`（`common/datetime.py:42` / `common/web.py:80`），**0 个写工具存在**——白名单是空过滤。**第一个写工具出现时**（Phase 7 设备 adapter 或 Phase 8 HomeAgent 接入）必须做白名单隔离，**否则事件→管家→写设备→又发事件→循环**。详见 §5.9.8.3 P0 护城河
+- [ ] ❌ **Personality 注入**——`_generate_message()` 未读 Personality
+- [ ] ❌ **Memory 注入**——`_generate_message()` 未读 Memory
+- [ ] ❌ **Skill 注入**——`input_state["skill_prompt_snippets"] = []`（**显式空**）
+- [ ] ❌ **不同的 system prompt**——Proactive 与 Reactive 用同一份
+- [ ] ❌ **AnswerRouter 集成**——`_extract_final_content()` 与 `_should_request_proactive()` 是**字符串拼接**（`orchestrator.py:305-308`），不是真正的 Proactive 推送
+
+> **Phase 4b 收尾 = 上述 5 个 ❌ + 1 个 ⏳ 状态全部明确标记优先级与启动时机**——
+> - ❌ **5 项**：Personality / Memory / Skill 注入 + 不同 system prompt + AnswerRouter 集成——**待 Phase 6b / 7 启动时按 P0 → P1 → P2 顺序补**
+> - ⏳ **1 项**：写工具白名单——**等 Phase 7/8 引入写工具时启动**（当前 0 个写工具，做了不报错也不生效）
+>
+> 不可在 `README.md` 或 commit message 里把 ❌ 描述为"已具备"。
+
+##### §5.9 内部一致性补丁
+
+- §5.9.7 "共享与独占"表里**"LLM 调用 / Tool / Memory / Personality / Skill"标 ✅**——**改成"目标"而非"现状"**，
+  避免读者误读为"Phase 4b 已实现"
+- §5.9.2 的双循环对比图**保留**——入口、沉默、推送路由的差异**真实存在**，
+  这些是 §5.9.8.1"当前实现的真实差异"表里的"✅ 真实差异"
+- §5.9.6 "Reactive → Proactive 内部通道"——**当前的字符串拼接实现**（`orchestrator.py:305-308`）**不算真正的内部通道**，
+  需在 §5.9.6 加注："当前实现是字符串拼接，**真正走 ProactiveLoop 拿建议**在 Phase 6b 之后"
 
 #### 5.9.9 不变量
 
