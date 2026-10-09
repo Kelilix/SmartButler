@@ -1,4 +1,4 @@
-"""SkillRuntime 装配 + 6 个文件 BaseTool 测试。"""
+"""SkillRuntime 装配 + 7 个文件 BaseTool 测试。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,14 +6,14 @@ from pathlib import Path
 import pytest
 
 from smartbutler.capabilities.tools.base import BaseTool
-from smartbutler.capabilities.tools.skills.fs_tools import build_default_skill_tools
-from smartbutler.capabilities.tools.skills.read_file import ReadFileTool
-from smartbutler.capabilities.tools.skills.write_file import WriteFileTool
 from smartbutler.thinking.skills import (
     SkillRuntime,
     SmartButlerFilesystemBackend,
     build_default_policy,
 )
+from smartbutler.thinking.skills.llm_tools import build_default_skill_tools
+from smartbutler.thinking.skills.llm_tools.read_file import ReadFileTool
+from smartbutler.thinking.skills.llm_tools.write_file import WriteFileTool
 
 
 @pytest.fixture

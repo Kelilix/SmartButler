@@ -4,6 +4,11 @@ LLM 看到的能力:
 - 读 skill 的 SKILL.md(看完 frontmatter 后第二步,看正文)
 - 读 workspace/YYYYMMDD/ 下的文件(回顾历史)
 - 读 smartbutler/skills/builtin/<name>/data/ 下的 cookie/cache
+
+所属:thinking/skills/llm_tools/。
+这是 SmartButlerFilesystemBackend.read() 的 LLM 适配层(以 BaseTool 形式暴露给管家),
+本质是"业务方法 + LLM 接口",不是 capabilities 层的通用 tool 能力。
+所以住在 thinking 层,而非 capabilities/tools/skills/。
 """
 from __future__ import annotations
 

@@ -4,6 +4,8 @@ LLM 看到的能力:
 - 写 skill 自有数据(skills/builtin/<name>/data/)
 - 写工作产出(workspace/YYYYMMDD/汇报.pptx 等)
 - 不在 work_dir 内的路径会触发 PermissionRejected
+
+所属:thinking/skills/llm_tools/。
 """
 from __future__ import annotations
 

@@ -64,7 +64,7 @@ class ProactiveDecision(BaseModel):
     )
 
     @classmethod
-    def silent(cls, reason: str = "default_silent") -> "ProactiveDecision":
+    def silent(cls, reason: str = "default_silent") -> ProactiveDecision:
         """便捷构造器:沉默决策。
 
         70%+ 的 ProactiveReasoning 决策应该走这个——好管家话不多。
@@ -121,7 +121,7 @@ class ProactiveResult(BaseModel):
         cls,
         reason: str = "default_silent",
         related_event_id: str | None = None,
-    ) -> "ProactiveResult":
+    ) -> ProactiveResult:
         """便捷构造器:沉默结果。"""
         return cls(
             acted=False,
@@ -140,7 +140,7 @@ class ProactiveResult(BaseModel):
         urgency: ProactiveUrgency = ProactiveUrgency.LOW,
         push_channel: str | None = None,
         related_event_id: str | None = None,
-    ) -> "ProactiveResult":
+    ) -> ProactiveResult:
         """便捷构造器:主动推送结果。"""
         if not message or not message.strip():
             msg = "acted_with 不允许空 message"

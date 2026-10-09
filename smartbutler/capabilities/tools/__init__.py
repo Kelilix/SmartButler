@@ -34,6 +34,17 @@ LangChain 适配(Phase 4 才用):
 from __future__ import annotations
 
 from smartbutler.capabilities.tools.base import BaseTool, FunctionTool
+
+# 显式 import common/ 下的所有 tool 模块,
+# 触发 @register_tool 副作用,把 2 个 common tool 注册到 default registry。
+# (Phase 6.3:reload_skills 已搬到 thinking/skills/,由 bootstrap() 阶段 0 触发 import)
+# 任何 `import smartbutler.capabilities.tools` 的人都会自动执行这段。
+from smartbutler.capabilities.tools.common import (  # noqa: F401
+    datetime as _common_datetime,
+)
+from smartbutler.capabilities.tools.common import (  # noqa: F401
+    web as _common_web,
+)
 from smartbutler.capabilities.tools.decorator import register_tool
 from smartbutler.capabilities.tools.langchain_adapter import (
     collect_langchain_tools,
@@ -51,16 +62,6 @@ from smartbutler.capabilities.tools.types import (
     ToolScope,
     ToolTimeoutError,
 )
-
-# 显式 import common/ 下的所有 tool 模块,
-# 触发 @register_tool 副作用,把 3 个 common tool 注册到 default registry。
-# 任何 `import smartbutler.capabilities.tools` 的人都会自动执行这段。
-from smartbutler.capabilities.tools.common import (  # noqa: F401
-    datetime as _common_datetime,
-    skill_admin as _common_skill_admin,
-    web as _common_web,
-)
-
 
 # 全量 tool 白名单 ——
 # 任何"对管家 + 业务"可见的 tool,启动期必须全部出现在 ToolRegistry.get_default() 中。
@@ -118,6 +119,21 @@ def bootstrap(
     _logger = structlog.get_logger(__name__)
     target = registry if registry is not None else ToolRegistry.get_default()
 
+    # ---- 阶段 0:触发所有 common/ thinking/ skill_admin 的 @register_tool 副作用 ----
+    # Phase 6.3 修订:reload_skills 从 capabilities.tools.common/ 搬到 thinking/skills/,
+    # 顶层 import 不再由 capabilities.tools.__init__ 触发,
+    # 这里显式 import 一次让 @register_tool 副作用发生。
+    # 这么改后,capabilities.tools 不再 import 任何 thinking 模块,
+    # agents ↔ capabilities.tools 整体循环被彻底切断。
+    #
+    # 同样道理:common/{datetime,web} 的 @register_tool 副作用原本由
+    # capabilities.tools.__init__ 顶层 import 触发,但其他测试可能 reset registry,
+    # 导致副作用"看似已触发,实际被清空"。这里统一由 bootstrap() 显式触发,
+    # 任何时刻调 bootstrap() 都能保证 common tool 重新出现在 registry 里。
+    import smartbutler.capabilities.tools.common.datetime  # noqa: F401
+    import smartbutler.capabilities.tools.common.web  # noqa: F401
+    import smartbutler.thinking.skills.skill_admin  # noqa: F401
+
     # ---- 阶段 1:校验 common tool 已就位 ----
     actual_names = {t.name for t in target.list_all()}
     expected_common = {"get_current_time", "reload_skills", "web_fetch"}
@@ -132,7 +148,11 @@ def bootstrap(
 
     # ---- 阶段 2:注册 skill tool(7 个文件工具)----
     if skill_runtime is not None:
-        from smartbutler.capabilities.tools.skills import (
+        # 走 thinking 层入口 ——
+        # 7 个 file tool 现住 thinking/skills/llm_tools/,
+        # register_default_skill_tools(backend, registry) 在那里定义,
+        # thinking → capabilities 单向依赖,无需 lazy
+        from smartbutler.thinking.skills.llm_tools import (
             register_default_skill_tools,
         )
 

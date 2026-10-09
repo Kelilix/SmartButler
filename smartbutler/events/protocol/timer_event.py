@@ -83,7 +83,7 @@ class TimerEvent(BaseEvent):
         timezone: str = "Asia/Shanghai",
         priority: EventPriority = EventPriority.NORMAL,
         payload: dict | None = None,
-    ) -> "TimerEvent":
+    ) -> TimerEvent:
         """工厂方法。"""
         topic = f"timer.{timer_type.value}"
         return cls(

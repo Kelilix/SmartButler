@@ -23,7 +23,6 @@ from smartbutler.thinking.loop.orchestrator import (
     _should_request_proactive,
 )
 
-
 # ---------- _should_request_proactive 规则测试 ----------
 
 

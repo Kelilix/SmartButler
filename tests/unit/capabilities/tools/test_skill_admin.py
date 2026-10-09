@@ -1,4 +1,4 @@
-"""reload_skills tool 测试(2026-10-09 增)。
+"""reload_skills tool 测试(2026-10-09 增,Phase 6.3 移到 thinking/skills/)。
 
 覆盖:
 - tool 已通过 @register_tool 装饰器注册到默认 registry
@@ -6,30 +6,45 @@
 - 实际调用走 SkillRuntime.mark_dirty(不直接动 _fingerprint)
 - 错误路径:SkillRuntime 不可用 → 抛 ToolError
 
-注意:其他测试文件(如 test_decorator / test_orchestrator_integration)会在
-fixture 末尾调 reset_default 把全局单例清空,本测试每次断言前必须 reload
-本模块以触发 @register_tool 装饰器副作用,否则会偶发失败。
+Phase 6.3 修订:
+- skill_admin 从 capabilities/tools/common/ 搬到 thinking/skills/
+- 触发 @register_tool 副作用的入口改成 smartbutler.capabilities.tools.bootstrap()
+  (见 capabilities/tools/__init__.py 阶段 0)
+- 本测试在 import 测试模块后还要调一次 bootstrap() 阶段 0 来保证注册
 """
 
 from __future__ import annotations
 
-import importlib
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-import smartbutler.capabilities.tools.common.skill_admin as skill_admin_module
-from smartbutler.capabilities.tools.common.skill_admin import reload_skills
+import smartbutler.thinking.skills.skill_admin as skill_admin_module
 from smartbutler.capabilities.tools.registry import ToolRegistry
 from smartbutler.capabilities.tools.types import ToolError, ToolScope
+from smartbutler.thinking.skills.skill_admin import reload_skills
 
 
 def _ensure_registered() -> None:
-    """保证 reload_skills 在默认 registry 里(其他测试可能 reset 过)。"""
-    # 已注册就跳过,避免重复
+    """保证 reload_skills 在默认 registry 里(其他测试可能 reset 过)。
+
+    Phase 6.3 修订:不再用 importlib.reload(那是治标),
+    改成调 bootstrap() + 在 bootstrap 内部用 importlib.reload
+    重新触发 @register_tool 装饰器副作用。
+    """
     if ToolRegistry.get_default().try_get("reload_skills") is not None:
         return
-    importlib.reload(skill_admin_module)
+    # 其他测试可能 reset 了 default registry,导致 @register_tool 装饰器
+    # 副作用"已触发但被清空"。这里显式 reload 模块,让装饰器重跑。
+    import importlib
+
+    from smartbutler.capabilities.tools.common import datetime as _dt
+    from smartbutler.capabilities.tools.common import web as _web
+    from smartbutler.thinking.skills import skill_admin
+
+    importlib.reload(skill_admin)
+    importlib.reload(_dt)
+    importlib.reload(_web)
 
 
 def test_reload_skills_registered_in_default_registry() -> None:

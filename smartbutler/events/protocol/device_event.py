@@ -100,7 +100,7 @@ class DeviceEvent(BaseEvent):
         priority: EventPriority = EventPriority.NORMAL,
         payload: dict[str, Any] | None = None,
         timestamp: datetime | None = None,
-    ) -> "DeviceEvent":
+    ) -> DeviceEvent:
         """工厂方法:从设备 adapter 调用,自动填 source/topic/device_id。"""
         topic = f"device.{device_type.value}.{action}"
         return cls(

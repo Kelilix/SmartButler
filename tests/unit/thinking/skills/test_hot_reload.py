@@ -16,14 +16,11 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-import pytest
-
 from smartbutler.config.skills import SkillSettings
 from smartbutler.thinking.skills.runtime import (
     SkillRuntime,
     _compute_skills_fingerprint,
 )
-
 
 # ---------- helper ----------
 
@@ -182,7 +179,7 @@ class TestHotReload:
 
         shutil.rmtree(builtin / "alpha")
 
-        snippet = rt.render_prompt_snippet()
+        _snippet = rt.render_prompt_snippet()
         # 检查 rt.skills 列表(权威),而非 snippet 字符串(可能含别的样例)
         assert "alpha" not in [s.name for s in rt.skills]
         assert len(rt.skills) == 1
@@ -372,7 +369,6 @@ def test_mark_dirty_forces_reload(tmp_path: Path) -> None:
     rt = SkillRuntime.from_settings(_make_settings(builtin, workspace))
     rt.render_prompt_snippet()  # 先建稳缓存
     assert rt._fingerprint > 0.0
-    fp_before = rt._fingerprint
 
     # 主动标记(无返回值,只改指纹)
     rt.mark_dirty()

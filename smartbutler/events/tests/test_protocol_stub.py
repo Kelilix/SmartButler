@@ -35,7 +35,6 @@ from smartbutler.events.protocol.voice_event import (
     VoiceEvent,
 )
 
-
 # === BaseEvent ===
 
 class TestBaseEvent:

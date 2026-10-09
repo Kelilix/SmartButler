@@ -170,7 +170,7 @@ class TestReadFileToolEndToEnd:
         # 准备文件
         skill_runtime.backend.write("/20261009/test.md", "hello from test")
         # 调工具
-        from smartbutler.capabilities.tools.skills.read_file import ReadFileTool
+        from smartbutler.thinking.skills.llm_tools.read_file import ReadFileTool
 
         tool = ReadFileTool(skill_runtime.backend)
         result = asyncio.run(tool.arun(path="/20261009/test.md"))
@@ -179,7 +179,7 @@ class TestReadFileToolEndToEnd:
     def test_read_missing_file(
         self, skill_runtime: SkillRuntime
     ) -> None:
-        from smartbutler.capabilities.tools.skills.read_file import ReadFileTool
+        from smartbutler.thinking.skills.llm_tools.read_file import ReadFileTool
 
         tool = ReadFileTool(skill_runtime.backend)
         result = asyncio.run(tool.arun(path="/20261009/missing.md"))
@@ -190,7 +190,7 @@ class TestWriteFileToolEndToEnd:
     def test_write_creates_today_workspace(
         self, skill_runtime: SkillRuntime
     ) -> None:
-        from smartbutler.capabilities.tools.skills.write_file import WriteFileTool
+        from smartbutler.thinking.skills.llm_tools.write_file import WriteFileTool
 
         tool = WriteFileTool(skill_runtime.backend)
         today = skill_runtime.backend.today_workspace()
@@ -205,7 +205,7 @@ class TestWriteFileToolEndToEnd:
     def test_write_outside_sandbox_rejected(
         self, skill_runtime: SkillRuntime
     ) -> None:
-        from smartbutler.capabilities.tools.skills.write_file import WriteFileTool
+        from smartbutler.thinking.skills.llm_tools.write_file import WriteFileTool
 
         tool = WriteFileTool(skill_runtime.backend)
         result = asyncio.run(tool.arun(path="/../escape.txt", content="x"))

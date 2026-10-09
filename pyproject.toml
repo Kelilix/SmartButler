@@ -24,12 +24,24 @@ dependencies = [
     # langchain-openai: ChatOpenAI 实现,DeepSeek / Qwen / OpenRouter 等
     #                  OpenAI 兼容协议厂商均可复用该类（通过 base_url 切换）。
     "langchain-core>=1.0,<2.0",
-    "langchain-openai>=0.3,<1.0",
+    "langchain-openai>=1.0,<2.0",
     "langgraph>=1.0,<2.0",
-    "langgraph-checkpoint>=2.0,<3.0",
+    "langgraph-checkpoint>=4.1,<5.0",
     "langgraph-prebuilt>=1.0,<2.0",
+    # Phase 6.1: SqliteSaver 让短期记忆(checkpointer 状态)跨进程持久化。
+    # 默认 InMemorySaver 重启即丢,Phase 6b Proactive 真实化时必须能查"最近一次对话",
+    # 故直接接 SqliteSaver,不复用 in-memory 占位。
+    "langgraph-checkpoint-sqlite>=3.1,<4.0",
     # Phase 5: Skill loader 基于 deepagents 中间件。
-    "deepagents>=0.7,<1.0",
+    # 0.7.0~0.7.6 早期版本只支持 langchain 0.3,跟我们现在 langchain 1.x 不兼容;
+    # 0.7.20+ 已升级依赖要求,实测 0.7.23 与 langchain 1.4.3 / langchain-core 1.6.8
+    # 共存正常。下界锁到 0.7.20 避免 pip 解图时去试早期版本,把 resolution-too-deep
+    # 触发面缩到最小。
+    "deepagents>=0.7.20,<0.8",
+    # Phase 6: 长期记忆层。qdrant-client 用嵌入式模式 (path=...) 不需要起
+    # 独立服务;langmem 提供 LangGraph 集成的记忆管理抽象。
+    "qdrant-client>=1.19,<2.0",
+    "langmem>=0.0.30,<0.1",
     # Windows 上 zoneinfo 走 PEP 615 fallback,需要 tzdata 包提供 IANA 时区数据库。
     # Linux/macOS 自带,装上无副作用;Windows 上无此包则 ZoneInfo("Asia/Shanghai") 直接抛
     # ZoneInfoNotFoundError,get_current_time 会被迫回退 UTC,LLM 自己手动 +8 兜底。

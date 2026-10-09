@@ -13,7 +13,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel
 
-from smartbutler.capabilities.llm.langgraph_adapter import ButlerChatModelAdapter
 from smartbutler.thinking.loop.graph import ButlerGraphBuilder
 from smartbutler.thinking.loop.orchestrator import ButlerOrchestrator
 

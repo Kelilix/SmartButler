@@ -1,6 +1,11 @@
 """edit_file / delete_file / ls / grep / glob 工具集合。
 
 跟 read_file / write_file 一并暴露给 LLM。
+
+所属:thinking/skills/llm_tools/。
+这 5 个 tool 是 SmartButlerFilesystemBackend 对应方法的 LLM 适配层(以 BaseTool 形式暴露),
+本质是"业务方法 + LLM 接口",不是 capabilities 层的通用 tool 能力,
+所以住在 thinking 层,而非 capabilities/tools/skills/。
 """
 from __future__ import annotations
 
@@ -8,14 +13,14 @@ import json
 from typing import Any
 
 from smartbutler.capabilities.tools.base import BaseTool
-from smartbutler.capabilities.tools.skills.read_file import ReadFileTool
-from smartbutler.capabilities.tools.skills.write_file import WriteFileTool
 from smartbutler.capabilities.tools.types import Permission
 from smartbutler.thinking.skills.filesystem_backend import (
     PathOutsideSandbox,
     PermissionRejected,
     SmartButlerFilesystemBackend,
 )
+from smartbutler.thinking.skills.llm_tools.read_file import ReadFileTool
+from smartbutler.thinking.skills.llm_tools.write_file import WriteFileTool
 
 
 class EditFileTool(BaseTool):
@@ -248,7 +253,10 @@ class GlobTool(BaseTool):
 def build_default_skill_tools(
     backend: SmartButlerFilesystemBackend,
 ) -> list[BaseTool]:
-    """构造默认 6 个文件工具,注册到 ToolRegistry 用。"""
+    """构造默认 7 个文件工具(给 ToolRegistry.register_many 用)。
+
+    顺序:read / write / edit / delete / ls / grep / glob。
+    """
     return [
         ReadFileTool(backend),  # type: ignore[abstract]
         WriteFileTool(backend),  # type: ignore[abstract]

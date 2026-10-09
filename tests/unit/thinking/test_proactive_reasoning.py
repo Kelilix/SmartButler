@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from smartbutler.events.core.event import BaseEvent, EventPriority, EventSource
-from smartbutler.thinking.proactive import ProactiveDecision, ProactiveUrgency
+from smartbutler.thinking.proactive import ProactiveUrgency
 from smartbutler.thinking.proactive.reasoning import RuleBasedProactiveReasoning
 
 

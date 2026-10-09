@@ -41,11 +41,29 @@ class StorageSettings(BaseSettings):
     )
 
     # ---- 向量库（Qdrant） ----
-    qdrant_url: str | None = Field(default=None, description="Qdrant 服务 URL")
-    qdrant_api_key: str | None = Field(default=None, description="Qdrant API key")
+    # Phase 6.1 起改为支持嵌入式模式：默认 path = data/qdrant,零部署成本。
+    # 用户在 .env 显式设 SMARTBUTLER_STORAGE_QDRANT_URL=http://... 时切到服务模式
+    # (Phase 8+ 部署到中心化机器或团队共享时用)。
+    qdrant_url: str | None = Field(default=None, description="Qdrant 服务 URL（设了则走服务模式；不设走嵌入式 path=）")
+    qdrant_path: Path = Field(
+        default=PROJECT_ROOT / "data" / "qdrant",
+        description="Qdrant 嵌入式模式数据目录（QdrantClient(path=...)）",
+    )
+    qdrant_api_key: str | None = Field(default=None, description="Qdrant API key（服务模式才用）")
     qdrant_collection: str = Field(
         default="smartbutler_memory",
         description="默认向量集合名",
+    )
+    # Phase 6.1:向量维度。1536 是 OpenAI text-embedding-3-small/ada-002 的默认维度,
+    # 也跟 DeepSeek/Qwen 的常用嵌入维度兼容。Phase 6.2 接 langmem 后会按嵌入模型
+    # 自动匹配;此字段先给一个安全 default,避免 Qdrant 嵌入式启动报"维度不匹配"。
+    qdrant_vector_size: int = Field(
+        default=1536,
+        description="Qdrant 集合向量维度（必须跟嵌入模型输出一致）",
+    )
+    qdrant_distance: str = Field(
+        default="Cosine",
+        description="向量距离度量（Cosine / Euclid / Dot）",
     )
 
     # ---- Redis（可选，用于高频短期数据） ----

@@ -1,4 +1,4 @@
-"""Skill 管理工具(2026-10-09 增)。
+"""Skill 管理工具(2026-10-09 增 — Phase 6.3 搬到 thinking)。
 
 提供:
 - reload_skills: 通知管家下次重读 skill 目录。
@@ -8,27 +8,39 @@
 LLM 不会"自己知道",必须给它一个 tool 来"主动询问" →
 LLM 在对话中看到这个 tool 的描述,知道"我修改了 skill 后可以调它"。
 
+为什么住在 thinking/skills/(Phase 6.3 修订前在 capabilities/tools/common/):
+- 它的业务核心是"管家如何管理自己的 skill 子系统",属于 thinking 业务域
+- 装 capabilities 层会引发循环(因为它必须引 SkillRuntime;
+  而 SkillRuntime 又被 agents/ thinking/ 顶层 import;
+  agents 顶层又引 capabilities.tools.types;
+  capabilities.tools.types 触发的 capabilities.tools.__init__ 副作用
+  会反过来 import 这个 skill_admin,形成循环)
+- 搬到 thinking 后:capabilities.tools.__init__ 不再 import 它,
+  循环被打断,所有 lazy import 治标可以删掉
+
 设计要点:
-1. **不在 thinking 层调工具**:thinking 是业务逻辑,tool 是能力层。
-2. **不绕过 SkillRuntime**:tool 只调 SkillRuntime.mark_dirty(),
+1. **不绕过 SkillRuntime**:tool 只调 SkillRuntime.mark_dirty(),
    thinking 层的封装边界保留,tool 不能直接改 _fingerprint。
-3. **scope=BUTLER 而非 GLOBAL**:只有管家能用,子 agent 看不到(它们用 SKILL 自己的工具)。
+2. **scope=BUTLER 而非 GLOBAL**:只有管家能用,子 agent 看不到(它们用 SKILL 自己的工具)。
+3. **不在 thinking 内部调其他 tool**:reload_skills 只改运行时状态,tool 调用面收敛。
 """
 
 from __future__ import annotations
 
 from smartbutler.capabilities.tools.decorator import register_tool
 from smartbutler.capabilities.tools.types import ToolError, ToolScope
+from smartbutler.config.skills import load_skill_settings
 from smartbutler.thinking.skills.runtime import SkillRuntime
 
 
 def _get_runtime() -> SkillRuntime:
-    """取单例。测试时可 patch 替换。"""
-    # SkillRuntime 当前没有显式 singleton,这里走 from_settings 懒构造
-    # 引入主流程的 settings 装配点,避免分散创建
-    from smartbutler.config.skills import get_skill_settings
+    """取 SkillRuntime 单例(测试时可 patch 替换)。
 
-    settings = get_skill_settings()
+    Phase 6.3:无 lazy import。
+    搬走 skill_admin 后,capabilities.tools.__init__ 不再 import 它,
+    agents ↔ capabilities.tools 整体循环被切断,这里可以安全 eager import。
+    """
+    settings = load_skill_settings()
     return SkillRuntime.from_settings(settings)
 
 

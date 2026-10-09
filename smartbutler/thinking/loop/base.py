@@ -26,7 +26,6 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
-from smartbutler.thinking.proactive.decision import ProactiveResult
 from smartbutler.thinking.proactive.triggers import LoopType
 
 

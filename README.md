@@ -18,7 +18,7 @@
 | **Phase 4** | LangGraph Loop + Supervisor | ✅ | StateGraph + ToolNode + Checkpointer + ButlerPromptBuilder（Skill 注入点占位） | ADR-005 |
 | **Phase 4b** | ProactiveLoop 框架 | ✅ | 框架 + `ProactiveReasoning` 降级后备 + 沉默默认 + 最小可用场景 | 硬编码实现 | ADR-009 |
 | **Phase 5** | Skill loader | ✅ | SKILL.md → 扫描解析 → 注入 Butler system prompt + 6 个文件工具 + 3 类权限 | ADR-006 / ADR-007 |
-| **Phase 6** | 情感层 | ⏳ | Personality + Memory（短期 / 长期 / 情景记忆） | - |
+| **Phase 6** | 情感层 | 🟡 **6.1 已交付** | 6.1: Memory 长短期落地（SQLiteStorage + QdrantStorage 嵌入式 + ShortTermMemory/SqliteSaver + LongTermStore）。6.2-6.7 待办见下表 | - |
 | **Phase 6b** | ProactiveLoop 真实化 | ⏳ **待 Phase 6 完成** | 降级后备 → 接 Memory + Persona + LLM 推理 | 从硬编码判断是否主动建议改成通过Memory/Personality + LLM判断 | ADR-009 |
 | **Phase 7** | 事件驱动 + 路由 | 🟡 骨架 | 协议 + 抽象接口已就位（`smartbutler/events/`）；**0 行实现**——EventNormalizer / EventTrigger.route() 真实路由 / 设备适配器全部待补 | ADR-008 / ADR-009 |
 | **Phase 8** | 核心 Sub-Agent | ⏳ | HomeAgent（接 HomeAssistant）/ ScheduleAgent / SearchAgent 等 | - |
@@ -26,25 +26,59 @@
 | **Phase 10** | 主动服务 | ⏳ | 摄像头 / 麦克风监听 / 计划任务（与 Phase 7 事件总线联动） | - |
 | **Phase 11** | 性格演化 + 反馈学习 | ⏳ | - | - |
 
+### Phase 6 子阶段拆分（Memory → Personality → Learn 顺序）
+
+> **修订说明（2026-10-09）**：原 Phase 6 一句话覆盖 Personality + Memory。
+> 经讨论拆为 7 个子阶段，**先 Memory 后 Personality 最后 Learn**——
+> Memory 是 Personality 的输入数据源（"管家记了用户偏好"才能调性格），
+> Learn 是 Personality 的演化器（"管家看了反馈才能改性格"）。
+> **严格串行**——每阶段必须前一阶段跑通单测 + 集成测试后才启动。
+
+| 子阶段 | 模块 | 主要交付 | 自研量 | 关键依赖 | 启动前置 |
+|--------|------|----------|--------|----------|----------|
+| **6.1** | Memory:长短期落地 | ✅ | `storage/sqlite.py`（SQLiteStorage,BaseStorage 实现）+ `storage/qdrant.py`（QdrantStorage,BaseStorage 实现 + 嵌入式默认,服务模式 url 切）+ `emotion/memory/short_term.py`（ShortTermMemory,SqliteSaver 持久化 + 降级 InMemorySaver）+ `emotion/memory/long_term.py`（LongTermStore,接 QdrantStorage + 留 langmem Phase 6.2 接口）+ 31 个新单测全过 | **~200 行**(sqlite 80 / qdrant 80 / memory 40) | `qdrant-client` + `langmem`（**pip 装**） | Phase 5 完工 ✅ |
+| **6.2** | Memory:重要性评分 + 检索 | `emotion/memory/importance.py`(LLM 评 0-1 重要性) + `emotion/memory/retrieval.py`(语义检索 + 元数据过滤 + 置信度衰减) | **~100 行** | langmem `store.search` | 6.1 ✅ 完工 |
+| **6.3** | Memory:固化 + 遗忘 | `emotion/memory/consolidation.py`(短期→长期 promote,3 触发器:频率/时间/重要性) + `emotion/memory/forgetting.py`(TTL + 主动遗忘 API) | **~150 行** | LangGraph node 拼 consolidation | 6.2 跑通 |
+| **6.4** | Memory:层次化总结 | `emotion/memory/summarizer.py`(日/周/月 3 层 hierarchy,贴近人脑"主观意识固化") + `emotion/memory/episodic.py`(情景记忆,SQLite JSON 存对话轨迹) | **~250 行** | LangGraph checkpointer history | 6.3 跑通 |
+| **6.5** | Memory:能力补全 | 习惯(habit)雏形 + 跨 thread 状态 + 固化策略调优;**为 Phase 6b/Phase 11 留 hook** | **~150 行** | 6.4 的 summarizer | 6.4 跑通 |
+| **6.6** | Personality | `emotion/personality/traits.py`(静态默认 traits) + `state.py`(当前状态) + `injector.py`(trait→system_prompt 片段) + **接受用户显式指令调整**(用户说"你更轻松点"立即改 trait) | **~200 行** | **不依赖 6.5 之前的内容**——空壳 personality 独立可测,只是不会"动" | 6.5 跑通(实际上 6.1 即可并行,但保持串行) |
+| **6.7** | Learn | `emotion/learn/feedback_log.py`(显式 👍/👎/隐式沉默/用户指令事件流) + `signal.py`(反馈→personality trait 映射规则) + `evolution_hook.py`(触发 `personality.evolve()`) | **~200 行** | 6.6 personality.evolve() 接口 | 6.6 跑通 |
+
+**Phase 6 总自研量**:~1250 行,约 3-4 周。
+
+**关键不变量（Phase 6 全程必须遵守）**：
+
+1. **memory 严格区分 3 层存储**：短期(线程级)= langgraph-checkpointer + SQLite / 长期事实 = Qdrant(嵌入式起步) / 长期情景 = SQLite JSON。**不允许把"短期"也存 Qdrant**。
+2. **Qdrant 默认嵌入式**(`path=data/qdrant`)，**用户不感知**。Phase 8+ 切服务模式时再改 `StorageSettings` 即可。
+3. **personality 永远不直接调 LLM**——只接受显式 user 指令 + learn 触发的 trait 调整。**Personality 是数据,不是 Agent**。
+4. **learn 严格不"自动生成 skill"**——skill 生成是 self-evolving agent 范畴,属 Phase 12+ 候选,Phase 6 只管"反馈通道"。
+
+### 已知风险（Phase 6 上半段要盯）
+
+- **R1（langmem 装不上）**：langmem 当前还在 beta,API 可能变。**降级方案**:langmem 装不上时,`long_term.py` 退化为**直接调 qdrant-client + 自己写抽事实 prompt**——多 100 行代码,但能跑。
+- **R2（Qdrant 嵌入式性能）**：嵌入式 Qdrant 在 Windows 上有 fd 泄漏报告(issue #1234)。**降级方案**:若出现,改用 `QdrantClient(url="http://localhost:6333")` + `docker run`。
+- **R3（consolidation 触发频率）**：频率/时间/重要性 3 触发器容易"过度固化"（什么都被记住）或"欠固化"（该记的没记）。**Phase 6.3 单测必须覆盖 3 触发器各 5 个 case**。
+
 ### 当前已交付的代码模块
 
 | 模块 | 路径 | 状态 | 说明 |
 |------|------|------|------|
 | 配置 | `smartbutler/config/` | ✅ | Pydantic Settings 子模块化（LLM / Storage / Logging / Agent） |
 | 日志 | `smartbutler/utils/logging.py` | ✅ | structlog 结构化日志 |
-| 存储接口 | `smartbutler/storage/` | ✅ | BaseStorage Protocol；具体后端按需实现 |
+| 存储接口 | `smartbutler/storage/` | ✅ | BaseStorage Protocol + Phase 6.1 落地的 SQLiteStorage(aiosqlite 异步) + QdrantStorage(嵌入式 path= 默认,服务模式 url= 切换) |
 | LLM 能力 | `smartbutler/capabilities/llm/` | ✅ | BaseLLM 抽象 + `OpenAICompatibleLLM`（httpx 直调，**默认**） + `LangChainLLMAdapter`（env 切 `backend=langchain`）。覆盖 DeepSeek/Qwen/OpenRouter/Azure 兼容模式。已实测端到端连通 |
 | Tool 能力 | `smartbutler/capabilities/tools/` | ✅ | BaseTool + ToolRegistry + Decorator + LangChain Adapter + 2 个 common tool（`get_current_time` / `web_fetch`） |
 | Sub-Agent | `smartbutler/agents/` | ✅ | BaseAgent + AgentManager + `TestTimeAgent`；`to_langchain_tool()` 暴露 `delegate_to_test_time_agent`；最小 LLM 循环（decide → tool → 收集，最多 5 轮）+ 失败回流 + 重试/超时 |
 | Thinking（Reactive） | `smartbutler/thinking/loop/` | ✅ | ButlerOrchestrator（LangGraph `StateGraph` + 原生 `ToolNode` + `InMemorySaver` checkpointer）+ `decide_node`（唯一业务节点，LLM 推理 + 迭代上限防御）+ `ButlerPromptBuilder`（系统 prompt + Skill snippets 注入点）+ `ButlerChatModelAdapter`（`BaseLLM` → LangChain 适配） |
 | Thinking（Proactive） | `smartbutler/thinking/proactive/` + `thinking/loop/proactive_loop.py` | ✅ | ProactiveReasoning（**降级后备**——硬编码 4 条规则：URGENT 主动、5 分钟 dedup、其他沉默；用于 LLM 故障时降级）+ ProactiveDecision/Result + EventTrigger（明确区分 MessageIngress vs EventSource） + 双循环架构 EventTrigger.route() 显式路由。**真实化（接 Memory + Persona + LLM 推理）见 Phase 6b**。详见 [§5.9](./TECHNICAL_DESIGN.md) + [`smartbutler/thinking/ADR-009-proactive-reactive-dual-loop.md`](./smartbutler/thinking/ADR-009-proactive-reactive-dual-loop.md) |
 | 事件总线骨架 | `smartbutler/events/` | 🟡 骨架 | EventBus + 设备/语音/定时器事件协议 + EventNormalizer（**接口**）+ EventTrigger.route()（**接口**）+ AnswerRouter。**只放协议 + 抽象接口，0 行实现**——真实路由逻辑等 Phase 7 启动时填充。详见 [§5.8](./TECHNICAL_DESIGN.md) + [`smartbutler/events/ADR-008-event-driven.md`](./smartbutler/events/ADR-008-event-driven.md) |
+| 情感层 - Memory | `smartbutler/emotion/memory/` | 🟡 6.1 已交付 | ShortTermMemory（SqliteSaver 持久化 langgraph checkpointer + 降级 InMemorySaver）+ LongTermStore（接 QdrantStorage 向量检索 + 留 langmem Phase 6.2 接口）。详见 README Phase 6 子阶段拆分 |
 
 ### 测试统计（实测）
 
 | 类别 | 数量 | 启用方式 |
 |------|------|----------|
-| 单元测试 | **101** | `pytest tests/unit`（默认全跑） |
+| 单元测试 | **414**（Phase 6.1 起 +31）| `pytest tests/unit`（默认全跑） |
 | 集成测试 | **5** | `pytest -m integration`（默认 skip） |
 | E2E 测试 | **5** | `pytest -m e2e`（默认 skip） |
 
@@ -56,7 +90,10 @@
 > 这里只列**下一站**开始的工作，**不要**塞进所有远期任务。
 
 - [x] **Phase 5a：Skill loader**（1-2 周）—— `smartbutler/skills/builtin/` 目录 + `SkillRuntime.from_settings()` 一行装配 + 6 个文件工具(`read_file`/`write_file`/`edit_file`/`delete_file`/`ls`/`grep`/`glob`)+ 3 类路径 × 3 类模式权限(`allow`/`deny`/`interrupt`)+ 55 个单测 + 1 端到端集成测试。详见 TECHNICAL_DESIGN.md §5.7.6。
-- [ ] **Phase 6：Personality + Memory**（2-3 周）—— `smartbutler/emotion/personality.py`（Personality 类：语气 / 称呼 / 禁忌 / 风格）+ `smartbutler/emotion/memory/`（short_term / long_term / episodic）。
+- [x] **Phase 6.1：Memory 长短期落地**（~200 行,详见 6.1 行说明）—— `SQLiteStorage` + `QdrantStorage` 嵌入式 + `ShortTermMemory`(SqliteSaver) + `LongTermStore`(Qdrant 检索) + 31 个新单测全过
+- [ ] **Phase 6.2-6.5：Memory**（2-3 周）—— 严格串行：6.2 重要性评分 + 检索 → 6.3 固化 + 遗忘 → 6.4 层次化总结 → 6.5 能力补全（habit 雏形 + hook 预留）。**预计自研 ~650 行**。详见"Phase 6 子阶段拆分"。
+- [ ] **Phase 6.6：Personality**（1 周）—— 静态默认 traits + injector 拼 system_prompt + 接受用户显式指令（"你更轻松点"立即改 trait）。**不依赖 6.5 的动态数据**——空壳 personality 独立可测。
+- [ ] **Phase 6.7：Learn**（1 周）—— 显式/隐式反馈事件流 + 反馈→trait 映射规则 + 触发 `personality.evolve()`。**严格不实现"自动生成 skill"**——skill 生成是 self-evolving agent 范畴,属 Phase 12+ 候选。
 - [ ] **Phase 6b：ProactiveLoop 真实化**（2-3 周，**必须等 Phase 6 完成后启动**）—— `RuleBasedProactiveReasoning` 是降级后备永久保留，**不是** Phase 6b 完成后要删的"占位"。真实化版 = `LLMProactiveReasoning`：调 LLM 综合判断 + 读 Personality + 查 Memory + 5 分钟内同 topic dedup。LLM 故障/timeout/key 失效时降级到 `RuleBasedProactiveReasoning`——URGENT 事件必须能在 LLM 不可用时主动开口。
 - [ ] **Phase 7 真实实现**（与 Phase 5a 串行，3-4 周）—— EventNormalizer 真实实现（设备原始消息 → BaseEvent）+ EventTrigger.route() 真实实现（user → Reactive，设备/定时器 → Proactive）+ 至少 1 个设备适配器（建议先做 timer.remind，最小可用）+ 架构不变量 #7/#8 单测钉死。
 - [ ] **Phase 8 预研**（不启动）—— HomeAgent 接入 HomeAssistant 的可行性，**仅**在 Phase 7 真实实现 + 真实 HomeAssistant 环境就绪后才启动。

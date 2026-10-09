@@ -172,9 +172,52 @@ class LangChainLLMAdapter(BaseLLM):
         )
 
     async def aclose(self) -> None:
-        # ChatOpenAI 内部的 httpx.AsyncClient 由 LangChain 管理,无需显式关闭。
-        # 若未来引入其它需要关闭的资源,在此 override。
-        return None
+        # LangChain 1.6 内部对 httpx client 用 @lru_cache 缓存(以 base_url +
+        # timeout + socket_options 为 key),所以两个 ChatOpenAI 实例会共用
+        # 同一个 _AsyncHttpxClientWrapper。
+        #
+        # 问题链(2026-10 真实踩坑):
+        #   1. pytest-asyncio function-scope 关闭 event loop A
+        #   2. 测试 B 启动 event loop B
+        #   3. 测试 B 调 LangChain,命中 @lru_cache 拿到旧 client(绑 loop A)
+        #   4. 旧 client 的 transport.call_soon 调 loop A → RuntimeError
+        #
+        # 解决:aclose 时
+        #   - 关掉内部 httpx2.AsyncClient(断开对旧 loop 的引用)
+        #   - 清掉 LangChain 的 @lru_cache(下次创建新 client,绑到新 loop)
+        #
+        # 全部用 getattr + hasattr 兜底,LangChain 改内部结构时不会爆炸。
+        try:
+            root_async = getattr(self._chat, "root_async_client", None)
+            if root_async is not None:
+                inner = getattr(root_async, "_client", None)
+                if inner is not None:
+                    aclose = getattr(inner, "aclose", None)
+                    if aclose is not None:
+                        result = aclose()
+                        if hasattr(result, "__await__"):
+                            await result
+
+            # 清掉 LangChain 的 @lru_cache,避免下次跨 loop 复用同一 client。
+            # 不做这一步的话,aclose 关掉了旧 client,但 cache 里仍指向它,
+            # 下次新 ChatOpenAI 仍会拿到一个已关的 client。
+            try:
+                from langchain_openai.chat_models import _client_utils as _cu
+
+                cache_clear = getattr(_cu, "_cached_async_httpx_client", None)
+                if cache_clear is not None and hasattr(cache_clear, "cache_clear"):
+                    cache_clear.cache_clear()
+            except ImportError:
+                # 极端兜底:LangChain 改了 import 路径,清缓存失败不致命,
+                # 因为 aclose 已经把 client 关了。下次创建会拿到新 client(绑新 loop)。
+                pass
+        except Exception as exc:  # noqa: BLE001 - 关 client 失败不影响业务
+            # 关 client 失败是 best-effort:不影响业务结果,只可能在日志里看到一行 debug。
+            structlog.get_logger(__name__).debug(
+                "llm.adapter.aclose_failed",
+                impl="LangChainLLMAdapter",
+                error=str(exc),
+            )
 
     async def __aenter__(self) -> LangChainLLMAdapter:
         return self
@@ -364,7 +407,14 @@ class LangChainLLMAdapter(BaseLLM):
         msg = str(exc) or cls_name
 
         # 401/403 鉴权
-        if cls_name in ("AuthenticationError",) or "401" in msg or "403" in msg:
+        # LangChain 1.x 内部把 openai.AuthenticationError 包装成
+        # langchain_openai.OpenAIAuthenticationError(类名变了),
+        # 但父类仍然是 openai.AuthenticationError。两者都要识别。
+        if (
+            cls_name in ("AuthenticationError", "OpenAIAuthenticationError")
+            or "401" in msg
+            or "403" in msg
+        ):
             return LLMAuthError(f"鉴权失败: {msg}")
         # 429 限流
         if cls_name in ("RateLimitError",) or "429" in msg:

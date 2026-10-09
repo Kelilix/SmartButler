@@ -35,9 +35,9 @@ from typing import Literal
 import structlog
 
 from smartbutler.capabilities.tools.base import BaseTool
-from smartbutler.capabilities.tools.skills.fs_tools import build_default_skill_tools
 from smartbutler.config.skills import SkillSettings, load_skill_settings
 from smartbutler.thinking.skills.filesystem_backend import SmartButlerFilesystemBackend
+from smartbutler.thinking.skills.llm_tools import build_default_skill_tools
 from smartbutler.thinking.skills.permissions import build_default_policy
 from smartbutler.thinking.skills.prompt_renderer import render_skill_list_prompt
 from smartbutler.thinking.skills.scanner import SkillMetadata, scan_skills_dirs

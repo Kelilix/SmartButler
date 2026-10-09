@@ -86,7 +86,7 @@ class VoiceEvent(BaseEvent):
         priority: EventPriority = EventPriority.NORMAL,
         payload: dict[str, Any] | None = None,
         timestamp: datetime | None = None,
-    ) -> "VoiceEvent":
+    ) -> VoiceEvent:
         """工厂方法。"""
         topic = f"voice.{action.value}"
         return cls(
