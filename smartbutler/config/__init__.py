@@ -17,11 +17,10 @@ from smartbutler.config.llm import LLMSettings, load_llm_settings
 from smartbutler.config.logging import LoggingSettings, load_logging_settings
 from smartbutler.config.skills import SkillSettings, load_skill_settings
 from smartbutler.config.storage import StorageSettings, load_storage_settings
-from smartbutler.capabilities.embedding.config import (
-    EmbeddingSettings,
-    load_embedding_settings,
-)
 
+# EmbeddingSettings 定义在 capabilities/embedding/config.py(那里
+# 跟 Embedder 实现绑在一起,放 config 包会让 import 链出现循环);
+# 这里做延迟导出,让 ``from smartbutler.config import EmbeddingSettings`` 可用。
 __all__ = [
     "PROJECT_ROOT",
     "SmartButlerBaseSettings",
@@ -38,3 +37,17 @@ __all__ = [
     "load_skill_settings",
     "load_embedding_settings",
 ]
+
+
+def __getattr__(name: str):  # type: ignore[no-untyped-def]
+    """PEP 562 模块级 __getattr__,延迟导入避免循环。"""
+    if name in ("EmbeddingSettings", "load_embedding_settings"):
+        from smartbutler.capabilities.embedding.config import (
+            EmbeddingSettings as _EmbeddingSettings,
+            load_embedding_settings as _load_embedding_settings,
+        )
+        return {
+            "EmbeddingSettings": _EmbeddingSettings,
+            "load_embedding_settings": _load_embedding_settings,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

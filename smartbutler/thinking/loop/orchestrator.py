@@ -101,6 +101,7 @@ class ButlerOrchestrator:
         enable_proactive_advice: bool = False,
         skill_runtime: SkillRuntime | None = None,
         memory_facade: Any | None = None,
+        short_term: Any | None = None,
     ) -> None:
         """构造 orchestrator。
 
@@ -123,6 +124,9 @@ class ButlerOrchestrator:
             memory_facade: 🆕 Phase 6.2 P0,``MemoryFacade`` 实例(thinking 接入层)。
                 注入后,管家在 ``decide_node`` 召回相关历史并注入 system prompt。
                 None → 不注入 memory 能力(老行为,零影响)。
+            short_term: 🆕 Phase 6.2 P0,``ShortTermMemory`` 实例。
+                注入后,LangGraph checkpointer 改用 SqliteSaver,重启不丢短期上下文。
+                None → 用默认 InMemorySaver(重启即丢,Phase 6.2 P0 前行为)。
         """
         self._llm = llm
         self._tool_registry = tool_registry or ToolRegistry.get_default()
@@ -157,6 +161,10 @@ class ButlerOrchestrator:
         # Phase 6.2 P0: Memory 接入层
         self._memory_facade = memory_facade
         self._current_memory_block: str = ""  # 每次 ainvoke 时刷新
+
+        # Phase 6.2 P0: Short-term memory checkpointer(SqliteSaver)
+        self._short_term = short_term
+        self._short_term_saver_cache: Any | None = None  # 缓存已初始化的 saver 实例
 
     # ---------- Skill 注入(Phase 5 占位) ----------
 
@@ -216,10 +224,73 @@ class ButlerOrchestrator:
     # ---------- Graph 懒构建 ----------
 
     def _ensure_graph(self) -> Any:
-        """首次 ainvoke / astream 时构造 graph,后续复用。"""
+        """首次 ainvoke / astream 时构造 graph,后续复用(同步路径)。
+
+        仅在无 event loop 的场景下使用(如同步单测),或着 short_term 为 None 的场景。
+        真实 ainvoke / astream 走 :meth:`_ensure_graph_async`。
+        """
         if self._compiled is not None:
             return self._compiled
+        compiled = self._build_graph_builder(saver=self._get_sync_saver())
+        self._compiled = compiled.build()
+        return self._compiled
 
+    async def _ensure_graph_async(self) -> Any:
+        """异步版 lazy 图构建(Phase 6.2 P0)。
+
+        与 :meth:`_ensure_graph` 的区别:
+        - 短记忆用 ``get_async_saver()`` 拿到 ``AsyncSqliteSaver``(LangGraph async 路径唯一
+          可用的 saver,同步 ``SqliteSaver.aget_tuple`` 会抛 ``NotImplementedError``)。
+        - 缓存到 ``self._short_term_saver_cache``,避免每次 ``ainvoke`` 都重建 saver。
+        """
+        if self._compiled is not None:
+            # 已有 compiled —— 但要确认它绑定的是 async saver(避免 sync 路径污染)。
+            cache = self._short_term_saver_cache
+            if cache is None or hasattr(cache, "aget_tuple"):
+                return self._compiled
+            # 否则:缓存的 compiled 绑了 sync saver,需要重建
+        saver = await self._get_async_saver()
+        compiled = self._build_graph_builder(saver=saver)
+        self._compiled = compiled.build()
+        return self._compiled
+
+    def _get_sync_saver(self) -> Any | None:
+        """同步 saver 获取器。short_term 为 None 时返回 None,走 InMemorySaver。"""
+        if self._short_term is None:
+            return None
+        if self._short_term_saver_cache is None:
+            self._short_term_saver_cache = self._short_term.get_sync_saver()
+        return self._short_term_saver_cache
+
+    async def _get_async_saver(self) -> Any | None:
+        """异步 saver 获取器(Phase 6.2 P0)。
+
+        防御性:如果缓存里是同步 ``SqliteSaver``(同步路径留下的脏数据),
+        重新走 ``get_async_saver()`` 拿异步版本,否则 ainvoke 会撞
+        ``NotImplementedError``。
+        """
+        if self._short_term is None:
+            return None
+        cache = self._short_term_saver_cache
+        # AsyncSqliteSaver 有 aget_tuple / aput;同步 SqliteSaver 没有。
+        if cache is not None and hasattr(cache, "aget_tuple"):
+            return cache
+        if cache is not None and not hasattr(cache, "aget_tuple"):
+            # 同步缓存(可能是同步路径留下的,或是 InMemorySaver 之外的 sync 类)
+            # 重置,走 async 路径
+            self._short_term_saver_cache = None
+            await self._short_term.aclose()  # 释放旧 held(若有)
+        self._short_term_saver_cache = await self._short_term.get_async_saver()
+        return self._short_term_saver_cache
+
+    def _build_graph_builder(self, *, saver: Any | None = None) -> Any:
+        """构造 graph builder,统一 LLM 装配 + 工具收集 + prompt 拼装。
+
+        Args:
+            saver: 已实例化的 checkpointer(同步或异步),None → 走 InMemorySaver。
+                同步路径传 ``self._get_sync_saver()`` 的结果,异步路径传
+                ``await self._get_async_saver()`` 的结果。
+        """
         # 1. 构造 LangChain 适配器
         self._chat_adapter = self._make_chat_adapter()
         # 2. 收集工具
@@ -237,15 +308,15 @@ class ButlerOrchestrator:
             skill_prompt_snippets=skill_snippets,
             memory_block=memory_block,
         )
-        # 4. build graph
-        self._compiled = (
+        compiled = (
             self._graph_builder_factory.with_llm(self._chat_adapter)
             .with_tools(self._all_tools)
             .with_system_prompt(system_prompt)
             .with_max_iterations(DEFAULT_MAX_ITERATIONS)
-            .build()
         )
-        return self._compiled
+        if saver is not None:
+            compiled = compiled.with_checkpointer(saver)
+        return compiled
 
     def _make_chat_adapter(self) -> ButlerChatModelAdapter:
         """从 ``BaseLLM`` + settings 构造 ``ButlerChatModelAdapter``。
@@ -341,13 +412,13 @@ class ButlerOrchestrator:
                 self._current_memory_block = await self._memory_facade.format_for_prompt(
                     query=user_input.strip(), ctx=ctx, k=5, max_chars=2000,
                 )
-                # 缓存失效:让 _ensure_graph 重新拼 system_prompt
+                # 缓存失效:让 _ensure_graph_async 重新拼 system_prompt
                 self._compiled = None
             except Exception:  # noqa: BLE001
                 self._current_memory_block = ""
                 # 缓存不变,无需重建
 
-        compiled = self._ensure_graph()
+        compiled = await self._ensure_graph_async()
         initial_state: ButlerState = {
             "messages": [HumanMessage(content=user_input.strip())],
             "user_id": user_id,
@@ -401,7 +472,7 @@ class ButlerOrchestrator:
             except Exception:  # noqa: BLE001
                 self._current_memory_block = ""
 
-        compiled = self._ensure_graph()
+        compiled = await self._ensure_graph_async()
         initial_state: ButlerState = {
             "messages": [HumanMessage(content=user_input.strip())],
             "user_id": user_id,
@@ -440,13 +511,13 @@ class ButlerOrchestrator:
             ProactiveResult(不可变,带 acted / message / urgency / silence_reason)。
         """
         effective_user_id = user_id or event.user_id
-        loop = self._get_or_build_proactive_loop(
+        loop = await self._get_or_build_proactive_loop(
             user_id=effective_user_id,
             session_id=f"proactive-{event.event_id}",
         )
         return await loop.tick(event)
 
-    def _get_or_build_proactive_loop(
+    async def _get_or_build_proactive_loop(
         self,
         *,
         user_id: str,
@@ -454,8 +525,9 @@ class ButlerOrchestrator:
     ) -> ProactiveLoop:
         """懒构建 ProactiveLoop(首次调用时构造,后续复用)。"""
         if self._proactive_loop is None:
-            # ProactiveLoop 需要 graph;优先用 _ensure_graph 出来的 compiled
-            graph = self._compiled if self._compiled is not None else None
+            # ProactiveLoop 需要 graph;优先用 _ensure_graph_async 出来的 compiled
+            await self._ensure_graph_async()
+            graph = self._compiled
             self._proactive_loop = ProactiveLoop(
                 reasoning=self._proactive_reasoning,
                 graph=graph,
@@ -494,7 +566,7 @@ class ButlerOrchestrator:
             priority=EventPriority.NORMAL,
             payload={"user_input": user_input, "base_answer": base_answer},
         )
-        loop = self._get_or_build_proactive_loop(
+        loop = await self._get_or_build_proactive_loop(
             user_id=user_id,
             session_id=f"advice-{synthetic_event.event_id}",
         )

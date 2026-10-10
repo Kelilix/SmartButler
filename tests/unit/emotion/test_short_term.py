@@ -28,15 +28,21 @@ def test_path_parent_created(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_async_saver_works_inside_async_with(tmp_path: Path) -> None:
-    """get_async_saver 返回的 wrapper 必须在 async with 内才能用 aput。"""
+async def test_get_async_saver_returns_usable_saver(tmp_path: Path) -> None:
+    """get_async_saver 直接返回可用的 AsyncSqliteSaver 实例(Phase 6.2 P0)。
+
+    不再要求调用方 ``async with`` 包装 —— Long-lived held pattern。
+    """
     from smartbutler.emotion.memory.short_term import _SQLITE_SAVER_AVAILABLE
 
     if not _SQLITE_SAVER_AVAILABLE:
         pytest.skip("langgraph-checkpoint-sqlite 未装")
     stm = ShortTermMemory(tmp_path / "stm.db")
-    saver = await stm.get_async_saver()
-    async with saver as s:
-        # 关键:有 aput 方法(异步 LangGraph checkpointer 必备)
-        assert hasattr(s, "aput")
-        assert callable(s.aput)
+    try:
+        saver = await stm.get_async_saver()
+        # 关键:有 aput / aget_tuple 方法(异步 LangGraph checkpointer 必备)
+        assert hasattr(saver, "aput")
+        assert callable(saver.aput)
+        assert hasattr(saver, "aget_tuple")
+    finally:
+        await stm.aclose()

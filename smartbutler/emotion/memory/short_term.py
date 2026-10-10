@@ -63,6 +63,7 @@ class ShortTermMemory:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._async_held: "_AsyncSqliteSaverHeld | None" = None
 
     @property
     def is_persistent(self) -> bool:
@@ -90,18 +91,78 @@ class ShortTermMemory:
         raise RuntimeError("无可用 checkpointer（既没 SqliteSaver 也没 InMemorySaver）")
 
     async def get_async_saver(self) -> Any:
-        """返回 AsyncSqliteSaver 实例（供 LangGraph async 图用）。
+        """返回 ``AsyncSqliteSaver`` 实例(供 LangGraph async 图用)。
 
-        失败时降级 InMemorySaver。
+        与 ``get_sync_saver`` 对称:内部用 ``__aenter__`` 立刻完成 context manager
+        初始化,持有关联 connection,调用方直接 await ``aput / aget_tuple``。
+        进程结束前需调 ``aclose()`` 释放连接。
+
+        失败时降级 InMemorySaver(进程内,重启即丢)。
         """
         if _SQLITE_SAVER_AVAILABLE:
-            # AsyncSqliteSaver.from_conn_string 返回的是 context manager
-            # 调用方需在 async with 内使用。这里我们给一个简便的辅助。
-            return _AsyncSqliteSaverWrapper(self._path)
+            held = _AsyncSqliteSaverHeld(self._path)
+            saver = await held.__aenter__()
+            # 持有 held 以便 close() / aclose() 释放连接
+            self._async_held = held
+            return saver
         if _MEMORY_SAVER_AVAILABLE:
             logger.warning("短期记忆降级为 InMemorySaver(重启即丢)")
             return InMemorySaver()
         raise RuntimeError("无可用 checkpointer")
+
+    def get_sync_saver(self) -> Any:
+        """返回同步 SqliteSaver 实例（Phase 6.2 P0,供 ButlerOrchestrator._ensure_graph 用）。
+
+        LangGraph 1.x 的 ``compile(checkpointer=...)`` 接受 BaseCheckpointSaver 实例,
+        同步 saver 可直接传入,不需要 async context manager。
+
+        关键陷阱:LangGraph 的 ``SqliteSaver.from_conn_string`` 是 ``@contextmanager`` 装饰的,
+        ``__enter__`` 返回的 saver 实例**依赖外层 with 块的 conn 句柄**,出了 with 块 conn 就 close。
+        所以我们必须持有这个 CM,延迟 __exit__ 到进程退出。
+
+        降级路径:SqliteSaver 不可用时回退 InMemorySaver(进程内)。
+        """
+        if _SQLITE_SAVER_AVAILABLE:
+            from langgraph.checkpoint.sqlite import SqliteSaver
+
+            # 持有 CM 句柄,延迟 __exit__ 到 close() 时
+            cm = SqliteSaver.from_conn_string(str(self._path))
+            saver = cm.__enter__()
+            # 把 cm 挂到 saver 上,close() 时一并释放
+            self._cm = cm
+            return saver
+        if _MEMORY_SAVER_AVAILABLE:
+            logger.warning(
+                "短期记忆降级为 InMemorySaver(重启即丢):"
+                "langgraph-checkpoint-sqlite 未装"
+            )
+            return InMemorySaver()
+        raise RuntimeError("无可用 checkpointer")
+
+    def close(self) -> None:
+        """释放 SqliteSaver 的 context manager(Phase 6.2 P0)。
+
+        同步版本:释放 ``get_sync_saver`` 持有的 ``SqliteSaver`` 句柄。
+        如果已通过 ``get_async_saver()`` 拿到 async saver,需在事件循环里
+        调 ``aclose()``(see :meth:`aclose`)。
+        """
+        cm = getattr(self, "_cm", None)
+        if cm is not None:
+            try:
+                cm.__exit__(None, None, None)
+            except Exception as e:  # pragma: no cover
+                logger.warning("ShortTermMemory.close failed: %s", e)
+            self._cm = None
+
+    async def aclose(self) -> None:
+        """释放 ``get_async_saver()`` 持有的 ``AsyncSqliteSaver`` 句柄(Phase 6.2 P0)。
+
+        必须在事件循环里调(同步 close() 不释放 async 句柄)。
+        """
+        held = getattr(self, "_async_held", None)
+        if held is not None:
+            await held.aclose()
+            self._async_held = None
 
     async def cleanup_expired(self, older_than_days: int = 30) -> int:
         """清理 N 天前的 checkpointer 历史。
@@ -174,6 +235,55 @@ class _AsyncSqliteSaverWrapper:
                 "AsyncSqliteSaver 未初始化 —— 必须在 'async with wrapper' 内使用"
             )
         return getattr(self._saver, name)
+
+
+class _AsyncSqliteSaverHeld:
+    """``AsyncSqliteSaver`` 长生命周期持有版(Phase 6.2 P0)。
+
+    解决 ``from_conn_string`` 必须 ``async with`` 才有连接的问题:
+    我们 ``await __aenter__()`` 一次,把 cm 句柄挂在自身上,让调用方可以像用
+    普通 saver 一样直接 ``await saver.aput(...)``,无需每次套一层 ``async with``。
+    进程退出前由 orchestrator 调 ``await aclose()`` 释放。
+
+    用法::
+
+        held = _AsyncSqliteSaverHeld(path)
+        saver = await held.__aenter__()
+        # ... 用 saver ...
+        await held.aclose()
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._cm: Any | None = None
+        self._saver: Any | None = None
+
+    async def __aenter__(self) -> Any:
+        """立刻完成 ``AsyncSqliteSaver.from_conn_string`` 的 CM 初始化。
+
+        Returns:
+            ``AsyncSqliteSaver`` 实例,可直接用 ``aput / aget_tuple / setup``。
+        """
+        if self._saver is not None:
+            return self._saver
+        self._cm = AsyncSqliteSaver.from_conn_string(str(self._path))
+        self._saver = await self._cm.__aenter__()
+        await self._saver.setup()  # 建表(幂等)
+        return self._saver
+
+    async def aclose(self) -> None:
+        """释放 connection(由 ShortTermMemory.aclose_async 统一调用)。"""
+        if self._cm is None:
+            return
+        try:
+            await self._cm.__aexit__(None, None, None)
+        except Exception as e:  # pragma: no cover
+            logger.warning("_AsyncSqliteSaverHeld.aclose failed: %s", e)
+        self._cm = None
+        self._saver = None
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.aclose()
 
 
 __all__ = ["ShortTermMemory"]

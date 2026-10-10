@@ -76,7 +76,25 @@ data/
 .env.local
 .env.*.local
 
+# Test scratch space
+# 任何 tests/ 下的隐藏文件(开发期临时 dump 的 .log / .out / .err 等)
+tests/.[!.]*
+tests/**/*.log
+tests/**/*.out
+tests/**/*.err
+tests/**/*.tmp
+tests/**/data/
+tests/**/logs/
+tests/**/checkpoints.db
+tests/**/short_term.db
+tests/**/long_term.db
+
+# Dev scripts (本地交互/调试入口,不入仓)
+# 顶层 examples/ 不在此列,正式 demo 入 examples/ 走 PR review
+scripts/
+
 # Distribution / packaging
 *.spec
 *.app
 MANIFEST
+tests/unit/test_dev_chat.py

@@ -308,3 +308,197 @@ class TestButlerOrchestratorWithMemory:
         orch, _ = self._make_orch_with_memory(FakeFacade())
         orch._current_memory_block = "### 记忆\n- 测试"  # type: ignore[attr-defined]
         assert orch._build_memory_block_sync() == "### 记忆\n- 测试"  # type: ignore[attr-defined]
+
+
+class TestButlerOrchestratorWithShortTerm:
+    """Phase 6.2 P0:short_term 注入后的 checkpointer 行为。"""
+
+    def _make_orch_with_short_term(
+        self, short_term: Any,
+    ) -> tuple[ButlerOrchestrator, _FakeCompiledGraph]:
+        compiled = _FakeCompiledGraph([AIMessage(content="管家回复")])
+        orch = ButlerOrchestrator(
+            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
+            llm_settings=_FakeSettings(),
+            short_term=short_term,
+        )
+        orch._compiled = compiled  # type: ignore[attr-defined]
+        return orch, compiled
+
+    def test_accepts_short_term_param(self) -> None:
+        """构造时传 short_term 参数不抛异常。"""
+        class FakeShortTerm:
+            def get_sync_saver(self) -> Any:
+                return None
+
+        orch = ButlerOrchestrator(
+            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
+            llm_settings=_FakeSettings(),
+            short_term=FakeShortTerm(),
+        )
+        assert orch._short_term is not None  # type: ignore[attr-defined]
+        assert orch._short_term_saver_cache is None  # type: ignore[attr-defined]
+
+    def test_short_term_none_uses_in_memory_saver(self) -> None:
+        """未注入 short_term 时 _short_term 为 None。"""
+        orch = ButlerOrchestrator(
+            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
+            llm_settings=_FakeSettings(),
+        )
+        assert orch._short_term is None  # type: ignore[attr-defined]
+
+    def test_ensure_graph_inits_saver_eagerly(self) -> None:
+        """_ensure_graph 同步初始化 short_term saver,缓存复用。"""
+        from unittest.mock import patch, MagicMock
+
+        saver_initialized: list[int] = []
+
+        class FakeShortTerm:
+            def get_sync_saver(self) -> Any:
+                saver_initialized.append(1)
+                return MagicMock()
+
+        orch = ButlerOrchestrator(
+            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
+            llm_settings=_FakeSettings(),
+            short_term=FakeShortTerm(),
+        )
+        # 拦截 compiled.build(),防止 LangGraph 验证 MagicMock
+        with patch.object(orch._graph_builder_factory, "build", return_value=MagicMock()):
+            with patch.object(orch, "_collect_tools", return_value=[]):
+                orch._ensure_graph()  # type: ignore[attr-defined]
+        assert len(saver_initialized) == 1
+        assert orch._short_term_saver_cache is not None  # type: ignore[attr-defined]
+        # 第二次 _ensure_graph:复用缓存,不再调 get_async_saver
+        orch._compiled = None  # type: ignore[attr-defined]
+        with patch.object(orch._graph_builder_factory, "build", return_value=MagicMock()):
+            with patch.object(orch, "_collect_tools", return_value=[]):
+                orch._ensure_graph()  # type: ignore[attr-defined]
+        assert len(saver_initialized) == 1
+
+    def test_ensure_graph_passes_checkpointer_to_builder(self) -> None:
+        """_ensure_graph 把 short_term 的 saver 传给 graph builder。"""
+        from unittest.mock import MagicMock, patch
+
+        class FakeShortTerm:
+            def get_sync_saver(self) -> Any:
+                return MagicMock()
+
+        orch = ButlerOrchestrator(
+            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
+            llm_settings=_FakeSettings(),
+            short_term=FakeShortTerm(),
+        )
+        # 拦截 compiled.build(),防止 LangGraph 验证
+        with patch.object(orch._graph_builder_factory, "build", return_value=MagicMock()):
+            with patch.object(orch, "_collect_tools", return_value=[]):
+                orch._ensure_graph()  # type: ignore[attr-defined]
+        # 验证:graph_builder._checkpointer 已被赋值为 saver 缓存实例
+        assert orch._graph_builder_factory._checkpointer is orch._short_term_saver_cache  # type: ignore[misc]
+
+
+class TestButlerOrchestratorAsyncSaver:
+    """Phase 6.2 P0: ainvoke / astream 走 async saver,不撞 NotImplementedError。"""
+
+    @pytest.mark.asyncio
+    async def test_ensure_graph_async_uses_async_saver(self) -> None:
+        """_ensure_graph_async 必须 await get_async_saver()(不是 get_sync_saver)。"""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        captured: dict[str, Any] = {}
+
+        class FakeShortTerm:
+            def get_sync_saver(self) -> Any:
+                raise AssertionError(
+                    "async 路径不应该调 get_sync_saver —— 会撞 NotImplementedError"
+                )
+
+            async def get_async_saver(self) -> Any:
+                captured["called"] = True
+                return MagicMock(name="AsyncSqliteSaver")
+
+        orch = ButlerOrchestrator(
+            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
+            llm_settings=_FakeSettings(),
+            short_term=FakeShortTerm(),
+        )
+        with patch.object(orch._graph_builder_factory, "build", return_value=MagicMock()):
+            with patch.object(orch, "_collect_tools", return_value=[]):
+                await orch._ensure_graph_async()  # type: ignore[attr-defined]
+        assert captured.get("called") is True
+        # 验证:graph_builder 拿到了 async saver
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        # _checkpointer 是 MagicMock,确认它是 async 路径拿的
+        assert orch._short_term_saver_cache is not None  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_ensure_graph_async_returns_cached_compiled(self) -> None:
+        """第二次调 _ensure_graph_async 复用缓存,不重建 saver。"""
+        from unittest.mock import MagicMock, patch
+
+        call_count: list[int] = []
+
+        class FakeShortTerm:
+            def get_sync_saver(self) -> Any:
+                raise AssertionError("不应该调 sync")
+
+            async def get_async_saver(self) -> Any:
+                call_count.append(1)
+                return MagicMock()
+
+        orch = ButlerOrchestrator(
+            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
+            llm_settings=_FakeSettings(),
+            short_term=FakeShortTerm(),
+        )
+        with patch.object(orch._graph_builder_factory, "build", return_value=MagicMock()):
+            with patch.object(orch, "_collect_tools", return_value=[]):
+                await orch._ensure_graph_async()  # type: ignore[attr-defined]
+        # 第二次:不应再调 get_async_saver
+        with patch.object(orch._graph_builder_factory, "build", return_value=MagicMock()):
+            with patch.object(orch, "_collect_tools", return_value=[]):
+                await orch._ensure_graph_async()  # type: ignore[attr-defined]
+        assert len(call_count) == 1
+
+    @pytest.mark.asyncio
+    async def test_ensure_graph_async_rebuilds_when_sync_cache_present(self) -> None:
+        """如果 _short_term_saver_cache 已被同步路径污染,async 路径必须重建。"""
+        from unittest.mock import MagicMock, patch
+
+        class FakeSyncSaver:
+            """模拟同步 SqliteSaver —— 没有 aget_tuple。"""
+
+        class FakeShortTerm:
+            def __init__(self) -> None:
+                self.async_called = False
+                self.aclose_called = False
+
+            def get_sync_saver(self) -> Any:
+                return FakeSyncSaver()
+
+            async def get_async_saver(self) -> Any:
+                self.async_called = True
+                return MagicMock()
+
+            async def aclose(self) -> None:
+                self.aclose_called = True
+
+        stm = FakeShortTerm()
+        orch = ButlerOrchestrator(
+            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
+            llm_settings=_FakeSettings(),
+            short_term=stm,
+        )
+        # 模拟同步路径污染了缓存
+        orch._short_term_saver_cache = FakeSyncSaver()  # type: ignore[attr-defined]
+        with patch.object(orch._graph_builder_factory, "build", return_value=MagicMock()):
+            with patch.object(orch, "_collect_tools", return_value=[]):
+                await orch._ensure_graph_async()  # type: ignore[attr-defined]
+        assert stm.async_called is True
+        assert stm.aclose_called is True
+        # 缓存里是 async 拿到的
+        assert orch._short_term_saver_cache is not None  # type: ignore[attr-defined]
+        assert orch._short_term_saver_cache is not isinstance(  # type: ignore[attr-defined]
+            orch._short_term_saver_cache, FakeSyncSaver
+        )
