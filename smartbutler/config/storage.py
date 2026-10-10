@@ -54,12 +54,11 @@ class StorageSettings(BaseSettings):
         default="smartbutler_memory",
         description="默认向量集合名",
     )
-    # Phase 6.1:向量维度。1536 是 OpenAI text-embedding-3-small/ada-002 的默认维度,
-    # 也跟 DeepSeek/Qwen 的常用嵌入维度兼容。Phase 6.2 接 langmem 后会按嵌入模型
-    # 自动匹配;此字段先给一个安全 default,避免 Qdrant 嵌入式启动报"维度不匹配"。
+    # Phase 6.2: 向量维度改为 1024（qwen3.7-text-embedding-flash 默认维度，MTEB 68.36）。
+    # Phase 6.1 的 1536 是旧值（OpenAI text-embedding-3-small），已废弃。
     qdrant_vector_size: int = Field(
-        default=1536,
-        description="Qdrant 集合向量维度（必须跟嵌入模型输出一致）",
+        default=1024,
+        description="Qdrant 集合向量维度（必须跟嵌入模型输出一致；默认 qwen3.7-text-embedding-flash 1024 维）",
     )
     qdrant_distance: str = Field(
         default="Cosine",

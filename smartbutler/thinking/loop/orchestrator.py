@@ -100,6 +100,7 @@ class ButlerOrchestrator:
         proactive_reasoning: ProactiveReasoning | None = None,
         enable_proactive_advice: bool = False,
         skill_runtime: SkillRuntime | None = None,
+        memory_facade: Any | None = None,
     ) -> None:
         """构造 orchestrator。
 
@@ -119,6 +120,9 @@ class ButlerOrchestrator:
                 注入后,管家自动获得 6 个文件工具(read_file/write_file/edit_file/
                 delete_file/ls/grep/glob)+ skill list 注入 system prompt。
                 None → 不注入 skill 能力(老行为,零影响)。
+            memory_facade: 🆕 Phase 6.2 P0,``MemoryFacade`` 实例(thinking 接入层)。
+                注入后,管家在 ``decide_node`` 召回相关历史并注入 system prompt。
+                None → 不注入 memory 能力(老行为,零影响)。
         """
         self._llm = llm
         self._tool_registry = tool_registry or ToolRegistry.get_default()
@@ -149,6 +153,10 @@ class ButlerOrchestrator:
                 except ToolAlreadyRegisteredError:
                     # 单测 / 重入场景:跳过
                     pass
+
+        # Phase 6.2 P0: Memory 接入层
+        self._memory_facade = memory_facade
+        self._current_memory_block: str = ""  # 每次 ainvoke 时刷新
 
     # ---------- Skill 注入(Phase 5 占位) ----------
 
@@ -193,6 +201,18 @@ class ButlerOrchestrator:
         tools.extend(self._agent_manager.get_delegate_tools())
         return tools
 
+    # ---------- Phase 6.2 P0 : Memory 注入 ----------
+
+    def _build_memory_block_sync(self) -> str:
+        """读缓存的 ``_current_memory_block``。
+
+        缓存由 ``ainvoke`` 在调 LLM 前用 ``format_for_prompt`` 刷新。
+        任何失败/无 facade → 返回空字符串(thinking 继续工作)。
+        """
+        if self._memory_facade is None:
+            return ""
+        return self._current_memory_block or ""
+
     # ---------- Graph 懒构建 ----------
 
     def _ensure_graph(self) -> Any:
@@ -204,15 +224,18 @@ class ButlerOrchestrator:
         self._chat_adapter = self._make_chat_adapter()
         # 2. 收集工具
         self._all_tools = self._collect_tools()
-        # 3. 拼 system prompt(含 skill list 注入)
+        # 3. 拼 system prompt(含 skill list 注入 + memory 注入)
         skill_snippets = list(self._skill_prompt_snippets)
         if self._skill_runtime is not None:
             skill_list_prompt = self._skill_runtime.render_prompt_snippet()
             if skill_list_prompt:
                 skill_snippets.append(skill_list_prompt)
+        # 3a. 🆕 Phase 6.2 P0: 召回相关历史并格式化为 system prompt 片段
+        memory_block = self._build_memory_block_sync()
         system_prompt = ButlerPromptBuilder().build(
             tool_specs=self._all_tools,
             skill_prompt_snippets=skill_snippets,
+            memory_block=memory_block,
         )
         # 4. build graph
         self._compiled = (
@@ -309,6 +332,21 @@ class ButlerOrchestrator:
         if not user_input or not user_input.strip():
             return ""
 
+        # 🆕 Phase 6.2 P0: 刷新 memory_block 缓存
+        if self._memory_facade is not None:
+            try:
+                from smartbutler.emotion.memory.facade import MemoryContext
+
+                ctx = MemoryContext(user_id=user_id, session_id=session_id)
+                self._current_memory_block = await self._memory_facade.format_for_prompt(
+                    query=user_input.strip(), ctx=ctx, k=5, max_chars=2000,
+                )
+                # 缓存失效:让 _ensure_graph 重新拼 system_prompt
+                self._compiled = None
+            except Exception:  # noqa: BLE001
+                self._current_memory_block = ""
+                # 缓存不变,无需重建
+
         compiled = self._ensure_graph()
         initial_state: ButlerState = {
             "messages": [HumanMessage(content=user_input.strip())],
@@ -349,6 +387,19 @@ class ButlerOrchestrator:
         """流式:每个 token chunk 走 ``BaseMessage``。"""
         if not user_input or not user_input.strip():
             return
+
+        # 🆕 Phase 6.2 P0: 同 ainvoke
+        if self._memory_facade is not None:
+            try:
+                from smartbutler.emotion.memory.facade import MemoryContext
+
+                ctx = MemoryContext(user_id=user_id, session_id=session_id)
+                self._current_memory_block = await self._memory_facade.format_for_prompt(
+                    query=user_input.strip(), ctx=ctx, k=5, max_chars=2000,
+                )
+                self._compiled = None
+            except Exception:  # noqa: BLE001
+                self._current_memory_block = ""
 
         compiled = self._ensure_graph()
         initial_state: ButlerState = {

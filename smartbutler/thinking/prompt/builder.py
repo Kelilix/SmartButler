@@ -61,6 +61,7 @@ class ButlerPromptBuilder:
         *,
         tool_specs: list[BaseTool] | None = None,
         skill_prompt_snippets: list[str] | None = None,
+        memory_block: str = "",
     ) -> str:
         """组装管家 system prompt。
 
@@ -68,6 +69,8 @@ class ButlerPromptBuilder:
             tool_specs: 可用工具列表(BaseTool 实例或 LangChain StructuredTool)。
                 兼容 BaseTool(取 name/description)和 LangChain tool(也取 name/description)。
             skill_prompt_snippets: Phase 5 注入的 Skill system_prompt 片段。
+            memory_block: 🆕 Phase 6.2 P0,MemoryFacade.format_for_prompt() 的输出。
+                空字符串 = 拼"无相关历史";非空 = 拼"## 相关历史记忆\\n{block}"。
 
         Returns:
             最终 system prompt 字符串。
@@ -76,6 +79,11 @@ class ButlerPromptBuilder:
 
         if tool_specs:
             parts.append(self._render_tool_awareness(tool_specs))
+
+        if memory_block:
+            parts.append(f"## 相关历史记忆\n\n{memory_block.strip()}")
+        else:
+            parts.append("## 相关历史记忆\n\n(无相关历史)")
 
         if skill_prompt_snippets:
             parts.append(self._render_skill_snippets(skill_prompt_snippets))

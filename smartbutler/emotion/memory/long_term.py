@@ -104,17 +104,15 @@ class LongTermStore:
             [{"key": str, "score": float, "content": str, "importance": float,
               "tags": list[str]}, ...]
         """
-        filter_payload: dict[str, Any] = {}
-        if tag is not None:
-            filter_payload["tags"] = tag  # Qdrant MatchValue 支持精确匹配
-        # min_importance 暂时不在 filter 里(需要 range query),留 Phase 6.2
-        hits = self._q.similarity_search(
-            embedding, limit=k, filter_payload=filter_payload or None,
+        # Phase 6.2: importance 过滤推送到 Qdrant 服务端,避免客户端二次过滤
+        hits = self._q.similarity_search_with_filters(
+            embedding,
+            k=k,
+            min_importance=min_importance,
+            tag=tag,
         )
         out: list[dict[str, Any]] = []
         for key, score, payload in hits:
-            if payload.get("importance", 0.0) < min_importance:
-                continue
             out.append({
                 "key": key,
                 "score": score,
@@ -142,7 +140,7 @@ def create_long_term_store(
     qdrant_url: str | None = None,
     qdrant_api_key: str | None = None,
     collection: str = "smartbutler_memory",
-    vector_size: int = 1536,
+    vector_size: int = 1024,
     distance: str = "Cosine",
 ) -> LongTermStore:
     """工厂函数:从参数建 LongTermStore。

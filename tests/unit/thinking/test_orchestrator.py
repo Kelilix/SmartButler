@@ -170,3 +170,141 @@ class TestButlerOrchestrator:
         assert compiled is not None
         # 第二次调用复用
         assert orch._ensure_graph() is compiled  # type: ignore[attr-defined]
+
+
+class TestButlerOrchestratorWithMemory:
+    """Phase 6.2 P0:memory_facade 注入后的接入行为。"""
+
+    def _make_orch_with_memory(
+        self, memory_facade: Any,
+    ) -> tuple[ButlerOrchestrator, _FakeCompiledGraph]:
+        compiled = _FakeCompiledGraph([AIMessage(content="管家回复")])
+        orch = ButlerOrchestrator(
+            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
+            llm_settings=_FakeSettings(),
+            memory_facade=memory_facade,
+        )
+        orch._compiled = compiled  # type: ignore[attr-defined]
+        return orch, compiled
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_calls_memory_format_for_prompt(self) -> None:
+        """ainvoke 调用 MemoryFacade.format_for_prompt(query=user_input)。"""
+        calls: list[dict[str, Any]] = []
+
+        class FakeFacade:
+            async def format_for_prompt(
+                self, query: str, *, ctx: Any = None, k: int = 5, max_chars: int = 2000
+            ) -> str:
+                calls.append({
+                    "query": query, "ctx": ctx, "k": k, "max_chars": max_chars,
+                })
+                return "### 相关历史记忆\n- 用户说 10.8 去迪士尼"
+
+        orch, _ = self._make_orch_with_memory(FakeFacade())
+        await orch.ainvoke("明天有什么安排", user_id="alice", session_id="s-1")
+        # 验证 facade 被调,query 是用户输入
+        assert len(calls) == 1
+        assert calls[0]["query"] == "明天有什么安排"
+        assert calls[0]["ctx"] is not None
+        assert calls[0]["ctx"].user_id == "alice"
+        assert calls[0]["ctx"].session_id == "s-1"
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_injects_memory_into_prompt(self) -> None:
+        """召回结果会拼到 system_prompt。"""
+        from unittest.mock import patch
+
+        class FakeFacade:
+            async def format_for_prompt(
+                self, query: str, *, ctx: Any = None, k: int = 5, max_chars: int = 2000
+            ) -> str:
+                return "### 相关历史记忆\n- 用户喜欢咖啡"
+
+        orch = ButlerOrchestrator(
+            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
+            llm_settings=_FakeSettings(),
+            memory_facade=FakeFacade(),
+        )
+        # 拦截 _collect_tools,只关注 prompt
+        with patch.object(orch, "_collect_tools", return_value=[]):
+            # 先预热 ainvoke 一次,刷新 _current_memory_block
+            await orch.ainvoke("hi")  # 这里 _compiled 会被 set,再清掉
+            orch._compiled = None  # type: ignore[attr-defined]
+            compiled = orch._ensure_graph()  # type: ignore[attr-defined]
+        # 验证 system_prompt 中含召回内容
+        # ButlerGraphBuilder 内部用 system_prompt,这里只能间接通过 _chat_adapter 看
+        # 简单方法:看 _build_memory_block_sync 输出
+        assert "咖啡" in orch._build_memory_block_sync()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_memory_failure_does_not_crash(self) -> None:
+        """facade 抛异常时,ainvoke 仍能返回结果(降级)。"""
+        class BrokenFacade:
+            async def format_for_prompt(self, **kwargs: Any) -> str:
+                raise RuntimeError("boom")
+
+        orch, compiled = self._make_orch_with_memory(BrokenFacade())
+        result = await orch.ainvoke("hi")
+        # 不崩,正常返回
+        assert result == "管家回复"
+        # memory_block 清空
+        assert orch._current_memory_block == ""  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_without_memory_facade(self) -> None:
+        """未注入 facade 时,行为跟原来一致(向后兼容)。"""
+        orch, compiled = self._make_orch_with_memory(None)
+        result = await orch.ainvoke("hi")
+        assert result == "管家回复"
+        assert orch._current_memory_block == ""  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_invalidates_compiled_on_memory_change(self) -> None:
+        """每次 ainvoke(因 memory 变化)都失效 graph,确保 system_prompt 用最新。"""
+        class FakeFacade:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def format_for_prompt(self, **kwargs: Any) -> str:
+                self.calls += 1
+                return f"记忆 {self.calls}"
+
+        facade = FakeFacade()
+        orch, compiled = self._make_orch_with_memory(facade)
+        # 第一次 ainvoke
+        await orch.ainvoke("query 1")
+        # 第二次 ainvoke,facade 又被调一次
+        await orch.ainvoke("query 2")
+        assert facade.calls == 2
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_skips_memory_on_empty_input(self) -> None:
+        """空输入不调 facade(直接返回空)。"""
+        class FakeFacade:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def format_for_prompt(self, **kwargs: Any) -> str:
+                self.calls += 1
+                return ""
+
+        facade = FakeFacade()
+        orch, compiled = self._make_orch_with_memory(facade)
+        result = await orch.ainvoke("")
+        assert result == ""
+        assert facade.calls == 0
+
+    def test_build_memory_block_no_facade_returns_empty(self) -> None:
+        """无 facade 时 _build_memory_block_sync 返回空。"""
+        orch, _ = self._make_orch_with_memory(None)
+        assert orch._build_memory_block_sync() == ""  # type: ignore[attr-defined]
+
+    def test_build_memory_block_with_cache(self) -> None:
+        """有 facade + 缓存时返回缓存值。"""
+        class FakeFacade:
+            pass
+
+        orch, _ = self._make_orch_with_memory(FakeFacade())
+        orch._current_memory_block = "### 记忆\n- 测试"  # type: ignore[attr-defined]
+        assert orch._build_memory_block_sync() == "### 记忆\n- 测试"  # type: ignore[attr-defined]

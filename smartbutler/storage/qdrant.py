@@ -24,6 +24,7 @@ upsert_with_vector）供 Phase 6.2 语义检索使用。
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from qdrant_client.models import (
     Filter,
     MatchValue,
     PointStruct,
+    Range,
     VectorParams,
 )
 
@@ -44,6 +46,15 @@ _DISTANCE_MAP: dict[str, Distance] = {
     "Euclid": Distance.EUCLID,
     "Dot": Distance.DOT,
 }
+
+# Qdrant payload key 必须是合法标识符(数字/字母/下划线/连字符/点)。
+# tag 默认是 "source:xxx" 这种含冒号的形式,需要转成 "source_xxx"。
+_TAG_KEY_RE = re.compile(r"[^a-zA-Z0-9_.\-]")
+
+
+def _sanitize_payload_key(key: str) -> str:
+    """把任意 tag 转成 Qdrant payload key(替换非法字符为 _)。"""
+    return _TAG_KEY_RE.sub("_", key)
 
 
 class QdrantStorage(BaseStorage):
@@ -68,7 +79,7 @@ class QdrantStorage(BaseStorage):
         url: str | None = None,
         api_key: str | None = None,
         collection: str = "smartbutler_memory",
-        vector_size: int = 1536,
+        vector_size: int = 1024,
         distance: str = "Cosine",
     ) -> None:
         """初始化 Qdrant 后端。
@@ -282,6 +293,65 @@ class QdrantStorage(BaseStorage):
             query=vector,
             limit=limit,
             score_threshold=score_threshold,
+            query_filter=scroll_filter,
+            with_payload=True,
+        )
+        result: list[tuple[str, float, dict[str, Any]]] = []
+        for p in resp.points:
+            payload = p.payload or {}
+            key = payload.get("kv_key", str(p.id))
+            result.append((key, p.score, payload))
+        return result
+
+    # --------------------- Phase 6.2 P0: range + tag 联合查询 ---------------------
+
+    def similarity_search_with_filters(
+        self,
+        vector: list[float],
+        *,
+        k: int = 5,
+        min_importance: float | None = None,
+        tag: str | None = None,
+    ) -> list[tuple[str, float, dict[str, Any]]]:
+        """带 ``min_importance`` + ``tag`` 过滤的语义检索(Phase 6.2 P0)。
+
+        区别于 ``similarity_search``:
+        - ``min_importance`` 走 Qdrant 服务端 ``Range(gte=...)``,避免客户端二次过滤
+        - ``tag`` 走服务端 ``MatchValue``,与现有 ``similarity_search`` 一致
+
+        Args:
+            vector: 查询向量。
+            k: 返回条数上限。
+            min_importance: 重要性下限,None = 不过滤。
+            tag: 单 tag 精确匹配,None = 不过滤。
+                注意:tag 如 ``"source:alice"`` 内部存为 ``"source_alice"``(Qdrant
+                payload key 不支持冒号),传 tag 时也走同样的 sanitize。
+
+        Returns:
+            ``[(key, score, payload), ...]`` 列表。
+        """
+        if len(vector) != self._vector_size:
+            raise StorageError(
+                f"vector size {len(vector)} != collection size {self._vector_size}"
+            )
+        self._ensure_collection()
+
+        must: list[FieldCondition] = []
+        if min_importance is not None:
+            must.append(
+                FieldCondition(key="importance", range=Range(gte=float(min_importance)))
+            )
+        if tag is not None:
+            # tag 在 ``similarity_search`` 里以 ``tags`` 数组存储,所以这里按数组元素匹配。
+            # 数组里存的是原 tag(可能含冒号),所以 match 的 value 用原 tag,Qdrant
+            # 本身支持数组里任意值匹配。
+            must.append(FieldCondition(key="tags", match=MatchValue(value=tag)))
+
+        scroll_filter: Filter | None = Filter(must=must) if must else None
+        resp = self._client.query_points(
+            collection_name=self._collection,
+            query=vector,
+            limit=k,
             query_filter=scroll_filter,
             with_payload=True,
         )
