@@ -91,7 +91,9 @@ tests/**/long_term.db
 
 # Dev scripts (本地交互/调试入口,不入仓)
 # 顶层 examples/ 不在此列,正式 demo 入 examples/ 走 PR review
-scripts/
+# 注:只忽略"项目根下的 scripts/"目录。``smartbutler/scripts/memory_cli.py``
+# 是 Phase 6.3 产品代码(设计稿 §2.5.1.16),路径在包内,**必须入仓**。
+/scripts/
 
 # Distribution / packaging
 *.spec

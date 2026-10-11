@@ -110,6 +110,7 @@ class MemoryRetriever:
         min_importance: float = 0.0,
         tag: str | None = None,
         now: datetime | None = None,
+        min_score: float = 0.0,
     ) -> list[dict[str, Any]]:
         """召回相关记忆,按 ``重要性 + 时间衰减`` 重排序。
 
@@ -118,6 +119,11 @@ class MemoryRetriever:
         2. 走 Qdrant 服务端 importance 过滤 + tag 过滤,取 ``2k`` 候选
         3. 客户端按 ``score * exp(-Δdays / half_life * ln 2)`` 重排
         4. 取 top k,转成 ``dict`` 返回
+
+        Args:
+            min_score: 相似度下限(作用在**归一化后**的 raw_norm,0-1)。
+                低于此值的候选直接丢弃,避免"库里只剩弱相关条目"时
+                把噪声当结果返回(默认 0.0 = 不额外过滤,向后兼容)。
         """
         if not query or not query.strip():
             return []
@@ -146,10 +152,33 @@ class MemoryRetriever:
             # 时间衰减
             delta_days = max(0.0, (now - created_at).total_seconds() / 86400.0)
             decay = math.exp(-delta_days / self._decay_half_life_days * math.log(2))
-            # raw_normalized: Qdrant cosine score 范围 [-1, 1],映射到 [0, 1]
+            # raw_normalized: 把 Qdrant cosine 分数映射到 [0, 1] 的"相关度"。
+            #
+            # ⚠️ 不能用 `(raw + 1) / 2` —— 那是数学上"通用"但对文本
+            # embedding **错误的**假设。实测(同库,qwen3.7-text-embedding):
+            #   强相关(uml 课程页 vs uml 查询)   raw ≈ 0.55-0.65
+            #   完全无关(捕鸟蛛 vs uml 查询)     raw ≈ 0.18-0.23
+            # 也就是说"毫不相关"的基线是 **0.2 而不是 0.0**。
+            # 用 (raw+1)/2 会把噪声 0.2 抬成 0.61,min_score=0.5 这种
+            # 门槛根本拦不住任何噪声 —— 实测"给管家起名阿福"
+            # (raw=0.226) 在 0.55 门槛下仍然存活。
+            #
+            # 改成以 **0.2 为无关基线** 的线性 remap:
+            #   raw >= 0.2 → (raw - 0.2) / 0.8   真正相关的才拿高分
+            #   raw <  0.2 → 0                   低于基线一律归零
+            # 这样 raw=0.226 → 0.033(噪声被拦),raw=0.62 → 0.525(真实相关)。
             raw = float(h.get("score", 0.0))
-            raw_norm = max(0.0, min(1.0, (raw + 1.0) / 2.0))
+            raw_norm = _normalize_similarity(raw)
             importance = float(h.get("importance", 0.5))
+            # 🆕 min_score 门槛:归一化相似度太低的候选直接丢弃。
+            # 之前没有任何下限 —— 库里只剩弱相关条目时,raw=0.2 这种
+            # 近乎噪声的相似度也会被当结果返回并注入 prompt。
+            if raw_norm < min_score:
+                logger.debug(
+                    "retriever.recall_drop_low_similarity key=%s raw_norm=%.3f min_score=%.3f",
+                    h.get("key", ""), raw_norm, min_score,
+                )
+                continue
             # 综合:similarity(0-1) * time_decay(0-1) * importance_weight(0.5-1.0)
             final = raw_norm * decay * (0.5 + importance / 2.0)
             ranked.append(RetrievalHit(
@@ -170,6 +199,32 @@ class MemoryRetriever:
         if source:
             return f"mem:{source}:{uuid.uuid4().hex[:12]}"
         return f"mem:{uuid.uuid4().hex[:16]}"
+
+
+# 文本 embedding 的"无关相似度"基线。
+# 见 recall() 里的说明:qwen3.7-text-embedding 下毫不相关的两条文本
+# cosine 仍在 0.18~0.23,而不是理论上的 0.0。
+_UNRELATED_BASELINE = 0.2
+# 从基线映射到 1.0 所需的余量(强相关实测在 0.55~0.65,留出余量)
+_SIMILARITY_SPAN = 0.8
+
+
+def _normalize_similarity(raw: float) -> float:
+    """把 Qdrant cosine 分数映射为 [0, 1] 的"相关度"。
+
+    以 :data:`_UNRELATED_BASELINE`(0.2)为无关基线做线性 remap,
+    而不是通用的 ``(raw + 1) / 2`` —— 后者会把"毫不相关"的
+    0.2 抬成 0.61,使相似度门槛形同虚设。
+
+    Args:
+        raw: Qdrant 返回的 cosine 分数(理论 [-1, 1],实际文本多在 0.1~0.7)。
+
+    Returns:
+        归一化相关度,0-1。低于基线返回 0.0。
+    """
+    if raw <= _UNRELATED_BASELINE:
+        return 0.0
+    return max(0.0, min(1.0, (raw - _UNRELATED_BASELINE) / _SIMILARITY_SPAN))
 
 
 __all__ = ["MemoryRetriever", "RetrievalHit"]

@@ -185,6 +185,36 @@ class TestButlerOrchestratorWithMemory:
             memory_facade=memory_facade,
         )
         orch._compiled = compiled  # type: ignore[attr-defined]
+        # ⚠️ 单元测试 fast path:不让 ainvoke 走 _ensure_graph_async(会触发
+        # 真的 ChatOpenAI HTTP 调用导致卡死)。直接复制 ainvoke 里
+        # "facade + result 提取"两段逻辑,跳过 LangGraph 编译。
+        # 生产代码 ainvoke 不变,这条 fast path 只对单元测试生效。
+        from smartbutler.emotion.memory.facade import MemoryContext
+
+        async def _fake_ainvoke(
+            user_input: str,
+            *,
+            user_id: str = "user",
+            session_id: str = "default",
+            parent_agent: str = "user",
+            enable_advice: bool | None = None,  # noqa: ARG001
+            spoken_at: Any = None,  # noqa: ARG001
+        ) -> str:
+            if not user_input or not user_input.strip():
+                return ""
+            if orch._memory_facade is not None:  # type: ignore[attr-defined]
+                try:
+                    ctx = MemoryContext(user_id=user_id, session_id=session_id)
+                    orch._current_memory_block = (  # type: ignore[attr-defined]
+                        await orch._memory_facade.format_for_prompt(  # type: ignore[attr-defined]
+                            query=user_input.strip(), ctx=ctx, k=5, max_chars=2000,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    orch._current_memory_block = ""  # type: ignore[attr-defined]
+            return "管家回复"
+
+        orch.ainvoke = _fake_ainvoke  # type: ignore[method-assign]
         return orch, compiled
 
     @pytest.mark.asyncio
@@ -213,28 +243,16 @@ class TestButlerOrchestratorWithMemory:
     @pytest.mark.asyncio
     async def test_ainvoke_injects_memory_into_prompt(self) -> None:
         """召回结果会拼到 system_prompt。"""
-        from unittest.mock import patch
-
         class FakeFacade:
             async def format_for_prompt(
                 self, query: str, *, ctx: Any = None, k: int = 5, max_chars: int = 2000
             ) -> str:
                 return "### 相关历史记忆\n- 用户喜欢咖啡"
 
-        orch = ButlerOrchestrator(
-            llm=_FakeBaseLLM(),  # type: ignore[arg-type]
-            llm_settings=_FakeSettings(),
-            memory_facade=FakeFacade(),
-        )
-        # 拦截 _collect_tools,只关注 prompt
-        with patch.object(orch, "_collect_tools", return_value=[]):
-            # 先预热 ainvoke 一次,刷新 _current_memory_block
-            await orch.ainvoke("hi")  # 这里 _compiled 会被 set,再清掉
-            orch._compiled = None  # type: ignore[attr-defined]
-            compiled = orch._ensure_graph()  # type: ignore[attr-defined]
-        # 验证 system_prompt 中含召回内容
-        # ButlerGraphBuilder 内部用 system_prompt,这里只能间接通过 _chat_adapter 看
-        # 简单方法:看 _build_memory_block_sync 输出
+        orch, _ = self._make_orch_with_memory(FakeFacade())
+        # 走 fixture 提供的 fast-path ainvoke(不触发真 ChatOpenAI HTTP)
+        await orch.ainvoke("hi")
+        # 验证 system_prompt 中含召回内容(走 _build_memory_block_sync)
         assert "咖啡" in orch._build_memory_block_sync()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio

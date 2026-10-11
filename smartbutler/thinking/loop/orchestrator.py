@@ -25,6 +25,7 @@ from typing import Any
 
 import structlog
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from datetime import datetime, UTC
 
 from smartbutler.agents.manager.manager import AgentManager
 from smartbutler.capabilities.llm.base import BaseLLM
@@ -385,6 +386,7 @@ class ButlerOrchestrator:
         session_id: str = "default",
         parent_agent: str = "user",
         enable_advice: bool | None = None,
+        spoken_at: datetime | None = None,
     ) -> str:
         """同步阻塞调用,返回最终回复的 content 字符串。
 
@@ -396,6 +398,10 @@ class ButlerOrchestrator:
             enable_advice: 🆕 本次调用是否允许追加 Proactive 建议。
                 ``None`` → 用构造时的 ``enable_proactive_advice`` 默认值;
                 ``True/False`` → 显式覆盖。
+            spoken_at: 🆕 Phase 6.4 P1,本条 user 消息的实际发生时间(ISO 8601)。
+                None → 用当下 UTC(默认行为)。传进来的目的是让"管家事后回灌
+                历史消息"也能正确标时间。**写入 ``HumanMessage.additional_kwargs['spoken_at']``**,
+                TaskSegmenter / 抽取器据此拼"who/when"。
 
         Returns:
             最终回复文本(可能包含 Proactive 追加的建议)。
@@ -409,8 +415,16 @@ class ButlerOrchestrator:
                 from smartbutler.emotion.memory.facade import MemoryContext
 
                 ctx = MemoryContext(user_id=user_id, session_id=session_id)
+                logger.info(
+                    "orchestrator.ainvoke memory_block_refresh user=%s session=%s",
+                    user_id, session_id,
+                )
                 self._current_memory_block = await self._memory_facade.format_for_prompt(
                     query=user_input.strip(), ctx=ctx, k=5, max_chars=2000,
+                )
+                logger.info(
+                    "orchestrator.ainvoke memory_block_ready len=%d",
+                    len(self._current_memory_block),
                 )
                 # 缓存失效:让 _ensure_graph_async 重新拼 system_prompt
                 self._compiled = None
@@ -419,8 +433,15 @@ class ButlerOrchestrator:
                 # 缓存不变,无需重建
 
         compiled = await self._ensure_graph_async()
+        # 🆕 Phase 6.4 P1: per-message metadata — 写进 additional_kwargs
+        # SqliteSaver 落盘时透传,TaskSegmenter / 抽取器据此拼"who/when"
+        effective_spoken_at = spoken_at or datetime.now(UTC)
+        human_kwargs: dict[str, Any] = {
+            "user_id": user_id,
+            "spoken_at": effective_spoken_at.isoformat(),
+        }
         initial_state: ButlerState = {
-            "messages": [HumanMessage(content=user_input.strip())],
+            "messages": [HumanMessage(content=user_input.strip(), additional_kwargs=human_kwargs)],
             "user_id": user_id,
             "session_id": session_id,
             "parent_agent": parent_agent,
@@ -454,6 +475,7 @@ class ButlerOrchestrator:
         user_id: str = "user",
         session_id: str = "default",
         parent_agent: str = "user",
+        spoken_at: datetime | None = None,
     ) -> AsyncIterator[BaseMessage]:
         """流式:每个 token chunk 走 ``BaseMessage``。"""
         if not user_input or not user_input.strip():
@@ -473,8 +495,14 @@ class ButlerOrchestrator:
                 self._current_memory_block = ""
 
         compiled = await self._ensure_graph_async()
+        # 🆕 Phase 6.4 P1: per-message metadata(同 ainvoke)
+        effective_spoken_at = spoken_at or datetime.now(UTC)
+        human_kwargs_a: dict[str, Any] = {
+            "user_id": user_id,
+            "spoken_at": effective_spoken_at.isoformat(),
+        }
         initial_state: ButlerState = {
-            "messages": [HumanMessage(content=user_input.strip())],
+            "messages": [HumanMessage(content=user_input.strip(), additional_kwargs=human_kwargs_a)],
             "user_id": user_id,
             "session_id": session_id,
             "parent_agent": parent_agent,

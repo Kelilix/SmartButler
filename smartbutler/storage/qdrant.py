@@ -207,6 +207,21 @@ class QdrantStorage(BaseStorage):
         )
         return True
 
+    def size_bytes(self) -> int:
+        """Qdrant 数据目录大小(字节,Phase 6.3 vacuum 用)。"""
+        if self._path is None:
+            return 0  # 服务模式没法拿本地大小
+        if not self._path.exists():
+            return 0
+        total = 0
+        try:
+            for f in self._path.rglob("*"):
+                if f.is_file():
+                    total += f.stat().st_size
+        except Exception:  # pragma: no cover
+            return 0
+        return total
+
     async def exists(self, key: str) -> bool:
         """判断 key 是否存在。"""
         return await self.get(key) is not None
@@ -348,6 +363,133 @@ class QdrantStorage(BaseStorage):
             must.append(FieldCondition(key="tags", match=MatchValue(value=tag)))
 
         scroll_filter: Filter | None = Filter(must=must) if must else None
+        resp = self._client.query_points(
+            collection_name=self._collection,
+            query=vector,
+            limit=k,
+            query_filter=scroll_filter,
+            with_payload=True,
+        )
+        result: list[tuple[str, float, dict[str, Any]]] = []
+        for p in resp.points:
+            payload = p.payload or {}
+            key = payload.get("kv_key", str(p.id))
+            result.append((key, p.score, payload))
+        return result
+
+    # --------------------- 运维: 原生 scroll(CLI dump 用) ---------------------
+
+    def scroll_points(
+        self,
+        *,
+        limit: int = 100,
+        offset: Any = None,
+        payload_filters: dict[str, Any] | None = None,
+        include_deleted: bool = True,
+        with_vectors: bool = False,
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """按 id 顺序 scroll 原始 points(运维/审计,CLI ``dump`` 依赖)。
+
+        与 :meth:`list_keys` 的区别:这里能拿到完整 payload(``content`` /
+        ``importance`` / ``tags`` / ``level`` / ``deleted`` ...),并且支持
+        payload 等值过滤 + 分页。
+
+        Args:
+            limit: 本页条数(调用方循环直到 ``next_offset is None``)。
+            offset: 上一页返回的 ``next_offset``,首页传 ``None``。
+            payload_filters: payload 等值过滤,如 ``{"level": "daily"}``。
+            include_deleted: False = 排除 ``deleted=true`` 的软删除条目。
+            with_vectors: 是否带向量。默认 False —— 1024 维会刷屏。
+
+        Returns:
+            ``(rows, next_offset)``。``rows`` 每项形如
+            ``{"id": int, "key": str, "payload": dict}``;
+            ``next_offset`` 为 ``None`` 表示已到底。
+        """
+        if not self._client.collection_exists(self._collection):
+            return [], None
+
+        must: list[FieldCondition] = [
+            FieldCondition(key=str(k), match=MatchValue(value=v))
+            for k, v in (payload_filters or {}).items()
+        ]
+        must_not: list[FieldCondition] = []
+        if not include_deleted:
+            must_not.append(
+                FieldCondition(key="deleted", match=MatchValue(value=True))
+            )
+        scroll_filter = Filter(must=must, must_not=must_not) if (must or must_not) else None
+
+        points, next_offset = self._client.scroll(
+            collection_name=self._collection,
+            scroll_filter=scroll_filter,
+            limit=limit,
+            offset=offset,
+            with_payload=True,
+            with_vectors=with_vectors,
+        )
+        rows: list[dict[str, Any]] = []
+        for p in points:
+            payload = p.payload or {}
+            rows.append(
+                {
+                    "id": p.id,
+                    "key": payload.get("kv_key", str(p.id)),
+                    "payload": payload,
+                }
+            )
+        return rows, next_offset
+
+    # --------------------- Phase 6.3 扩展 ---------------------
+
+    def _payload_filter_for_key(self, key: str) -> Filter:
+        """生成 ``kv_key == key`` 的 filter(内部用,供 long_term 读 payload/vector)。"""
+        return Filter(
+            must=[FieldCondition(key="kv_key", match=MatchValue(value=key))]
+        )
+
+    def similarity_search_with_filters_and_soft_delete(
+        self,
+        vector: list[float],
+        *,
+        k: int = 5,
+        min_importance: float | None = None,
+        tag: str | None = None,
+    ) -> list[tuple[str, float, dict[str, Any]]]:
+        """带 ``min_importance`` + ``tag`` + **软删除排除** 的语义检索(Phase 6.3)。
+
+        在 :meth:`similarity_search_with_filters` 基础上多加:
+        - ``must_not=[deleted=true]`` —— 6.3 软删除过滤走 Qdrant 服务端
+
+        Args:
+            vector: 查询向量。
+            k: 返回条数上限。
+            min_importance: 重要性下限,None = 不过滤。
+            tag: 单 tag 精确匹配,None = 不过滤。
+
+        Returns:
+            ``[(key, score, payload), ...]`` 列表。
+        """
+        if len(vector) != self._vector_size:
+            raise StorageError(
+                f"vector size {len(vector)} != collection size {self._vector_size}"
+            )
+        self._ensure_collection()
+
+        must: list[FieldCondition] = []
+        if min_importance is not None:
+            must.append(
+                FieldCondition(key="importance", range=Range(gte=float(min_importance)))
+            )
+        if tag is not None:
+            must.append(FieldCondition(key="tags", match=MatchValue(value=tag)))
+
+        # 6.3: 软删除过滤(注意 Qdrant 1.19 旧版不支持 "must_not" 键,实际叫 "must_not")
+        must_not: list[FieldCondition] = [
+            FieldCondition(key="deleted", match=MatchValue(value=True))
+        ]
+
+        scroll_filter = Filter(must=must, must_not=must_not)
         resp = self._client.query_points(
             collection_name=self._collection,
             query=vector,

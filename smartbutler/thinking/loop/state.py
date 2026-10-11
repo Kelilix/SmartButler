@@ -39,6 +39,15 @@ class ButlerState(MessagesState):
     skill_prompt_snippets: list[str]
     iteration_count: int
     max_iterations: int
+    # 🆕 Phase 6.3 P2: 短期记忆切分(task 边界)
+    # - True = 本轮是 task 起点(用户新话题 / 任务完成 / 触发词)
+    # - facade.format_for_prompt 据此把"上一 task 摘要"作为锚点
+    # - 由 TaskBoundaryDetector 实时算,不写 SqliteSaver(见 2.5.1.2)
+    task_boundary: bool
+    # 🆕 Phase 6.3 P2: 上一 task 摘要(跨 task 锚点)
+    # - format_for_prompt 时注入 system prompt 作为"短期片段"
+    # - 默认 ""(没历史 task 时为空)
+    last_task_summary: str
 
 
 class ButlerStateDelta(TypedDict, total=False):

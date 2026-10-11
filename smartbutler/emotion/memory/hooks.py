@@ -33,6 +33,10 @@ class MemoryEventType(StrEnum):
     ON_RECALL = "on_recall"
     ON_PROMOTE = "on_promote"
     ON_HABIT_DETECTED = "on_habit_detected"
+    # 🆕 Phase 6.3+: task 进入 completed/chitchat_done 时触发,
+    # 用于短期对话 → 长期 fact 的抽取流水线(extract_facts)。
+    # 回调签名约定: def cb(*, task_id: str, category: str, content: str) -> None
+    ON_TASK_COMPLETE = "on_task_complete"
 
 
 # callback 类型:接受 (key, ...) 等参数,返回 None

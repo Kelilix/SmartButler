@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -97,14 +98,25 @@ class ShortTermMemory:
         初始化,持有关联 connection,调用方直接 await ``aput / aget_tuple``。
         进程结束前需调 ``aclose()`` 释放连接。
 
+        🐛 修复 2026-10-11:改为单例缓存。
+        原实现每次 new 一个 _AsyncSqliteSaverHeld,导致并发任务拿到多个
+        AsyncSqliteSaver = 多个 aiosqlite 连接,SQLite 单写锁 + 各自 lock
+        互不感知 → 第二个 saver 写时拿到"no active connection"。
+        改成单例:整个 ShortTermMemory 实例只持有一个 AsyncSqliteSaver,共享 1 个连接 + 1 个 asyncio.Lock,
+        LangGraph 内部用 self.lock 串行化所有 cursor 调用,从根本上消除并发问题。
+
         失败时降级 InMemorySaver(进程内,重启即丢)。
         """
         if _SQLITE_SAVER_AVAILABLE:
-            held = _AsyncSqliteSaverHeld(self._path)
-            saver = await held.__aenter__()
-            # 持有 held 以便 close() / aclose() 释放连接
-            self._async_held = held
-            return saver
+            if self._async_held is None:
+                held = _AsyncSqliteSaverHeld(self._path)
+                self._async_held = held
+            # 每次都 await __aenter__() 一次(幂等),但返回同一个 saver
+            logger.debug(
+                "short_term.get_async_saver path=%s held_id=%s",
+                self._path, id(self._async_held),
+            )
+            return await self._async_held.__aenter__()
         if _MEMORY_SAVER_AVAILABLE:
             logger.warning("短期记忆降级为 InMemorySaver(重启即丢)")
             return InMemorySaver()
@@ -257,6 +269,16 @@ class _AsyncSqliteSaverHeld:
         self._path = path
         self._cm: Any | None = None
         self._saver: Any | None = None
+        # 🆕 Phase 6.5 修复:并发 init race。
+        # 现象:第一次启动 dev_chat 后,两条 user_input + task_scheduler.scan_start
+        # 会几乎同时调 get_async_saver()。两路都进 __aenter__() 的 init 分支,
+        # 都对**同一个** self._cm 调 __aenter__()。
+        # AsyncSqliteSaver.from_conn_string 是 @asynccontextmanager 包装的
+        # async generator,**不是线程/任务安全的**——两路并发 __aenter__ 会让
+        # generator 跑过 yield,触发 aiosqlite.connect 的 __aexit__,
+        # conn 立即被关。第二路 commit/setup 时报 "Connection closed"。
+        # 修复:加 asyncio.Lock 串行化 init 路径,所有路径共享一个 init 结果。
+        self._init_lock: asyncio.Lock = asyncio.Lock()
 
     async def __aenter__(self) -> Any:
         """立刻完成 ``AsyncSqliteSaver.from_conn_string`` 的 CM 初始化。
@@ -264,12 +286,30 @@ class _AsyncSqliteSaverHeld:
         Returns:
             ``AsyncSqliteSaver`` 实例,可直接用 ``aput / aget_tuple / setup``。
         """
+        # ⚠️ 必须先做 cache 早 return(无锁路径,几乎零开销)
         if self._saver is not None:
+            logger.debug("_AsyncSqliteSaverHeld.__aenter__ cache_hit path=%s", self._path)
             return self._saver
-        self._cm = AsyncSqliteSaver.from_conn_string(str(self._path))
-        self._saver = await self._cm.__aenter__()
-        await self._saver.setup()  # 建表(幂等)
-        return self._saver
+        # 进入 init 路径必须持锁,防止并发 __aenter__ 把 @asynccontextmanager
+        # 包出来的 generator 跑过 yield,提前关掉 aiosqlite conn。
+        async with self._init_lock:
+            # double-check:持锁后再次判断,避免锁内重复初始化
+            if self._saver is not None:
+                logger.debug(
+                    "_AsyncSqliteSaverHeld.__aenter__ cache_hit_after_lock path=%s",
+                    self._path,
+                )
+                return self._saver
+            logger.debug(
+                "_AsyncSqliteSaverHeld.__aenter__ init_start path=%s", self._path
+            )
+            self._cm = AsyncSqliteSaver.from_conn_string(str(self._path))
+            self._saver = await self._cm.__aenter__()
+            await self._saver.setup()  # 建表(幂等)
+            logger.debug(
+                "_AsyncSqliteSaverHeld.__aenter__ init_done path=%s", self._path
+            )
+            return self._saver
 
     async def aclose(self) -> None:
         """释放 connection(由 ShortTermMemory.aclose_async 统一调用)。"""
