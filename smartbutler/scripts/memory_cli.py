@@ -415,22 +415,29 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
     )
 
     if dry_run:
-        now = datetime.now(UTC)
+        # 🆕 2026-10-12:CLI dry_run 与正式 schedule 行为分离
+        # - schedule consolidate():[本地昨日 00:00, 本地今日 00:00) 锁死
+        # - CLI dry_run          :[本地昨日 00:00, 当前) 扫到当下,方便手工测试
+        from zoneinfo import ZoneInfo as _ZI
+        _LOCAL_TZ = _ZI("Asia/Shanghai")
+        now_utc = datetime.now(UTC)
+        now_local = now_utc.astimezone(_LOCAL_TZ)
         lvl = ConsolidationLevel(level)
-        window = c._resolve_window(lvl, now)
+        window = c._resolve_window(lvl, now_utc)
         source_level = {
             "daily": None,
             "weekly": MemoryLevel.DAILY.value,
             "monthly": MemoryLevel.WEEKLY.value,
         }[level]
+        # 扫到当前(本地时区),让手工调试能扫到刚写的 fact
         cand = c._scan(
             level=source_level,
             since=window["since"],
-            now=now,
+            now=now_local,
             limit=10_000,
         )
         print(f"\n🔍 DRY RUN consolidate --level {level}")
-        print(f"  时间窗              {window['label']}")
+        print(f"  时间窗              {window['label']}(扫到当前 {now_local.strftime('%Y-%m-%d %H:%M:%S %Z')})")
         print(f"  源层级              {source_level or '(无 level 的原始 fact)'}")
         print(f"  candidates_scanned  {len(cand):>6} 条")
         low = sum(1 for it in cand if it.get("importance", 0.5) < 0.2)
@@ -438,7 +445,7 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
         print(f"  → 预计产出          {1 if len(cand) - low > 0 else 0:>6} 条摘要")
         if len(cand) - low > 0:
             print(f"  → 压缩比            {(len(cand) - low):>6}:1")
-        print("\n  💡 加 --no-llm 可看降级效果;去掉 --dry-run 真跑。")
+        print("\n  💡 加 --no-llm 可看降级效果;去掉 --dry-run 真跑(真跑按 schedule 规则:仅到本地今日 00:00)。")
         return 0
 
     # 真跑

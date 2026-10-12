@@ -30,6 +30,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
 from enum import StrEnum, unique
 from typing import Any
+from zoneinfo import ZoneInfo
+
+# 🆕 时区:Consolidation 的"自然日"以 Asia/Shanghai 为准。
+# 所有窗口边界都在本地 00:00,再转 UTC 后传给 _scan 做字符串比较
+# (Qdrant.created_at 也是 UTC,字符串可比较)。
+# 测试可注入 _LOCAL_TZ=UTC 验证时区无关逻辑。
+import os
+_LOCAL_TZ_NAME = os.environ.get("SMARTBUTLER_MEMORY_TZ", "Asia/Shanghai")
+LOCAL_TZ = ZoneInfo(_LOCAL_TZ_NAME)
 
 from smartbutler.capabilities.embedding.base import Embedder, EmbedderError
 from smartbutler.emotion.memory.levels import (
@@ -160,24 +169,35 @@ class Consolidator:
 
         Args:
             level: 目标层。
-                - "daily"   → 汇总**昨天** 00:00-24:00 的未分层 fact → 1 条日报
-                - "weekly"  → 汇总**最近 7 天**的 daily 摘要 → 1 条周报
-                - "monthly" → 汇总**最近 30 天**的 weekly 摘要 → 1 条月报
+                - "daily"   → 汇总**本地昨日** 00:00-24:00 的未分层 fact → 1 条日报
+                - "weekly"  → 汇总**本地最近 7 天**的 daily 摘要 → 1 条周报
+                - "monthly" → 汇总**本地最近 30 天**的 weekly 摘要 → 1 条月报
             limit: 单次扫描上限。
-            now: 当前时间(测试时可注入)。
+            now: 当前时间(测试时可注入)。无 tz 时按 UTC 处理。
 
         Returns:
             :class:`ConsolidationReport`,``promoted`` 最大为 1。
         """
-        now = now or datetime.now(UTC)
+        if now is None:
+            now = datetime.now(UTC)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
         if isinstance(level, str):
             level = ConsolidationLevel(level)
         report = ConsolidationReport(level=level)
 
         # 1. 按层级确定"扫哪个 level + 时间窗"
+        #    🆕 2026-10-12:窗口用本地时区(默认 Asia/Shanghai)
+        #    - daily 锁死到 [本地昨日 00:00, 本地今日 00:00)
+        #      → 凌晨 3 点跑不会把"今天 0-3 点"的 fact 当成昨天的
+        #    - weekly/monthly 用本地 0 点对齐,保持语义一致
         window = self._resolve_window(level, now)
         report.period = window["label"]
 
+        # 🆕 窗口右边界统一用 window["until"](本地日 0 点),
+        # 而不是 now——保证"昨天 0-24"完整,且跟标签一致。
+        # CLI dry_run 走自己的 _scan,真跑用 consolidate() 这条路径。
+        scan_now = window["until"]
         source_level: str | None = None
         if level == ConsolidationLevel.DAILY:
             # 扫无 level 的 fact(auto_extract 写的原始 fact)
@@ -190,7 +210,7 @@ class Consolidator:
         candidates = self._scan(
             level=source_level,
             since=window["since"],
-            now=now,
+            now=scan_now,
             limit=limit,
         )
         report.candidates_scanned = len(candidates)
@@ -275,22 +295,33 @@ class Consolidator:
     def _resolve_window(
         self, level: ConsolidationLevel, now: datetime
     ) -> dict[str, Any]:
-        """按层级算出"扫哪个时间窗" + 给人看的时段描述。"""
+        """按层级算出"扫哪个时间窗" + 给人看的时段描述。
+
+        🆕 2026-10-12:窗口以**本地时区(默认 Asia/Shanghai)**的自然日为准,
+        daily 锁死到 [本地昨日 00:00, 本地今日 00:00)。
+
+        返回的 ``since``/``until`` 是带 tz 的 datetime,转 iso 后与 Qdrant 里
+        的 UTC ``created_at`` 字符串可比较。
+        """
+        # now 一定有 tz(consolidate() 已注入)
+        local_now = now.astimezone(LOCAL_TZ)
         if level == ConsolidationLevel.DAILY:
-            # 🆕 用户决策:按**自然日**聚合 —— 昨天 00:00-24:00
-            today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            start = today - timedelta(days=1)
-            end = today
+            # 锁死到本地昨日整天
+            today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            start = today_start - timedelta(days=1)        # 本地昨日 00:00
+            end = today_start                              # 本地今日 00:00
             label = f"昨天 {start.date()} ~ {end.date()}"
         elif level == ConsolidationLevel.WEEKLY:
-            # 最近 7 天(滚动)
-            end = now
-            start = now - timedelta(days=DAILY_TO_WEEKLY_DAYS)
+            # 滚动 7 天,以本地 0 点对齐右边界(避免跨日漂移)
+            today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = today_start
+            start = today_start - timedelta(days=DAILY_TO_WEEKLY_DAYS)
             label = f"最近{_DAYS_PER_WEEK}天 {start.date()} ~ {end.date()}"
         else:
-            # 最近 30 天(滚动)
-            end = now
-            start = now - timedelta(days=WEEKLY_TO_MONTHLY_DAYS)
+            # 滚动 30 天,同上
+            today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end = today_start
+            start = today_start - timedelta(days=WEEKLY_TO_MONTHLY_DAYS)
             label = f"最近{_DAYS_PER_MONTH}天 {start.date()} ~ {end.date()}"
 
         return {"since": start, "until": end, "label": label}
@@ -317,8 +348,13 @@ class Consolidator:
         all_items = self._store.list_keys_by_level(
             level=level, include_deleted=False, limit=limit,
         )
-        since_iso = since.isoformat()
-        now_iso = now.isoformat()
+        # 🆕 2026-10-12:_resolve_window 返回的是本地时区(Asia/Shanghai)datetime,
+        # 而 Qdrant.created_at 是 UTC iso 字符串(可能 +00:00 也可能 +08:00),
+        # 直接字典序比较会跨时区乱套。统一转 UTC 后再 iso 化再比较。
+        since_utc = since.astimezone(UTC)
+        now_utc_t = now.astimezone(UTC)
+        since_iso = since_utc.isoformat()
+        now_iso = now_utc_t.isoformat()
         out: list[dict[str, Any]] = []
         for it in all_items:
             created = it.get("created_at", "") or it.get(PAYLOAD_CREATED_AT, "")

@@ -2,7 +2,7 @@
 
 3 个 job:
 - ``daily``   —— 每天凌晨 3:00 跑 ``consolidate(level="daily")``
-- ``weekly``  —— 每周日 3:00 跑 ``consolidate(level="weekly")``
+- ``weekly``  —— 每周一 3:00 跑 ``consolidate(level="weekly")``(周一是一周之始)
 - ``monthly`` —— 每月 1 日 4:00 跑 ``consolidate(level="monthly")``
 
 设计:
@@ -47,7 +47,7 @@ class ConsolidationScheduler:
         *,
         consolidator: "Consolidator",
         daily_hour: int = 3,
-        weekly_weekday: int = 6,
+        weekly_weekday: int = 0,  # 0=周一,6=周日 —— 周一是一周之始,周日是结束,周一 3:00 跑正好汇总完上周
         monthly_day: int = 1,
         monthly_hour: int = 4,
     ) -> None:

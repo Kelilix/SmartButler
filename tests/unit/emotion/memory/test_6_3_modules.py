@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, UTC, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -237,9 +237,20 @@ def consolidator_setup(tmp_path: Path) -> tuple[Consolidator, LongTermStore, Mem
 
 
 def _yesterday(now: datetime | None = None) -> datetime:
-    """昨天同一时刻(daily 汇总窗口用)。"""
-    now = now or datetime.now(UTC)
-    return now - timedelta(days=1)
+    """本地昨日 12:00 转 UTC(daily 汇总窗口用)。
+
+    🆕 2026-10-12:配合 Consolidator 锁死 [本地昨日 00:00, 本地今日 00:00)。
+    用 12:00 而不是 now-1d,确保无论何时跑都稳稳落在昨日整天里。
+    """
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Asia/Shanghai")
+    base = now.astimezone(tz) if now and now.tzinfo else (
+        (now or datetime.now(UTC)).astimezone(tz)
+    )
+    yesterday_noon_local = (base - timedelta(days=1)).replace(
+        hour=12, minute=0, second=0, microsecond=0,
+    )
+    return yesterday_noon_local.astimezone(UTC)
 
 
 def test_consolidator_daily_aggregates_into_one(
@@ -306,13 +317,19 @@ def test_consolidator_weekly_aggregates_daily(
 ) -> None:
     """🆕 weekly:N 条 daily → **1 条**周报(旧实现是 N 条 weekly)。"""
     import asyncio
+    from zoneinfo import ZoneInfo
     c, store, _ = consolidator_setup
     emb = asyncio.run(StubEmbedder(dimension=64).embed("8点烧水"))
-    recent = datetime.now(UTC) - timedelta(days=3)
+    # 过去 3 天的本地 12:00 → 一定落在 [本地今日 00:00 - 7d, 本地今日 00:00)
+    tz = ZoneInfo("Asia/Shanghai")
+    base_local = datetime.now(UTC).astimezone(tz)
     for i in range(4):
+        ts_local = (base_local - timedelta(days=i + 1)).replace(
+            hour=12, minute=0, second=0, microsecond=0,
+        )
         store.store_memory(
             f"d{i}", emb, f"第{i}天的日报内容",
-            importance=0.6, level="daily", created_at=recent,
+            importance=0.6, level="daily", created_at=ts_local.astimezone(UTC),
         )
     report = asyncio.run(c.consolidate(level=ConsolidationLevel.WEEKLY))
     assert report.promoted == 1
@@ -342,3 +359,102 @@ def test_consolidator_triggers_on_promote_hook(
     asyncio.run(c.consolidate(level=ConsolidationLevel.DAILY))
     assert len(seen) == 1
     assert seen[0].startswith("consolidated:daily:")
+
+
+# ------------------- 时区 / 窗口边界回归(2026-10-12) -------------------
+
+def test_resolve_window_daily_uses_local_day(
+    consolidator_setup: tuple[Consolidator, LongTermStore, MemoryHooks],
+) -> None:
+    """daily 窗口 = [本地昨日 00:00, 本地今日 00:00),锁死不漂移。
+
+    关键性质:
+    - 标签日期是**本地**日期(不是 UTC)
+    - 凌晨 3 点跑(now=本地 03:00)跟上午 10 点跑(now=本地 10:00)窗口一致
+    - 不会因"几点跑"误把今天的 fact 算进昨日
+    """
+    from smartbutler.emotion.memory.consolidation import LOCAL_TZ
+    c, _, _ = consolidator_setup
+    # 本地 03:00 跑
+    now_local_3am = datetime(2026, 10, 12, 3, 0, 0, tzinfo=LOCAL_TZ)
+    w = c._resolve_window(ConsolidationLevel.DAILY, now_local_3am.astimezone(UTC))
+    # since 必须是本地昨日 00:00
+    assert w["since"].astimezone(LOCAL_TZ).hour == 0
+    assert w["since"].astimezone(LOCAL_TZ).minute == 0
+    assert w["since"].astimezone(LOCAL_TZ).date() == date(2026, 10, 11)
+    # until 必须是本地今日 00:00(锁死,不是 now)
+    assert w["until"].astimezone(LOCAL_TZ).hour == 0
+    assert w["until"].astimezone(LOCAL_TZ).minute == 0
+    assert w["until"].astimezone(LOCAL_TZ).date() == date(2026, 10, 12)
+    # 标签用本地日期
+    assert "2026-10-11" in w["label"] and "2026-10-12" in w["label"]
+
+    # 本地 10:00 跑 → 窗口相同
+    now_local_10am = datetime(2026, 10, 12, 10, 0, 0, tzinfo=LOCAL_TZ)
+    w2 = c._resolve_window(ConsolidationLevel.DAILY, now_local_10am.astimezone(UTC))
+    assert w2["since"] == w["since"]
+    assert w2["until"] == w["until"]
+
+
+def test_consolidator_daily_excludes_today_early_morning(
+    consolidator_setup: tuple[Consolidator, LongTermStore, MemoryHooks],
+) -> None:
+    """凌晨 3 点跑,今天 0-3 点写的 fact 不应被当作昨日纳入。
+
+    模拟场景:北京 10-12 凌晨 2:00 用户写了 1 条 fact(应该归"今天"),
+    凌晨 3:00 schedule 触发 daily 跑 → 不应纳入。
+    """
+    import asyncio
+    from zoneinfo import ZoneInfo
+    from smartbutler.emotion.memory.consolidation import LOCAL_TZ
+    c, store, _ = consolidator_setup
+    emb = asyncio.run(StubEmbedder(dimension=64).embed("x"))
+
+    # 北京 10-12 凌晨 2:00 写 1 条 → UTC 10-11 18:00
+    tz = ZoneInfo("Asia/Shanghai")
+    today_2am_local = datetime(2026, 10, 12, 2, 0, 0, tzinfo=tz)
+    store.store_memory(
+        "today_2am", emb, "今天凌晨 2 点的 fact",
+        importance=0.7, created_at=today_2am_local.astimezone(UTC),
+    )
+    # 北京 10-12 凌晨 3:00 跑 consolidate(模拟 schedule 触发时刻)
+    now_local_3am = datetime(2026, 10, 12, 3, 0, 0, tzinfo=tz)
+    report = asyncio.run(
+        c.consolidate(level=ConsolidationLevel.DAILY, now=now_local_3am.astimezone(UTC))
+    )
+    # today_2am 是今天 0-3 点的 fact,不该被纳入"昨日"
+    assert report.candidates_scanned == 0
+    assert report.promoted == 0
+
+
+def test_consolidator_daily_includes_yesterday_all_day(
+    consolidator_setup: tuple[Consolidator, LongTermStore, MemoryHooks],
+) -> None:
+    """本地昨日全天 00:00-24:00 写的 fact 都应纳入。
+
+    包括:本地 10-11 00:00、10-11 12:00、10-11 23:59
+    """
+    import asyncio
+    from zoneinfo import ZoneInfo
+    c, store, _ = consolidator_setup
+    emb = asyncio.run(StubEmbedder(dimension=64).embed("x"))
+    tz = ZoneInfo("Asia/Shanghai")
+    # 昨日 3 个时刻
+    moments_local = [
+        datetime(2026, 10, 11, 0, 0, 0, tzinfo=tz),    # 00:00 整
+        datetime(2026, 10, 11, 12, 0, 0, tzinfo=tz),   # 12:00
+        datetime(2026, 10, 11, 23, 59, 59, tzinfo=tz), # 23:59:59
+    ]
+    for i, m in enumerate(moments_local):
+        store.store_memory(
+            f"y{i}", emb, f"昨日 {m.strftime('%H:%M')} 的 fact",
+            importance=0.7, created_at=m.astimezone(UTC),
+        )
+    # 10-12 凌晨 3:00 跑
+    now_local = datetime(2026, 10, 12, 3, 0, 0, tzinfo=tz)
+    report = asyncio.run(
+        c.consolidate(level=ConsolidationLevel.DAILY, now=now_local.astimezone(UTC))
+    )
+    assert report.candidates_scanned == 3, (
+        f"昨日整天 3 条 fact 应全部纳入,实扫 {report.candidates_scanned}"
+    )
