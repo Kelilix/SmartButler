@@ -201,17 +201,42 @@ class AutoExtractHook:
             logger.debug("auto_extract.iter_task_messages_failed task_id=%s err=%s", task_id, e)
             return title
 
-        # 抽 user 消息(按 spoken_at 升序,iter_task_messages 已保证)
-        user_lines: list[str] = []
+        # 🆕 拼完整对话流(user + assistant),而不是只拼 user。
+        #
+        # 为什么:
+        # - 旧版只取 user,fact 变成 "你是谁 | 你叫阿福吧",
+        #   管家实际怎么回的完全丢失 → 召回后没有可用上下文,
+        #   用户问"上次你自我介绍说了什么"这类 query 命中了也没内容可给。
+        # - assistant 回复是 task 语义的一部分(尤其是 web_parse / booking
+        # 这类"管家替用户做完了事"的 task,回复里才有结论)。
+        #
+        # 为什么不用 JSON 格式:
+        # - 向量库的 content 会整段参与 embedding,"Q1"/"Q"/"A" 这类 key
+        #   不是自然语言,会把向量方向从语义上带偏,和自然语言 query 不对齐。
+        # - 纯对话流格式和用户真实 query 分布一致,检索更稳。
+        # - task_id / category / status 已经走 tags 字段,不必重复塞进 content。
+        #
+        # 为什么不需要 LLM 参与:
+        # - ImportanceScorer 是纯启发式(P0 不调 LLM);这里只是格式化,
+        #   调 LLM 只会多一次 API 调用和延迟,收益不明显。
+        # - 后续若要"提炼 fact"而不是"存对话流",那是 summarizer 的职责。
+        lines: list[str] = []
         for m in msgs:
-            role = getattr(m, "role", "") or ""
-            if role != "user":
-                continue
+            role = (getattr(m, "role", "") or "").lower()
+            user_id = (getattr(m, "user_id", "") or "")
             content = (getattr(m, "content", "") or "").strip()
-            if content:
-                user_lines.append(content)
-        if user_lines:
-            return " | ".join(user_lines)
+            if not content:
+                continue
+            if role in ("user", "human"):
+                tag = f"[user={user_id}]" if user_id else "[user]"
+                lines.append(f"{tag} {content}")
+            elif role in ("assistant", "ai"):
+                lines.append(f"[assistant] {content[:300]}")
+            elif role == "tool":
+                lines.append(f"[tool] {content[:100]}")
+
+        if lines:
+            return "\n".join(lines)
         return title
 
 

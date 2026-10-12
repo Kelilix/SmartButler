@@ -66,10 +66,14 @@ class TaskMessageRecord:
     task_id: str
     message_id: str
     thread_id: str
-    role: str                       # user/assistant
+    role: str                       # user/assistant/tool
     user_id: str | None             # 说话人
     spoken_at: str                  # ISO
     content: str
+    # 🆕 对话流位置(可选)。assistant/tool 没有真实 spoken_at(写入时秒级兜底),
+    # 与 user 的微秒级混排会乱序;seq 由写入侧按 new_messages 顺序给出。
+    # None = 老数据,读取时退回 spoken_at 排序。
+    seq: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +121,21 @@ class TaskIndex:
                 conn.execute(
                     "ALTER TABLE tasks ADD COLUMN paused_turn_count INTEGER NOT NULL DEFAULT 0"
                 )
+            # 🆕 Phase 6.5b: task_messages.seq —— 对话流顺序
+            # 背景:assistant/tool 消息没有 spoken_at,写入时用 _now_iso()
+            # (秒级)兜底;user 消息是微秒级。ORDER BY spoken_at 是字符串比较,
+            # "…:07" < "…:07.000001" → 同秒时 assistant 会被排到 user 前面,
+            # 对话流错位。seq 记录写入时的对话流位置,作为排序主键。
+            msg_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(task_messages)").fetchall()
+            }
+            if "seq" not in msg_cols:
+                conn.execute("ALTER TABLE task_messages ADD COLUMN seq INTEGER")
+                # 老数据没有 seq —— **不回填**,保持 NULL。
+                # 回填成 rowid 会破坏既有契约:iter_task_messages 原本按
+                # spoken_at 排序,调用方(如 test_iter_task_messages_ordered)
+                # 依赖"乱序插入 → 按 spoken_at 排好"。NULL 表示"无 seq 信息",
+                # 读取时按 spoken_at 退化排序,语义不变。
             conn.commit()
 
     # ---- task CRUD ----
@@ -271,22 +290,42 @@ class TaskIndex:
     def append_message(self, msg: TaskMessageRecord) -> None:
         """往 task 追加一条 message(去重由 (task_id, message_id) 主键保证)。"""
         with self._lock, self._conn() as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO task_messages
-                    (task_id, message_id, thread_id, role, user_id, spoken_at, content)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    msg.task_id, msg.message_id, msg.thread_id,
-                    msg.role, msg.user_id, msg.spoken_at, msg.content,
-                ),
-            )
+            self._insert_messages(conn, [msg])
             conn.commit()
 
     def append_messages(self, msgs: Iterable[TaskMessageRecord]) -> None:
         """批量追加。"""
         with self._lock, self._conn() as conn:
+            self._insert_messages(conn, list(msgs))
+            conn.commit()
+
+    def _insert_messages(
+        self, conn: sqlite3.Connection, msgs: list[TaskMessageRecord],
+    ) -> None:
+        """写 task_messages(容错:表无 seq 列时自动降级)。
+
+        task_segmenter._apply_actions 走裸 SQL 直写,不走这里;
+        这里服务的是 append_message/append_messages 的调用方与测试。
+        """
+        if not msgs:
+            return
+        has_seq = "seq" in {
+            row[1] for row in conn.execute("PRAGMA table_info(task_messages)").fetchall()
+        }
+        if has_seq:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO task_messages
+                    (task_id, message_id, thread_id, role, user_id, spoken_at, content, seq)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (m.task_id, m.message_id, m.thread_id, m.role, m.user_id,
+                     m.spoken_at, m.content, m.seq)
+                    for m in msgs
+                ],
+            )
+        else:
             conn.executemany(
                 """
                 INSERT OR IGNORE INTO task_messages
@@ -299,15 +338,34 @@ class TaskIndex:
                     for m in msgs
                 ],
             )
-            conn.commit()
 
     def iter_task_messages(self, task_id: str) -> list[TaskMessageRecord]:
-        """返回 task 下的全部 message(按 spoken_at 升序)。"""
+        """返回 task 下的全部 message(按对话流顺序)。
+
+        排序键:**有 seq 的消息按 seq**(写入时的对话流位置);seq 全为 NULL 的
+        老数据仍按 ``spoken_at``(保持既有契约)。
+        之所以不直接用 ``ORDER BY spoken_at``:assistant/tool 消息没有
+        spoken_at,写入时用 ``_now_iso()``(秒级)兜底,而 user 是微秒级 ——
+        字符串比较下 ``"…T10:00:07+00:00" < "…T10:00:07.000001+00:00"``,
+        同秒时 assistant 会被排到 user 前面,对话流错位。
+        """
         with self._lock, self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM task_messages WHERE task_id = ? ORDER BY spoken_at ASC",
-                (task_id,),
-            ).fetchall()
+            has_seq = "seq" in {
+                row[1] for row in conn.execute("PRAGMA table_info(task_messages)").fetchall()
+            }
+            if has_seq:
+                # 有 seq 的走 seq;seq 为 NULL 的按 spoken_at 排在后面
+                rows = conn.execute(
+                    "SELECT * FROM task_messages WHERE task_id = ? "
+                    "ORDER BY (seq IS NULL) ASC, "
+                    "         COALESCE(seq, spoken_at) ASC",
+                    (task_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM task_messages WHERE task_id = ? ORDER BY spoken_at ASC",
+                    (task_id,),
+                ).fetchall()
         return [
             TaskMessageRecord(
                 task_id=r["task_id"],
@@ -317,6 +375,7 @@ class TaskIndex:
                 user_id=r["user_id"],
                 spoken_at=r["spoken_at"],
                 content=r["content"],
+                seq=(r["seq"] if has_seq and "seq" in r.keys() else None),
             )
             for r in rows
         ]
@@ -529,6 +588,7 @@ CREATE TABLE IF NOT EXISTS task_messages (
     user_id    TEXT,
     spoken_at  TEXT NOT NULL,
     content    TEXT NOT NULL,
+    seq        INTEGER,
     PRIMARY KEY (task_id, message_id)
 );
 

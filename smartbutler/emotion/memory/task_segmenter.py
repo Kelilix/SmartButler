@@ -58,6 +58,12 @@ class SegmentAction:
     category: str | None = None                 # start_new/chitchat 用
     title: str | None = None                    # start_new/chitchat 用
     reason: str = ""
+    # 🆕 消息索引(可选):本 action 对应 user_messages 中的哪些下标。
+    # 用于解决"一轮创建多个新 task 时,哪个 user 消息归哪个 task"的问题。
+    # 例如:action=[start_new(title="询问身份"), start_new(title="解析网站")],
+    # message_ref=[0, 2] 表示第 0 条 user 归第一个 start_new,第 2 条归第二个。
+    # 无此字段时退回按顺序一一对应或全归最后一个(向后兼容旧 judge 输出)。
+    message_ref: list[int] | None = None
 
 
 @dataclass
@@ -78,8 +84,10 @@ class SegmentResult:
 _JUDGE_PROMPT = """你是"智能管家"的后台分析模块,负责把短期对话流切分成"任务(task)"。
 
 ## 输入
-1. **新消息**(自上次 judge 以来):
+1. **新消息**(自上次 judge 以来,仅 user 消息):
 {new_messages}
+
+    注意:本列表只含 user 消息,assistant 回复在存储时会自动跟随其前一条 user。
 
 2. **当前活跃 task**(ongoing/paused):
 {active_tasks}
@@ -122,7 +130,8 @@ _JUDGE_PROMPT = """你是"智能管家"的后台分析模块,负责把短期对�
 {{
   "actions": [
     {{"type": "continue", "task_id": "t-xxxxx", "reason": "继续聊订机票细节"}},
-    {{"type": "start_new", "category": "phone_call", "title": "打电话问老婆回家时间", "reason": "用户明确换话题"}},
+    {{"type": "start_new", "category": "phone_call", "title": "打电话问老婆回家时间", "reason": "用户明确换话题", "message_ref": [0]}},
+    {{"type": "start_new", "category": "web_parse", "title": "查询机票价格", "reason": "新任务", "message_ref": [2, 3]}},
     {{"type": "pause", "task_id": "t-xxxxx", "reason": "被电话打断"}}
   ],
   "summary": "一句话总结当前所有 task 状态"
@@ -130,6 +139,9 @@ _JUDGE_PROMPT = """你是"智能管家"的后台分析模块,负责把短期对�
 ```
 
 注意:
+- **`message_ref` 是关键字段**:当本轮 action 列表中有**多个** `start_new` 或 `chitchat`(新开 task)时,**每个**都必须带 `message_ref`,指明它承接哪些 `[msg#i]` 消息(用 i 的数字值,不要加 "#"),例如:
+  - `message_ref: [0, 1]` = 本 action 承接 [msg#0] 和 [msg#1]
+  - 错误输出:两个 action 都没有 message_ref → 系统只能把"查机票"全塞进第二个 task
 - 闲聊必须 `category=chitchat`,title 简明(例 "周末闲聊", "情绪问候")
 - 至少给一个 action,不能"什么都不做"(除非真的没新消息)
 - task_id 必须从"当前活跃 task"列表里复制(不要瞎编)
@@ -171,13 +183,17 @@ class TaskSegmenter:
         *,
         thread_id: str,
         new_messages: list[dict[str, Any]],
+        all_messages: list[dict[str, Any]] | None = None,
         user_id: str | None = None,
     ) -> SegmentResult:
         """对一段新消息做 judge。
 
         Args:
             thread_id: 消息来源 thread。
-            new_messages: 自上次 judge 以来的新消息。
+            new_messages: **仅 user 消息**,供 judge LLM 做切分决策。
+                (judge prompt 依赖"最新一/两条"做切分,assistant 会干扰判断)
+            all_messages: 完整对话流(含 assistant/tool),写入侧按位置跟随。
+                None = 退化成 new_messages(向后兼容 fallback_segment)。
             user_id: 限定用户,None = 看全 user。
 
         Returns:
@@ -186,11 +202,18 @@ class TaskSegmenter:
         if not new_messages:
             return SegmentResult(summary="no new messages")
 
+        # all_messages 未传入时退化为 new_messages(向后兼容测试)
+        if all_messages is None:
+            all_messages = new_messages
+
         # 1. 拿当前 active tasks(看完整 user 池,不只当前 user)
         active = self._index.list_active_tasks(user_id=user_id)
         logger.info(
-            "task_segmenter.segment_enter thread=%s new_msg_count=%d active_count=%d has_llm=%s",
-            thread_id, len(new_messages), len(active), self._llm is not None,
+            "task_segmenter.segment_enter thread=%s new_msg_count=%d all_count=%s "
+            "active_count=%d has_llm=%s",
+            thread_id, len(new_messages),
+            len(all_messages) if all_messages is not None else "same",
+            len(active), self._llm is not None,
         )
 
         # 2. 调 LLM
@@ -200,6 +223,7 @@ class TaskSegmenter:
                 thread_id=thread_id,
                 new_messages=new_messages,
                 active_tasks=active,
+                all_messages=all_messages,
                 reason="no_llm_configured",
             )
 
@@ -209,9 +233,13 @@ class TaskSegmenter:
             actions, summary = self._parse_llm_output(raw)
             # 🆕 Phase 6.5 debug: 解析后 actions 摘要
             if actions:
-                action_summary = ",".join(
-                    f"{a.type}({a.task_id or a.title or ''})" for a in actions
-                )
+                parts = []
+                for a in actions:
+                    base = f"{a.type}({a.task_id or a.title or ''})"
+                    if a.message_ref:
+                        base = f"{base[:-1]}@{a.message_ref})"
+                    parts.append(base)
+                action_summary = ",".join(parts)
             else:
                 action_summary = "(empty)"
             logger.info("task_segmenter.judge_parsed summary=%r actions=%d [%s]",
@@ -222,6 +250,7 @@ class TaskSegmenter:
                 thread_id=thread_id,
                 new_messages=new_messages,
                 active_tasks=active,
+                all_messages=all_messages,
                 reason=f"llm_error:{type(e).__name__}",
             )
 
@@ -229,7 +258,7 @@ class TaskSegmenter:
         self._apply_actions(
             actions=actions,
             thread_id=thread_id,
-            new_messages=new_messages,
+            all_messages=(all_messages if all_messages is not None else new_messages),
             user_id=user_id or "",
         )
         return SegmentResult(actions=actions, summary=summary, used_llm=True)
@@ -241,14 +270,14 @@ class TaskSegmenter:
         new_messages: list[dict[str, Any]],
         active: list[TaskRecord],
     ) -> str:
-        # 新消息:带 who/when
+        # 新消息:带索引(供 message_ref 直接引用)
         lines: list[str] = []
-        for m in new_messages:
+        for i, m in enumerate(new_messages):
             who = m.get("user_id") or "?"
             when = m.get("spoken_at") or "?"
             role = m.get("role", "?")
             content = (m.get("content") or "")[:300]
-            lines.append(f"[{when} {who} {role}] {content}")
+            lines.append(f"[msg#{i}] [{when} {who} {role}] {content}")
         msgs_block = "\n".join(lines) if lines else "(无)"
 
         # 活跃 task
@@ -334,12 +363,19 @@ class TaskSegmenter:
         actions: list[SegmentAction] = []
         for a in data.get("actions") or []:
             try:
+                mr_raw = a.get("message_ref")
+                message_ref: list[int] | None = None
+                if isinstance(mr_raw, list):
+                    message_ref = [int(x) for x in mr_raw if isinstance(x, (int, str)) and str(x).isdigit()]
+                    if not message_ref:
+                        message_ref = None
                 actions.append(SegmentAction(
                     type=str(a.get("type", "")).strip(),
                     task_id=a.get("task_id"),
                     category=a.get("category"),
                     title=a.get("title"),
                     reason=str(a.get("reason", "")),
+                    message_ref=message_ref,
                 ))
             except Exception:  # noqa: BLE001
                 continue
@@ -350,16 +386,31 @@ class TaskSegmenter:
         *,
         actions: list[SegmentAction],
         thread_id: str,
-        new_messages: list[dict[str, Any]],
+        all_messages: list[dict[str, Any]],
         user_id: str,
+        new_messages: list[dict[str, Any]] | None = None,
     ) -> None:
         """把 actions 落到 task_index(创建/更新 task + 追加 message)。
 
         整个流程必须在同一把 Lock 下完成 —— 避免多次 Lock 之间
         被别的 asyncio 任务插入,导致 task_messages 落到错的 task。
+
+        设计原则:
+        - judge 只看 user 消息序列,`new_messages` 即该序列(仅 user)。
+        - `all_messages` 是完整对话流,写入时 assistant 按位置跟随:
+          "A 是谁"→[assistant] 我是管家 → "帮我解析网站"→[assistant] 已解析
+          → assistant[1] 归 A 是谁 的 task, assistant[3] 归帮我解析网站 的 task。
+        - 用 message_id 在 `all_messages` 里定位 `new_messages` 里各 user 消息的
+          实际位置,再向后延伸到下一个 user 或对话结尾 —— 中间的 assistant 跟随。
         """
         if not actions:
             return
+        # all_messages 未传入时退化为 new_messages(向后兼容 fallback_segment 路径)
+        if all_messages is None:
+            all_messages = new_messages or []
+        # 保持 new_messages 可用(供 task 记录 participants / start_ts 使用)
+        if new_messages is None:
+            new_messages = all_messages
         # 找本轮会 active 的 task
         # 用 list 保 insert 顺序 —— target_task_ids[-1] 必须是"本轮最后涉及的 task"
         # (新开的 task 而不是被 pause 的 task),否则 message 落到错的 task
@@ -477,57 +528,120 @@ class TaskSegmenter:
                                 ),
                             )
 
-            # 把新消息落到"本轮承接消息的 task"(约定:本轮涉及的 task 累加 message)
-            if target_task_ids:
-                # ── 归属规则 ──────────────────────────────────────────
-                # 多个 start_new 同时出现时,judge 没有指明"哪条消息归哪个
-                # task"。实测(14 轮 replay):[start_new(起名), start_new(课程)]
-                # 会把"你叫阿福吧"和课程消息**全**塞进最后一个 task(课程),
-                # 导致课程 task 的 fact 变成
-                #   "你叫阿福吧 | 帮我解析下网站... | 我养的小动物..."
-                # 关键词被稀释,召回时 course 查询命中不了。
-                #
-                # 规则:new task 数 == 本轮 user 消息数 时,**按顺序一一对应**
-                # (judge 按消息顺序输出 action,这是 prompt 要求的);
-                # 否则退回"全部归最后一个 target"(保持旧行为,不猜)。
+            # 把新消息落到"本轮承接消息的 task"
+            # 设计:
+            # - new_messages = 仅 user 消息（供 judge 做切分决策）
+            # - all_messages = 完整对话流（含 assistant/tool）
+            # - 用 new_messages 里各 user 消息的 message_id 作为锚点,
+            #   在 all_messages 里重建完整配对:锚点 user 归对应 task,
+            #   其余 assistant/tool 沿用当前锚点。
+            if not target_task_ids:
+                return
+
+            ordered_targets = list(new_task_ids) + [
+                t for t in target_task_ids if t not in new_task_ids
+            ]
+
+            # ── 用 message_ref 建立锚点(若有) ──
+            # 若 judge 输出里 start_new 带 message_ref,直接按索引映射;
+            # 否则退回 one_to_one(仅当 user 数 == new task 数时);
+            # 再否则全归最后一个 target。
+            uid_to_target: dict[str, str] = {}
+            user_msgs_in_new = [m for m in new_messages
+                               if (m.get("role") or "user") == "user"]
+            ref_mapped = False
+
+            # 🆕 message_ref:把 action.message_ref 映射到 new_task_ids
+            # action.task_id 是 None(judge 输出没有 task_id),tid 是后面
+            # new_task_id() 才生成的。按 action 顺序 zip:
+            #   action[i].message_ref → new_task_ids[i]
+            new_actions = [
+                act for act in actions
+                if act.type in ("start_new", "chitchat") and act.title
+            ]
+            for a, tid in zip(new_actions, new_task_ids):
+                if a.message_ref:
+                    for idx in a.message_ref:
+                        if 0 <= idx < len(user_msgs_in_new):
+                            uid_to_target[user_msgs_in_new[idx]["message_id"]] = tid
+                            ref_mapped = True
+
+            if ref_mapped:
+                logger.info(
+                    "task_segmenter.assign_by_ref n=%d",
+                    len(uid_to_target),
+                )
+            else:
+                # 无 message_ref → 退回 one_to_one 或全归最后一个
                 n_new = len(new_task_ids)
-                user_msgs = [m for m in new_messages
-                             if (m.get("role") or "user") == "user"] or new_messages
-                # 目标队列:新 task 优先(按 judge 输出顺序),其余排后面
-                ordered_targets = list(new_task_ids) + [
-                    t for t in target_task_ids if t not in new_task_ids
-                ]
                 one_to_one = (
                     n_new > 0
-                    and len(user_msgs) == n_new
+                    and len(user_msgs_in_new) == n_new
                     and len(new_task_ids) == n_new
                 )
                 if one_to_one:
-                    pairs = list(zip(user_msgs, ordered_targets))
+                    for m, tgt in zip(user_msgs_in_new, ordered_targets):
+                        uid_to_target[m["message_id"]] = tgt
                     logger.info(
-                        "task_segmenter.assign_messages_one_to_one n=%d",
-                        len(pairs),
+                        "task_segmenter.assign_one_to_one n=%d",
+                        len(user_msgs_in_new),
                     )
                 else:
-                    # 无法一一对应 → 全归最后一个 target
-                    pairs = [(m, ordered_targets[-1]) for m in new_messages]
+                    last_tgt = ordered_targets[-1]
+                    for m in user_msgs_in_new:
+                        uid_to_target[m["message_id"]] = last_tgt
+                    logger.info(
+                        "task_segmenter.assign_fallback n_user=%d n_new=%d last=%s",
+                        len(user_msgs_in_new), n_new, ordered_targets[-1],
+                    )
+
+            # ── 第二步:遍历完整对话流,重建配对 ──
+            # all_messages 包含 assistant/tool,它们不在 uid_to_target 里,
+            # 用 message_id 定位:锚点 user 更新锚点,其余沿用当前锚点。
+            pairs: list[tuple[dict[str, Any], str]] = []
+            last_target = ordered_targets[-1]  # 兜底
+            for m in all_messages:
+                msg_id = m.get("message_id") or ""
+                role = (m.get("role") or "").lower()
+                if msg_id in uid_to_target:
+                    last_target = uid_to_target[msg_id]
+                    pairs.append((m, last_target))  # 锚点 user 也写入
+                elif role in ("assistant", "ai", "tool"):
+                    pairs.append((m, last_target))  # assistant 跟随锚点
 
                 msg_target_ids: list[str] = []
-                for m, tgt in pairs:
-                    mid = m.get("message_id") or f"{thread_id}:{m.get('spoken_at', '')}:{len(m.get('content', ''))}"
-                    conn.execute(
-                        """
+                has_seq = "seq" in {
+                    row[1] for row in conn.execute(
+                        "PRAGMA table_info(task_messages)"
+                    ).fetchall()
+                }
+                seq_cols = ", seq" if has_seq else ""
+                seq_ph = ", ?" if has_seq else ""
+                insert_sql = f"""
                         INSERT OR IGNORE INTO task_messages
-                            (task_id, message_id, thread_id, role, user_id, spoken_at, content)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            tgt, mid, thread_id,
-                            m.get("role", "user"), m.get("user_id"),
-                            m.get("spoken_at") or _now_iso(),
-                            m.get("content", "") or "",
-                        ),
+                            (task_id, message_id, thread_id, role, user_id,
+                             spoken_at, content{seq_cols})
+                        VALUES (?, ?, ?, ?, ?, ?, ?{seq_ph})
+                        """
+                for m, tgt in pairs:
+                    mid = m.get("message_id") or _fallback_message_id(
+                        thread_id, m, len(pairs)
                     )
+                    row_vals = (
+                        tgt, mid, thread_id,
+                        m.get("role", "user"), m.get("user_id"),
+                        m.get("spoken_at") or _now_iso(),
+                        m.get("content", "") or "",
+                    )
+                    if has_seq:
+                        # seq 必须在 task 内全局递增,不能每轮 judge 从 0 重开 ——
+                        # 同一个 task 会被多轮 judge 追加消息,每轮都从 0 开始
+                        # 会让不同轮的消息撞到相同 seq,排序就乱了。
+                        # 偏移量 = 该 task 现有最大 seq + 1。
+                        row_vals = row_vals + (
+                            _next_seq(conn, tgt),  # type: ignore[arg-type]
+                        )
+                    conn.execute(insert_sql, row_vals)
                     msg_target_ids.append(tgt)
                 # 🆕 真正收到消息的 task 本轮活跃 → staleness 归零。
                 # 没有这一步,tick_paused_staleness 只增不减,活跃 task 也会被误杀。
@@ -549,7 +663,8 @@ class TaskSegmenter:
         thread_id: str,
         new_messages: list[dict[str, Any]],
         active_tasks: list[TaskRecord],
-        reason: str,
+        all_messages: list[dict[str, Any]] | None = None,
+        reason: str = "",
     ) -> SegmentResult:
         """无 LLM 时的降级:走 :class:`TaskBoundaryDetector` 规则。
 
@@ -614,7 +729,7 @@ class TaskSegmenter:
         self._apply_actions(
             actions=actions,
             thread_id=thread_id,
-            new_messages=new_messages,
+            all_messages=(all_messages if all_messages is not None else new_messages),
             user_id=last.get("user_id") or "",
         )
         return SegmentResult(
@@ -626,6 +741,39 @@ class TaskSegmenter:
 def _now_iso() -> str:
     from datetime import datetime, UTC
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def _fallback_message_id(
+    thread_id: str, msg: dict[str, Any], idx: int,
+) -> str:
+    """消息缺 message_id 时的回退主键。
+
+    ⚠️ 不能只用 ``(spoken_at, len(content))``:
+    - assistant / tool 消息的 ``spoken_at`` 是 ``None``(只有 HumanMessage
+      在 orchestrator.ainvoke 里带 additional_kwargs['spoken_at'])
+    - 多条 assistant 就会得到相同键 → ``INSERT OR IGNORE`` 静默吞掉,
+      message_id 是主键的一部分,吞掉等于丢消息。
+
+    所以把数组下标 idx 拼进去,保证同一批次内唯一。
+    """
+    spoken = msg.get("spoken_at") or ""
+    content = msg.get("content") or ""
+    return f"{thread_id}:{spoken}:{len(content)}:{idx}"
+
+
+def _next_seq(conn: Any, task_id: str) -> int:
+    """该 task 下一个可用 seq(= 现有最大 seq + 1,空表则 0)。
+
+    必须在 task 内全局递增:同一个 task 会被多轮 judge 追加消息,
+    每轮都从 0 开始会让不同轮的消息撞到相同 seq,排序错乱。
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(COALESCE(seq, rowid - 1)), -1) AS mx "
+        "FROM task_messages WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    mx = row["mx"] if row is not None and row["mx"] is not None else -1
+    return int(mx) + 1
 
 
 def _parse_iso(s: str | None):

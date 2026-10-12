@@ -286,7 +286,13 @@ class MemoryFacade:
                 window = await view.build_window(
                     current_session_id=ctx.session_id,
                     current_user_input=query,
-                    n_prior_tasks=3,
+                    # ⚠️ 不要在这里传 n_prior_tasks / n_completed_tasks /
+                    # n_chitchat_tasks —— build_window 的 call-time 参数优先级
+                    # 高于构造参数(``n_prior if n_prior_tasks is None else ...``),
+                    # 一旦在这里写死,facade 构造时收到的
+                    # MemorySettings.{n_prior_tasks,n_completed_tasks,n_chitchat_tasks}
+                    # 会被静默丢弃,.env 改了也不生效(踩过)。
+                    # 不传 → 走 ShortTermView 构造时注入的那组值。
                     user_id=ctx.user_id,
                 )
                 short_block = build_short_term_prompt_block(window)

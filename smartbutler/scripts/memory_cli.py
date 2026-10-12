@@ -11,6 +11,12 @@
 - ``dump`` —— 全量翻页看库里到底存了什么(运维/排查)
 - ``dump-fields`` —— payload 字段分布体检
 
+短期记忆(短期,读 short_term.db,不是 Qdrant):
+- ``stm-threads`` —— 列出所有 thread + checkpoint 数
+- ``stm-dump`` —— 全量翻出对话消息流
+- ``stm-stats`` —— 容量体检
+- ``st-raw`` —— 打印某个 checkpoint 的原始 state(JSON)
+
 设计要点:
 1. **纯 stdlib + 项目内依赖** —— 无 typer / click,只用 argparse
 2. **独立入口** —— ``python -m smartbutler.scripts.memory_cli <cmd> [args]``
@@ -573,6 +579,372 @@ def cmd_dump_fields(args: argparse.Namespace) -> int:
     return 0
 
 
+# ===========================================================================
+# 短期记忆(LangGraph checkpoint / short_term.db)
+#
+# 与上面所有长期记忆命令的区别:
+#   长期 = Qdrant(points,向量)  → 事实/fact
+#   短期 = SQLite(checkpoints)  → 对话消息流 + 工具调用中间态
+#
+# 直接读 SQLite 而不走 ShortTermMemory.get_async_saver():
+#   saver 走 LangGraph 的 msgpack 编解码 + 需要 aiosqlite 异步连接,
+#   而 CLI 是同步工具;更重要的是 saver 会持有连接与 run 中的管家进程
+#   抢 SQLite 写锁。原始 blob + 自建解码器更安全,也更能暴露原始数据。
+# ===========================================================================
+
+
+def _open_stm_db(path: Path) -> Any:
+    """只读打开 short_term.db(不复用 saver,避免抢连接/锁)。"""
+    import sqlite3
+
+    if not path.exists():
+        raise FileNotFoundError(f"short-term DB 不存在: {path}")
+    # file:...?mode=ro —— 纯只读,即使有别的进程在写也不影响我们读
+    uri = f"file:{path.as_posix()}?mode=ro"
+    return sqlite3.connect(uri, uri=True, timeout=5.0)
+
+
+_SERDE: Any = None
+
+
+def _get_serde() -> Any:
+    """懒加载 JsonPlusSerializer(模块级单例,构造有开销)。"""
+    global _SERDE
+    if _SERDE is None:
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+        _SERDE = JsonPlusSerializer()
+    return _SERDE
+
+
+def _decode_blob(blob: Any, type_name: str = "msgpack") -> Any:
+    """解 LangGraph checkpoint 的 blob。
+
+    必须用 LangGraph 自己的 ``JsonPlusSerializer.loads_typed`` ——
+    它与写入时是同一个 codec,解出来的东西和图运行时看到的一致。
+
+    ⚠️ 两个坑(都踩过):
+    1. ``loads_typed`` 签名是**单参数** ``(type_str, blob)`` 的 tuple,
+       不是 ``(data, type)``;传错顺序会静默解出错的东西或直接抛。
+    2. ``type`` 是 checkpoints 表里的一列,不同版本可能是 ``msgpack``/
+       ``json``,必须从 DB 读出来传进去,别硬编码。
+
+    另外本项目环境没装 ``msgpack`` 这个独立包(LangGraph 走
+    ``ormsgpack``),自己 ``import msgpack`` 会 ImportError。
+    """
+    if blob is None:
+        return None
+    try:
+        return _get_serde().loads_typed((type_name, blob))
+    except Exception as e:  # noqa: BLE001 - 单条解不开不该让整个 CLI 崩
+        return {"__decode_error__": f"{type(e).__name__}: {e}"}
+
+
+def _as_dict(msg: Any) -> dict[str, Any] | None:
+    """把一条消息转成 plain dict,拿不到就返回 None。
+
+    ⚠️ 坑:反序列化出来的消息是 **LangChain pydantic 对象**
+    (``HumanMessage`` / ``AIMessage`` / ``ToolMessage``),**不是 dict**。
+    早期版本这里按 ``isinstance(m, dict)`` 过滤,结果 30 条消息被筛成 0 条,
+    而 ``stm-dump`` 静默输出"没有含 messages 的 checkpoint"——
+    看起来像库是空的,实际是类型判断错了。
+    所以统一走 duck-typing:dict 直接用,对象走 ``model_dump()``/``dict()``。
+    """
+    if isinstance(msg, dict):
+        return msg
+    for attr in ("model_dump", "dict"):
+        fn = getattr(msg, attr, None)
+        if callable(fn):
+            try:
+                out = fn()
+                if isinstance(out, dict):
+                    return out
+            except Exception:  # noqa: BLE001,PERF203 - 逐个降级
+                continue
+    return None
+
+
+def _extract_messages(state: Any) -> list[dict[str, Any]]:
+    """从 checkpoint state 里挖出 messages 列表(兼容多种形态)。"""
+    if not isinstance(state, dict):
+        return []
+    # LangGraph 的结构:state["channel_values"]["messages"]
+    # 但直连 saver 存的老版本可能直接平铺,所以几种形态都兜一下。
+    candidates: list[Any] = []
+    cv = state.get("channel_values")
+    if isinstance(cv, dict):
+        candidates.append(cv.get("messages"))
+    elif isinstance(cv, list):
+        candidates.append(cv)
+    candidates.append(state.get("messages"))
+    candidates.append(state.get("values"))
+
+    for val in candidates:
+        if not isinstance(val, list):
+            continue
+        out = [d for d in (_as_dict(m) for m in val) if d is not None]
+        if out:
+            return out
+    return []
+
+
+def _msg_preview(msg: dict[str, Any], width: int) -> str:
+    """把一条消息渲染成一行可读文本。"""
+    role = (
+        msg.get("type")
+        or msg.get("role")
+        or msg.get("_type")
+        or msg.get("class")
+        or "?"
+    )
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        # 多模态:content 可能是 [{type:text,text:...}, ...]
+        parts = []
+        for blk in content:
+            if isinstance(blk, dict):
+                parts.append(str(blk.get("text") or blk.get("type") or ""))
+        content = " ".join(p for p in parts if p)
+    if not isinstance(content, str):
+        content = str(content)
+    content = content.replace("\n", " ⏎ ")
+    return f"{role}: {content[:width]}"
+
+
+def _msg_meta(msg: dict[str, Any]) -> str:
+    """消息的附加元信息(id / user_id / spoken_at / tool_calls)。"""
+    bits = []
+    mid = msg.get("id")
+    if mid:
+        bits.append(f"id={mid}")
+    extra = msg.get("additional_kwargs") or {}
+    if isinstance(extra, dict):
+        if extra.get("user_id"):
+            bits.append(f"user={extra['user_id']}")
+        if extra.get("spoken_at"):
+            bits.append(f"at={str(extra['spoken_at'])[:19]}")
+    tc = msg.get("tool_calls")
+    if tc:
+        bits.append(f"tool_calls={len(tc)}")
+    # AI 消息带模型元信息,便于排查"是哪次调用生成的"
+    meta = msg.get("response_metadata") or {}
+    if isinstance(meta, dict):
+        if meta.get("model_name"):
+            bits.append(f"model={meta['model_name']}")
+        usage = meta.get("token_usage") or meta.get("usage_metadata")
+        if isinstance(usage, dict) and usage:
+            bits.append(f"tokens={usage.get('total_tokens', '?')}")
+    return "  ".join(bits)
+
+
+def cmd_st_threads(args: argparse.Namespace) -> int:
+    """stm-threads: 列出短期记忆里所有 thread + 各自的 checkpoint 数。"""
+    conn = _open_stm_db(Path(args.stm_path))
+    try:
+        rows = conn.execute(
+            "SELECT thread_id, checkpoint_ns, COUNT(*) AS n, "
+            "       MIN(checkpoint_id), MAX(checkpoint_id) "
+            "FROM checkpoints GROUP BY thread_id, checkpoint_ns "
+            "ORDER BY n DESC"
+        ).fetchall()
+        wr = conn.execute(
+            "SELECT thread_id, COUNT(*) FROM writes GROUP BY thread_id"
+        ).fetchall()
+        write_counts = {t: n for t, n in wr}
+
+        total_ck = sum(r[2] for r in rows)
+        total_wr = sum(write_counts.values())
+        print(f"Short-term memory: {args.stm_path}")
+        print(f"  threads(checkpoint groups)={len(rows)}  "
+              f"checkpoints={total_ck}  writes={total_wr}\n")
+        print(f"  {'thread_id':<44} {'ns':<10} {'ckpt':>6} {'writes':>7}")
+        for tid, ns, n, _min, _max in rows:
+            print(f"  {tid:<44} {ns or '-':<10} {n:>6} "
+                  f"{write_counts.get(tid, 0):>7}")
+        if args.detail:
+            print("\n  checkpoint_id range (每 thread 最新/最旧):")
+            for tid, ns, _n, mn, mx in rows:
+                print(f"    {tid:<44} {mn[:24]} … {mx[:24]}")
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_st_dump(args: argparse.Namespace) -> int:
+    """stm-dump: 全量翻出短期记忆里的对话消息流。"""
+    conn = _open_stm_db(Path(args.stm_path))
+    try:
+        sql = (
+            "SELECT thread_id, checkpoint_ns, checkpoint_id, type, checkpoint "
+            "FROM checkpoints "
+        )
+        params: list[Any] = []
+        where = []
+        if args.thread:
+            where.append("thread_id = ?")
+            params.append(args.thread)
+        if args.checkpoint_ns:
+            where.append("checkpoint_ns = ?")
+            params.append(args.checkpoint_ns)
+        if where:
+            sql += "WHERE " + " AND ".join(where) + " "
+        # DESC = 最新的在前;LangGraph 的 checkpoint_id 是单调递增的 uuid6
+        sql += "ORDER BY rowid DESC LIMIT ?"
+        params.append(args.limit)
+
+        rows = conn.execute(sql, params).fetchall()
+        if not rows:
+            print("No checkpoints matched.")
+            return 0
+
+        print(f"Short-term dump: {args.stm_path}")
+        print(f"  matched={len(rows)} checkpoint(s)\n")
+
+        shown_msgs = 0
+        shown_ck = 0
+        for tid, ns, ckid, ctype, blob in rows:
+            state = _decode_blob(blob, ctype)
+            msgs = _extract_messages(state)
+            if not msgs and not args.all_checkpoints:
+                continue
+            shown_ck += 1
+            shown_msgs += len(msgs)
+            print(f"── thread={tid}  ns={ns or '-'}  ckpt={ckid[:24]}  "
+                  f"msgs={len(msgs)}")
+            if args.verbose:
+                print(f"   state keys: {sorted(state.keys()) if isinstance(state, dict) else type(state).__name__}")
+            for i, m in enumerate(msgs, 1):
+                line = _msg_preview(m, args.width)
+                meta = _msg_meta(m)
+                print(f"   [{i:>2}] {line}")
+                if meta:
+                    print(f"        {meta}")
+            print()
+
+        print(f"\nTotal: {shown_ck} checkpoint(s) shown, {shown_msgs} message(s).")
+        if len(rows) >= args.limit and not args.all_checkpoints:
+            print(
+                f"⚠️  Hit --limit={args.limit} "
+                f"(scanned {len(rows)} rows). Raise --limit for more."
+            )
+        if shown_ck == 0 and not args.all_checkpoints:
+            print("💡 没有含 messages 的 checkpoint。试试 --all-checkpoints。")
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_st_stats(args: argparse.Namespace) -> int:
+    """stm-stats: 短期记忆容量体检(表/thread/消息数)。"""
+    import os
+
+    conn = _open_stm_db(Path(args.stm_path))
+    try:
+        path = Path(args.stm_path)
+        size = path.stat().st_size if path.exists() else 0
+        n_ck = conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
+        n_wr = conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]
+        n_thr = conn.execute(
+            "SELECT COUNT(DISTINCT thread_id) FROM checkpoints"
+        ).fetchone()[0]
+
+        print(f"Short-term memory stats: {path}\n")
+        print(f"  {'file_size':<26} {size:>12,} bytes  ({size / 1024:.1f} KB)")
+        print(f"  {'checkpoints':<26} {n_ck:>12,}")
+        print(f"  {'writes':<26} {n_wr:>12,}")
+        print(f"  {'distinct_threads':<26} {n_thr:>12,}")
+
+        # 消息总数:逐个解 blob(只统计含 messages 的)
+        total_msgs = 0
+        ck_with_msgs = 0
+        role_counter: dict[str, int] = {}
+        for ctype, blob in conn.execute("SELECT type, checkpoint FROM checkpoints"):
+            msgs = _extract_messages(_decode_blob(blob, ctype))
+            if msgs:
+                ck_with_msgs += 1
+                total_msgs += len(msgs)
+                for m in msgs:
+                    r = m.get("type") or m.get("role") or "?"
+                    role_counter[r] = role_counter.get(r, 0) + 1
+
+        print(f"  {'checkpoints_with_msgs':<26} {ck_with_msgs:>12,}")
+        print(f"  {'messages(total,含历史重复)':<26} {total_msgs:>12,}")
+        if role_counter:
+            print("\n  by role(注意:每个 checkpoint 含全量历史,故累加值偏大):")
+            for r, n in sorted(role_counter.items(), key=lambda kv: -kv[1]):
+                print(f"    {r:<20} {n:>6}")
+
+        # 单 thread 最新 checkpoint 的消息数 = 真实对话长度
+        print("\n  latest checkpoint per thread(=真实对话长度):")
+        for tid, in conn.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints"
+        ).fetchall():
+            row = conn.execute(
+                "SELECT type, checkpoint FROM checkpoints "
+                "WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            if row is None:
+                continue
+            msgs = _extract_messages(_decode_blob(row[1], row[0]))
+            print(f"    {tid:<44} {len(msgs):>4} msgs")
+        return 0
+    finally:
+        conn.close()
+
+
+def _jsonable(obj: Any) -> Any:
+    """把任意对象转成 ``json.dumps`` 能吃的结构。
+
+    默认 ``json.dumps(default=str)`` 会把 LangChain 消息整个变成一行 repr
+    (``"content='你是谁' id='...'"``),可读性差。递归转一遍:
+    消息对象走 ``_as_dict``,其他对象退化到 repr。
+    """
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    d = _as_dict(obj)
+    if d is not None:
+        return _jsonable(d)
+    return repr(obj)
+
+
+def cmd_st_raw(args: argparse.Namespace) -> int:
+    """st-raw: 打印某个 checkpoint 的原始 state(排查用,深)。"""
+    import json as _json
+
+    conn = _open_stm_db(Path(args.stm_path))
+    try:
+        row = conn.execute(
+            "SELECT thread_id, checkpoint_ns, checkpoint_id, type, checkpoint, metadata "
+            "FROM checkpoints WHERE checkpoint_id LIKE ? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (f"{args.checkpoint_prefix}%",),
+        ).fetchone()
+        if row is None:
+            print(f"No checkpoint matching {args.checkpoint_prefix!r}")
+            return 1
+        tid, ns, ckid, ctype, blob, meta_blob = row
+        print(f"thread_id      : {tid}")
+        print(f"checkpoint_ns  : {ns or '-'}")
+        print(f"checkpoint_id  : {ckid}")
+        print(f"serde type     : {ctype}")
+        state = _decode_blob(blob, ctype)
+        print("\n--- decoded state ---")
+        print(_json.dumps(_jsonable(state), ensure_ascii=False,
+                          indent=2)[: args.width])
+        if args.verbose:
+            print("\n--- metadata ---")
+            print(_json.dumps(_jsonable(_decode_blob(meta_blob, ctype)),
+                              ensure_ascii=False, indent=2)[: args.width])
+        return 0
+    finally:
+        conn.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="memory_cli",
@@ -596,6 +968,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--archive-path", default="data/deleted_archive.db",
         help="archived SQLite 备份表路径",
+    )
+    parser.add_argument(
+        "--stm-path", default="data/short_term.db",
+        help="短期记忆 SQLite 路径(短期记忆子命令用)",
     )
     subparsers = parser.add_subparsers(dest="cmd", required=True)
 
@@ -780,6 +1156,67 @@ def main(argv: list[str] | None = None) -> int:
         "--page-size", type=int, default=256, help="每页 scroll 条数(内部用)",
     )
     p_df.set_defaults(func=cmd_dump_fields)
+
+    # ===== 短期记忆(LangGraph checkpoint / short_term.db)=====
+
+    # stm-threads
+    p_stt = subparsers.add_parser(
+        "stm-threads",
+        help="列出短期记忆里的所有 thread + checkpoint 数",
+    )
+    p_stt.add_argument(
+        "--detail", action="store_true",
+        help="额外显示每个 thread 的 checkpoint_id 范围",
+    )
+    p_stt.set_defaults(func=cmd_st_threads)
+
+    # stm-dump(全量看消息流)
+    p_std = subparsers.add_parser(
+        "stm-dump",
+        help="全量翻出短期记忆里的对话消息流(按 checkpoint)",
+    )
+    p_std.add_argument("--thread", default=None, help="只看这个 thread_id")
+    p_std.add_argument(
+        "--checkpoint-ns", default=None, help="只看这个 checkpoint_ns",
+    )
+    p_std.add_argument(
+        "--limit", type=int, default=10, help="最多看几个 checkpoint(默认 10)",
+    )
+    p_std.add_argument(
+        "--all-checkpoints", action="store_true",
+        help="连不含 messages 的中间步一起显示(默认跳过)",
+    )
+    p_std.add_argument(
+        "--width", type=int, default=120, help="content 截断宽度(默认 120)",
+    )
+    p_std.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="额外打印 state 的字段名",
+    )
+    p_std.set_defaults(func=cmd_st_dump)
+
+    # stm-stats
+    p_sts = subparsers.add_parser(
+        "stm-stats",
+        help="短期记忆容量体检(表大小/thread 数/消息数)",
+    )
+    p_sts.set_defaults(func=cmd_st_stats)
+
+    # st-raw
+    p_str = subparsers.add_parser(
+        "st-raw",
+        help="打印某个 checkpoint 的原始 state JSON(深排查)",
+    )
+    p_str.add_argument(
+        "checkpoint_prefix", help="checkpoint_id 前缀(定位用)",
+    )
+    p_str.add_argument(
+        "--width", type=int, default=4000, help="输出截断宽度(默认 4000)",
+    )
+    p_str.add_argument(
+        "--verbose", "-v", action="store_true", help="连 metadata 一起打",
+    )
+    p_str.set_defaults(func=cmd_st_raw)
 
     args = parser.parse_args(argv)
     return args.func(args)
