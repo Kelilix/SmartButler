@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,6 +30,70 @@ logger = get_logger(__name__)
 _INFERENCE_PATTERNS = re.compile(
     r"(用户可能|他大概|可能是因为|也许是因为|看来是|应该是|似乎是|估计是|或许是)"
 )
+
+# markdown 代码块围栏(```json ... ``` / ``` ... ```)
+_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*|\s*```$")
+
+
+def _strip_code_fence(text: str) -> str:
+    """剥掉 markdown 代码块围栏,只留正文。
+
+    LLM 经常无视"不要代码块围栏"的指令直接包 ```json,注入 prompt 时
+    这些围栏是纯噪音。
+    """
+    return _CODE_FENCE_RE.sub("", text).strip()
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    """从 LLM 输出里抠出第一个 JSON 对象。
+
+    容错:围栏包裹、前后有解释文字、尾部逗号都尝试修。
+    抠不出返回 None(调用方降级)。
+    """
+    text = _strip_code_fence(text)
+    if not text:
+        return None
+
+    # 1) 直接试
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 2) 抠第一个 {...} 平衡括号段
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                seg = text[start:i + 1]
+                # 修尾逗号 {"a":1,}
+                seg = re.sub(r",\s*([}\]])", r"\1", seg)
+                try:
+                    obj = json.loads(seg)
+                    return obj if isinstance(obj, dict) else None
+                except (json.JSONDecodeError, ValueError):
+                    return None
+    return None
 
 
 @dataclass
@@ -167,20 +232,45 @@ class FiveW1HExtractor:
 
 
 class LLMScorer:
-    """LLM 评分器 —— 对 consolidation 候选 fact 批评 0-1 分(2026-10-10 设计)。
+    """LLM 评分器 —— 对 consolidation 候选 fact 批评 0-1 分。
 
     设计:
-    - P0 阶段不调 LLM,只走 ``HeuristicScorer``(在 ``importance.py``)
-    - 6.3 的 LLM 评分是 consolidation 触发时,**只对候选 promote 的 fact** 调
     - 评分维度:
       - 0.0-0.2: 日常琐事(开灯/调温度等无后续影响)
       - 0.2-0.5: 有时间/数字的事实(8 点烧洗澡水)
       - 0.5-0.8: 任务/约定(下周出差/周末聚餐)
       - 0.8-1.0: 持久偏好/关系/约定(用户长期习惯/家庭成员信息)
-    - **降级**: LLM 失败 → 返回 None,调用方走启发式兜底
+    - **降级**: LLM 失败 / 未注入 → 返回 None,调用方走启发式兜底
 
-    本类只定义接口 + 降级,不直接 import LLM client(留给 thinking 层或后续实现)。
+    🆕 2026-10-12:接入真实 LLM(此前是 ``return None`` 的桩,导致
+    consolidation 全程走启发式 importance)。``llm`` 为 None 时行为不变。
     """
+
+    #: 评分 prompt —— 只输出 JSON,禁止解释性文字
+    _SCORE_PROMPT = (
+        "你是记忆重要性评分器。给下面这条记忆打 0-1 的重要性分。\n"
+        "评分标准:\n"
+        "- 0.0-0.2 日常琐事(开灯/调温度/打招呼),无后续影响\n"
+        "- 0.2-0.5 有时间或数字的事实\n"
+        "- 0.5-0.8 任务、约定、计划\n"
+        "- 0.8-1.0 持久偏好、关系、身份信息\n"
+        "\n"
+        "只输出 JSON,不要任何解释:\n"
+        '{"importance": 0.X, "reason": "一句话理由"}'
+    )
+
+    def __init__(self, llm: "Any | None" = None, *, max_chars: int = 2000) -> None:
+        """Args:
+            llm: :class:`~smartbutler.capabilities.llm.base.BaseLLM` 实例;
+                None = 不调 LLM(降级到调用方的启发式 importance)。
+            max_chars: 送进 prompt 的 fact 内容上限,防止超长撑爆上下文。
+        """
+        self._llm = llm
+        self._max_chars = max_chars
+
+    @property
+    def enabled(self) -> bool:
+        return self._llm is not None
 
     async def score_batch(
         self, facts: list[dict[str, Any]]
@@ -192,36 +282,207 @@ class LLMScorer:
 
         Returns:
             ``[{"key": ..., "importance": 0.X, "reason": "..."}, ...]`` 顺序对齐输入。
-            失败/降级时返回 None(调用方走启发式)。
+            未注入 LLM / 调用失败 → 返回 None(调用方走启发式)。
         """
-        # P0 阶段不接 LLM,直接返 None 让 calling 走启发式
-        # 6.3 实施时这里接 capabilities.llm.BaseLLM(可选)
-        logger.debug("LLMScorer.score_batch not implemented yet, returning None")
-        return None
+        if self._llm is None or not facts:
+            return None
+
+        from smartbutler.capabilities.llm.types import Message
+
+        out: list[dict[str, Any]] = []
+        for f in facts:
+            content = str(f.get("content", ""))[: self._max_chars]
+            user_msg = (
+                f"当前启发式分数:{f.get('current_importance', f.get('importance', 0.5))}\n"
+                f"记忆内容:\n{content}"
+            )
+            try:
+                resp = await self._llm.chat(
+                    [
+                        Message(role="system", content=self._SCORE_PROMPT),
+                        Message(role="user", content=user_msg),
+                    ],
+                    temperature=0.0,
+                    max_tokens=200,
+                )
+                parsed = _parse_json_object(getattr(resp, "content", "") or "")
+                if not parsed or "importance" not in parsed:
+                    logger.warning("LLMScorer.bad_response content=%r",
+                                   (getattr(resp, "content", "") or "")[:120])
+                    out.append({"key": f.get("key"), "importance": None})
+                    continue
+                score = float(parsed["importance"])
+                score = max(0.0, min(1.0, score))
+                out.append({
+                    "key": f.get("key"),
+                    "importance": score,
+                    "reason": str(parsed.get("reason", ""))[:200],
+                })
+            except Exception as e:  # noqa: BLE001
+                logger.warning("LLMScorer.score_failed key=%s err=%s", f.get("key"), e)
+                out.append({"key": f.get("key"), "importance": None})
+
+        # 全军覆没(每条 importance 都是 None)→ 返回 None 让调用方走启发式
+        if all(r["importance"] is None for r in out):
+            return None
+        return out
 
 
 class LLMSummarizer:
-    """LLM 摘要器 —— 调 LLM 把一批 fact 提炼为 weekly/monthly 摘要(2026-10-10 设计)。
+    """LLM 摘要器 —— 把**一批** fact 总结成**一条**日报/周报/月报。
 
-    设计:
-    - 输入:一批 fact(原文 + 5W1H)
-    - 输出:提炼后的 markdown 摘要(为什么必须原话引述,见 _INFERENCE_PATTERNS)
-    - 降级: LLM 失败 → 走启发式摘要(只拼接)
-    - why 严格校验: 检出 LLM 编造的"用户可能..." → 丢弃 why 字段
+    🆕 2026-10-12 重写。此前是 ``summarize_5w1h``(逐条 5W1H)的桩,返回 None;
+    consolidation 因此退化成"N 条 fact → N 条 daily",压缩率为 0 —— 与
+    consolidation 的目的(降低 Qdrant 负担)完全相反。
+
+    新语义:输入 N 条 fact,**输出 1 条**时段摘要。调用方按
+    :class:`~smartbutler.emotion.memory.levels.MemoryLevel` 组织 prompt:
+    daily 汇总"昨天所有 fact"、weekly 汇总"本周所有 daily"、
+    monthly 汇总"本月所有 weekly"。
+
+    设计约束:
+    - **why 严禁编造** —— 检出 "用户可能/大概/也许" 等推断语则丢弃该字段
+    - **降级** —— LLM 未注入 / 调用失败 / 解析失败 → 返回 None,
+      调用方走 :class:`HeuristicSummarizer` 的拼接兜底
+    - **可读性优先** —— 摘要要能直接注入 prompt 给 LLM 看,不要 JSON
     """
+
+    def __init__(
+        self,
+        llm: "Any | None" = None,
+        *,
+        max_facts: int = 200,
+        max_fact_chars: int = 1500,
+        max_tokens: int = 2000,
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        """Args:
+            llm: :class:`~smartbutler.capabilities.llm.base.BaseLLM` 实例;
+                None = 不调 LLM(降级到 :class:`HeuristicSummarizer`)。
+            max_facts: 单次总结最多纳入多少条 fact(防止 prompt 爆炸)。
+            max_fact_chars: 单条 fact 送进 prompt 的字符上限。
+            max_tokens: LLM 输出上限。
+            timeout_seconds: 单次调用超时,防止 consolidation 卡死。
+        """
+        self._llm = llm
+        self._max_facts = max_facts
+        self._max_fact_chars = max_fact_chars
+        self._max_tokens = max_tokens
+        self._timeout_seconds = timeout_seconds
+
+    @property
+    def enabled(self) -> bool:
+        return self._llm is not None
+
+    def _build_prompt(self, level: str, period: str, facts: list[dict[str, Any]]) -> str:
+        """按目标层级拼 prompt。"""
+        from smartbutler.emotion.memory.levels import MemoryLevel
+
+        label = {
+            MemoryLevel.DAILY.value: "日报",
+            MemoryLevel.WEEKLY.value: "周报",
+            MemoryLevel.MONTHLY.value: "月报",
+        }.get(level, "摘要")
+
+        lines: list[str] = []
+        for i, f in enumerate(facts[: self._max_facts], 1):
+            content = str(f.get("content", "")).strip()
+            if not content:
+                continue
+            if len(content) > self._max_fact_chars:
+                content = content[: self._max_fact_chars] + "…(略)"
+            lines.append(f"[记忆{i}] {content}")
+
+        return (
+            f"你是记忆整理助手。请把下面 {period} 的 {len(lines)} 条记忆"
+            f"合并成**一条{label}**。\n"
+            "\n"
+            "要求:\n"
+            "1. **只写记忆里真实存在的信息**,严禁推断、补充、编造。\n"
+            "2. 不确定的时间/原因宁可省略,也不要猜。\n"
+            "3. 同一件事的多条记忆合并成一句,不要重复罗列。\n"
+            "4. 保留具体的数字、日期、人名、地点、偏好等细节。\n"
+            "5. 用中文 markdown,分条列出,控制在 600 字以内。\n"
+            f"\n"
+            f"【{period}的记忆】\n" + "\n".join(lines)
+        )
+
+    async def summarize_period(
+        self,
+        facts: list[dict[str, Any]],
+        *,
+        level: str = "daily",
+        period: str = "昨天",
+    ) -> str | None:
+        """把一批 fact 总结成一条时段摘要。
+
+        Args:
+            facts: ``[{"key":..., "content":..., "importance":...}, ...]``
+            level: 目标层("daily"/"weekly"/"monthly"),决定 prompt 措辞。
+            period: 时间段描述(如 "昨天 2026-10-11"/"本周 10-06~10-12")。
+
+        Returns:
+            markdown 摘要字符串;未注入 LLM / 调用失败 / 内容为空 → ``None``
+            (调用方降级到 :class:`HeuristicSummarizer`)。
+        """
+        if self._llm is None or not facts:
+            return None
+
+        from smartbutler.capabilities.llm.types import Message
+
+        prompt = self._build_prompt(level, period, facts)
+        if not prompt.strip():
+            return None
+
+        try:
+            import asyncio
+
+            resp = await asyncio.wait_for(
+                self._llm.chat(
+                    [
+                        Message(
+                            role="system",
+                            content=(
+                                "你只做记忆归档,不闲聊。"
+                                "输出纯 markdown,不要代码块围栏,不要开场白。"
+                            ),
+                        ),
+                        Message(role="user", content=prompt),
+                    ],
+                    temperature=0.2,
+                    max_tokens=self._max_tokens,
+                ),
+                timeout=self._timeout_seconds,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "LLMSummarizer.summarize_failed level=%s n_facts=%d err=%s",
+                level, len(facts), e,
+            )
+            return None
+
+        text = (getattr(resp, "content", "") or "").strip()
+        if not text:
+            logger.warning("LLMSummarizer.empty_summary level=%s", level)
+            return None
+
+        # 剥掉可能的 markdown 代码块围栏
+        text = _strip_code_fence(text)
+        logger.info(
+            "LLMSummarizer.summarize_done level=%s n_facts=%d summary_len=%d",
+            level, len(facts), len(text),
+        )
+        return text
 
     async def summarize_5w1h(
         self, facts: list[FiveW1H]
     ) -> list[FiveW1H] | None:
-        """调 LLM 提炼一批 fact 的 5W1H。
+        """兼容旧 API(逐条 5W1H 提炼)。
 
-        Args:
-            facts: 已用 :class:`FiveW1HExtractor` 抽出的 5W1H 列表(启发式版)。
-
-        Returns:
-            LLM 提炼后的 5W1H 列表,顺序对齐输入。失败/降级时返 None。
+        🆕 2026-10-12:新流程用 :meth:`summarize_period`(聚合成一条),
+        本方法保留仅为不破坏既有调用方,仍返回 None(不调 LLM)。
         """
-        logger.debug("LLMSummarizer.summarize_5w1h not implemented yet, returning None")
+        logger.debug("LLMSummarizer.summarize_5w1h deprecated, returning None")
         return None
 
     @staticmethod

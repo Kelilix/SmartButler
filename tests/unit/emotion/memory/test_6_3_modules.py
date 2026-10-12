@@ -20,6 +20,7 @@ from smartbutler.emotion.memory.summarizer import (
     FiveW1H,
     FiveW1HExtractor,
     HeuristicSummarizer,
+    LLMScorer,
     LLMSummarizer,
     SummarizedFact,
 )
@@ -224,35 +225,67 @@ def consolidator_setup(tmp_path: Path) -> tuple[Consolidator, LongTermStore, Mem
     s = LongTermStore(q)
     embedder = StubEmbedder(dimension=64)
     hooks = MemoryHooks()
+    # llm=None → 评分走启发式、摘要走拼接兜底(测试不该依赖真实 LLM)
     c = Consolidator(
         store=s,
         embedder=embedder,
-        extractor=FiveW1HExtractor(),
-        summarizer=HeuristicSummarizer(),
-        llm_scorer=__import__("smartbutler.emotion.memory.summarizer", fromlist=["LLMScorer"]).LLMScorer(),
-        llm_summarizer=LLMSummarizer(),
+        llm_scorer=LLMScorer(None),
+        llm_summarizer=LLMSummarizer(None),
         hooks=hooks,
     )
     return c, s, hooks
 
 
-def test_consolidator_daily_promotes_unlevel(
+def _yesterday(now: datetime | None = None) -> datetime:
+    """昨天同一时刻(daily 汇总窗口用)。"""
+    now = now or datetime.now(UTC)
+    return now - timedelta(days=1)
+
+
+def test_consolidator_daily_aggregates_into_one(
     consolidator_setup: tuple[Consolidator, LongTermStore, MemoryHooks],
 ) -> None:
-    """daily 触发:无 level 的 fact 升 L1。"""
+    """🆕 daily:N 条 fact → **1 条**日报(旧实现是 N 条 daily)。"""
+    import asyncio
+    c, store, _ = consolidator_setup
+    emb = asyncio.run(StubEmbedder(dimension=64).embed("x"))
+    y = _yesterday()
+    for i in range(5):
+        store.store_memory(
+            f"k{i}", emb, f"第{i}条记忆:讨论项目进度",
+            importance=0.7, created_at=y,
+        )
+    report = asyncio.run(c.consolidate(level=ConsolidationLevel.DAILY))
+    # 只产出 1 条
+    assert report.promoted == 1
+    assert report.source_count == 5
+    assert report.compression_ratio == 5.0
+    new = [it for it in store.list_keys_by_level(include_deleted=False)
+           if it["key"].startswith("consolidated:daily:")]
+    assert len(new) == 1
+    assert new[0]["level"] == "daily"
+
+
+def test_consolidator_daily_keeps_source_facts(
+    consolidator_setup: tuple[Consolidator, LongTermStore, MemoryHooks],
+) -> None:
+    """🆕 源 fact **不删**(用户决策 2026-10-12):留给 forget 按时间窗处理。
+
+    旧行为是升格即软删源 fact —— 那样"第 4 个月删第 1 个月的 fact"
+    就无从谈起(源 fact 在升格当天就没了)。
+    """
     import asyncio
     c, store, _ = consolidator_setup
     emb = asyncio.run(StubEmbedder(dimension=64).embed("重要任务"))
-    store.store_memory("k1", emb, "明天 8 点开会讨论项目", importance=0.7)
-    report = asyncio.run(c.consolidate(level=ConsolidationLevel.DAILY))
-    assert report.promoted == 1
-    # 源 fact 被软删
+    store.store_memory(
+        "k1", emb, "明天 8 点开会讨论项目",
+        importance=0.7, created_at=_yesterday(),
+    )
+    asyncio.run(c.consolidate(level=ConsolidationLevel.DAILY))
     pl = store.get_payload("k1")
-    assert pl is not None and pl.get("deleted") is True
-    # 新 fact 有 level:daily
-    new = [it for it in store.list_keys_by_level(include_deleted=False) if it["key"].startswith("promoted:daily:")]
-    assert len(new) == 1
-    assert new[0]["level"] == "daily"
+    assert pl is not None
+    assert not pl.get("deleted"), "源 fact 不该被升格时软删"
+    assert "level" not in pl, "源 fact 不该被打 level tag"
 
 
 def test_consolidator_skips_low_importance(
@@ -262,33 +295,33 @@ def test_consolidator_skips_low_importance(
     import asyncio
     c, store, _ = consolidator_setup
     emb = asyncio.run(StubEmbedder(dimension=64).embed("琐事"))
-    store.store_memory("lo", emb, "开个灯", importance=0.1)
+    store.store_memory("lo", emb, "开个灯", importance=0.1, created_at=_yesterday())
     report = asyncio.run(c.consolidate(level=ConsolidationLevel.DAILY))
     assert report.promoted == 0
     assert report.skipped_low_importance == 1
 
 
-def test_consolidator_weekly_promotes_old_daily(
+def test_consolidator_weekly_aggregates_daily(
     consolidator_setup: tuple[Consolidator, LongTermStore, MemoryHooks],
 ) -> None:
-    """weekly 触发:L1 daily 且 age > 7 天 → 升 L2,软删 L1。"""
+    """🆕 weekly:N 条 daily → **1 条**周报(旧实现是 N 条 weekly)。"""
     import asyncio
     c, store, _ = consolidator_setup
     emb = asyncio.run(StubEmbedder(dimension=64).embed("8点烧水"))
-    old = (datetime.now(UTC) - timedelta(days=10)).isoformat()
-    store.store_memory(
-        "old_daily", emb, "明早 8 点烧洗澡水",
-        importance=0.6, level="daily",
-        created_at=datetime.fromisoformat(old),
-    )
+    recent = datetime.now(UTC) - timedelta(days=3)
+    for i in range(4):
+        store.store_memory(
+            f"d{i}", emb, f"第{i}天的日报内容",
+            importance=0.6, level="daily", created_at=recent,
+        )
     report = asyncio.run(c.consolidate(level=ConsolidationLevel.WEEKLY))
     assert report.promoted == 1
-    # old_daily 被软删
-    pl = store.get_payload("old_daily")
-    assert pl is not None and pl.get("deleted") is True
-    # 新 fact level:weekly
-    new = [it for it in store.list_keys_by_level(include_deleted=False) if it["key"].startswith("promoted:weekly:")]
+    assert report.source_count == 4
+    new = [it for it in store.list_keys_by_level(include_deleted=False)
+           if it["key"].startswith("consolidated:weekly:")]
     assert len(new) == 1
+    # 源 daily 也保留
+    assert store.get_payload("d0") is not None
 
 
 def test_consolidator_triggers_on_promote_hook(
@@ -303,7 +336,9 @@ def test_consolidator_triggers_on_promote_hook(
         seen.append(key)
     hooks.register(MemoryEventType.ON_PROMOTE, cb)
     emb = asyncio.run(StubEmbedder(dimension=64).embed("8点烧水"))
-    store.store_memory("k1", emb, "明天 8 点要烧水", importance=0.6)
+    store.store_memory(
+        "k1", emb, "明天 8 点要烧水", importance=0.6, created_at=_yesterday(),
+    )
     asyncio.run(c.consolidate(level=ConsolidationLevel.DAILY))
     assert len(seen) == 1
-    assert seen[0].startswith("promoted:daily:")
+    assert seen[0].startswith("consolidated:daily:")

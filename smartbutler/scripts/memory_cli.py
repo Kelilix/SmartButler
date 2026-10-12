@@ -63,6 +63,22 @@ def _build_store(args: argparse.Namespace) -> LongTermStore:
     )
 
 
+def _try_build_llm() -> Any | None:
+    """尽力建一个 LLM 实例,失败返回 None(调用方降级)。
+
+    consolidate 的摘要依赖 LLM,但 CLI 不能因为没配 api_key 就崩 ——
+    返回 None 时 :class:`LLMSummarizer` 自动退化为拼接兜底。
+    """
+    try:
+        from smartbutler.config.llm import load_llm_settings
+        from smartbutler.capabilities.llm.factory import create_llm
+
+        return create_llm(load_llm_settings())
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️  LLM 初始化失败({e}),将退化为无 LLM 模式。")
+        return None
+
+
 def cmd_list_deleted(args: argparse.Namespace) -> int:
     """list-deleted: 列出软删除的事实(支持 --by-age 分桶显示)。"""
     store = _build_store(args)
@@ -364,81 +380,83 @@ def cmd_recall(args: argparse.Namespace) -> int:
 
 
 def cmd_consolidate(args: argparse.Namespace) -> int:
-    """consolidate: 跑一次 4 层升格管道(Phase 6.3 P1)。
+    """consolidate: 把一个时间段的 fact 聚合成 1 条摘要(3 层:day/week/month)。
 
     走底层 :class:`Consolidator`(不绕 facade),所以 CLI 是独立可用,
     不依赖 facade 是否已 bind consolidator。
+
+    🆕 2026-10-12 语义变化:旧实现是"N 条 fact → N 条 daily"(压缩率 0),
+    现在是"N 条 fact → 1 条日报",weekly/monthly 同理逐层收敛。
+    源 fact **不删除**(留给 forget 策略按时间窗处理)。
     """
+    from datetime import UTC, datetime
+
+    from smartbutler.emotion.memory.consolidation import ConsolidationLevel
     from smartbutler.emotion.memory.embedder import build_default_embedder
-    from smartbutler.emotion.memory.levels import (
-        DAILY_TO_WEEKLY_DAYS,
-        MONTHLY_TO_PERMANENT_DAYS,
-        WEEKLY_TO_MONTHLY_DAYS,
-    )
+    from smartbutler.emotion.memory.levels import MemoryLevel
 
     level = args.level
     dry_run = args.dry_run
     store = _build_store(args)
     embedder = build_default_embedder()
     hooks = MemoryHooks()
+
+    # 🆕 接真实 LLM(--no-llm 可强制降级到拼接兜底,便于对比/省钱)
+    llm = None if getattr(args, "no_llm", False) else _try_build_llm()
+    if llm is None:
+        print("⚠️  未启用 LLM,摘要将退化为拼接兜底(不压缩)。")
+
     c = Consolidator(
         store=store,
         embedder=embedder,
-        extractor=FiveW1HExtractor(),
-        summarizer=HeuristicSummarizer(),
-        llm_scorer=LLMScorer(),
-        llm_summarizer=LLMSummarizer(),
+        llm_scorer=LLMScorer(llm),
+        llm_summarizer=LLMSummarizer(llm),
         hooks=hooks,
     )
+
     if dry_run:
-        # dry-run:只统计候选数,不动数据
-        from smartbutler.emotion.memory.levels import MemoryLevel
-        from smartbutler.emotion.memory.consolidation import ConsolidationLevel
-        if level == "daily":
-            cand = c._scan_raw_or_unlevel(limit=10_000)
-        elif level == "weekly":
-            from datetime import datetime, UTC
-            cand = c._scan_level(
-                MemoryLevel.DAILY,
-                older_than_days=DAILY_TO_WEEKLY_DAYS,
-                now=datetime.now(UTC),
-                limit=10_000,
-            )
-        else:  # monthly
-            from datetime import datetime, UTC
-            cand = c._scan_level(
-                MemoryLevel.WEEKLY,
-                older_than_days=WEEKLY_TO_MONTHLY_DAYS,
-                now=datetime.now(UTC),
-                limit=10_000,
-            )
+        now = datetime.now(UTC)
+        lvl = ConsolidationLevel(level)
+        window = c._resolve_window(lvl, now)
+        source_level = {
+            "daily": None,
+            "weekly": MemoryLevel.DAILY.value,
+            "monthly": MemoryLevel.WEEKLY.value,
+        }[level]
+        cand = c._scan(
+            level=source_level,
+            since=window["since"],
+            now=now,
+            limit=10_000,
+        )
         print(f"\n🔍 DRY RUN consolidate --level {level}")
-        print(f"  candidates_scanned   {len(cand):>6} 条")
-        # 按 importance 分级预估
+        print(f"  时间窗              {window['label']}")
+        print(f"  源层级              {source_level or '(无 level 的原始 fact)'}")
+        print(f"  candidates_scanned  {len(cand):>6} 条")
         low = sum(1 for it in cand if it.get("importance", 0.5) < 0.2)
-        l1_only = sum(1 for it in cand if 0.2 <= it.get("importance", 0.5) < 0.5)
-        l1_l2 = sum(1 for it in cand if 0.5 <= it.get("importance", 0.5) < 0.8)
-        l1_l2_l3 = sum(1 for it in cand if it.get("importance", 0.5) >= 0.8)
-        print(f"  → importance<0.2 跳过:    {low:>4} 条(走 TTL)")
-        print(f"  → L1 daily only:          {l1_only:>4} 条")
-        print(f"  → L1+L2:                 {l1_l2:>4} 条")
-        print(f"  → L1+L2+L3 permanent:    {l1_l2_l3:>4} 条")
-        if level == "daily":
-            print("\n  💡 配合阈值(当前 qdrant 是 0 条)建议先用 /remember 写一些 fact 再跑。")
+        print(f"  → importance<0.2   {low:>6} 条(会被门控跳过)")
+        print(f"  → 预计产出          {1 if len(cand) - low > 0 else 0:>6} 条摘要")
+        if len(cand) - low > 0:
+            print(f"  → 压缩比            {(len(cand) - low):>6}:1")
+        print("\n  💡 加 --no-llm 可看降级效果;去掉 --dry-run 真跑。")
         return 0
+
     # 真跑
     report = asyncio.run(c.consolidate(level=level))
     print(f"\n✅ Consolidate done (level={level})")
-    print(f"  scanned              {report.candidates_scanned:>6} 条")
-    print(f"  promoted             {report.promoted:>6} 条(升格成功)")
-    print(f"  forgotten            {report.forgotten:>6} 条(源 fact 软删)")
-    print(f"  skipped_low_importance{report.skipped_low_importance:>5} 条(<0.2)")
-    print(f"  skipped_invalid_5w1h {report.skipped_invalid_5w1h:>6} 条(5W1H 不完整)")
+    print(f"  时间窗              {report.period}")
+    print(f"  candidates_scanned  {report.candidates_scanned:>6} 条")
+    print(f"  汇总源 fact         {report.source_count:>6} 条")
+    print(f"  promoted            {report.promoted:>6} 条摘要")
+    print(f"  压缩比              {report.compression_ratio:>6}x")
+    print(f"  摘要方式            {report.summary_method or '(未生成)':>6}")
+    print(f"  skipped_low_import  {report.skipped_low_importance:>6} 条(<0.2)")
+    print(f"  源 fact            {'保留(由 forget 策略处理)':>6}")
     if report.errors:
         print(f"  errors               {len(report.errors):>6} 条(见 logs)")
     if report.new_keys:
-        print(f"\n  new_keys(前 5):")
-        for nk in report.new_keys[:5]:
+        print(f"\n  new_keys:")
+        for nk in report.new_keys:
             print(f"    - {nk}")
     return 0
 
@@ -1098,19 +1116,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_rec.set_defaults(func=cmd_recall)
 
-    # consolidate(4 层升格管道)
+    # consolidate(3 层聚合管道)
     p_con = subparsers.add_parser(
         "consolidate",
-        help="跑一次 4 层升格管道(daily/weekly/monthly,Phase 6.3 P1)",
+        help="把一个时间段的 fact 聚合成 1 条摘要(daily/weekly/monthly)",
     )
     p_con.add_argument(
         "--level", default="daily",
         choices=["daily", "weekly", "monthly"],
-        help="目标层(daily=升 L1;weekly=7d+ daily→L2;monthly=30d+ weekly→L3)",
+        help=(
+            "目标层。daily=汇总昨天的 fact 成 1 条日报;"
+            "weekly=汇总最近 7 天的 daily 成 1 条周报;"
+            "monthly=汇总最近 30 天的 weekly 成 1 条月报"
+        ),
     )
     p_con.add_argument(
         "--dry-run", dest="dry_run", action="store_true", default=False,
-        help="只统计候选数,不实际写新条目/软删源条目",
+        help="只统计候选数与时间窗,不实际写摘要",
+    )
+    p_con.add_argument(
+        "--no-llm", dest="no_llm", action="store_true", default=False,
+        help="不调 LLM,摘要退化为拼接兜底(对比效果 / 省 token)",
     )
     p_con.set_defaults(func=cmd_consolidate)
 

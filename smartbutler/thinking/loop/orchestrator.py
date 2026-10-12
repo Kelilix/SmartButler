@@ -415,20 +415,21 @@ class ButlerOrchestrator:
                 from smartbutler.emotion.memory.facade import MemoryContext
 
                 ctx = MemoryContext(user_id=user_id, session_id=session_id)
-                logger.info(
-                    "orchestrator.ainvoke memory_block_refresh user=%s session=%s",
-                    user_id, session_id,
+                _logger.info(
+                    "orchestrator.ainvoke memory_block_refresh",
+                    user=user_id, session=session_id,
                 )
                 self._current_memory_block = await self._memory_facade.format_for_prompt(
                     query=user_input.strip(), ctx=ctx, k=5, max_chars=2000,
                 )
-                logger.info(
-                    "orchestrator.ainvoke memory_block_ready len=%d",
-                    len(self._current_memory_block),
+                _logger.info(
+                    "orchestrator.ainvoke memory_block_ready",
+                    length=len(self._current_memory_block),
                 )
                 # 缓存失效:让 _ensure_graph_async 重新拼 system_prompt
                 self._compiled = None
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                _logger.exception("orchestrator.ainvoke memory_block_failed", error=str(e))
                 self._current_memory_block = ""
                 # 缓存不变,无需重建
 
@@ -490,8 +491,13 @@ class ButlerOrchestrator:
                 self._current_memory_block = await self._memory_facade.format_for_prompt(
                     query=user_input.strip(), ctx=ctx, k=5, max_chars=2000,
                 )
+                _logger.info(
+                    "orchestrator.astream memory_block_ready",
+                    length=len(self._current_memory_block),
+                )
                 self._compiled = None
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                _logger.exception("orchestrator.astream memory_block_failed", error=str(e))
                 self._current_memory_block = ""
 
         compiled = await self._ensure_graph_async()

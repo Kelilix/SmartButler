@@ -140,6 +140,37 @@ class MemorySettings(SmartButlerBaseSettings, BaseSettings):
         description="recall 相似度下限(归一化 raw_norm),0=关闭",
     )
 
+    # ---- 注入 prompt 的字符预算 ----
+    #
+    # 🆕 2026-10-12 用户决策:**召回优先于 prompt 预算**。
+    #
+    # 背景(三轮实测踩坑,facade.py 里也有完整记录):
+    #   1. 单条 fact 上限 200 太短 —— 课程 fact 的 `[assistant]` 结论在
+    #      第 189 字符,被砍成 `[assista...`,LLM 答"没链接请发我"。
+    #   2. 提到 1000 仍不够 —— 宠物 task fact 总长 2678(8 轮),关键事实
+    #      "养了几个月,蜕过一次皮,足展 5-6 厘米"在位置 1279,被砍掉,
+    #      用户问"我的金直间多大了",LLM 答"没记录"。
+    #   3. 试"保首尾砍中间"(head=tail=700),1279 仍在中间,照样丢。
+    #
+    # 根因:问答式对话信息密度不均匀 —— user 平均 16 字符、assistant 平均
+    # 440 字符(科普长文),高价值事实永远是被长文包裹的少数短语,
+    # 按字符位置截断必然砍到它们。
+    #
+    # 所以默认 0 = **不截断**,召回到什么原样注入什么。
+    # 将来若要控制 prompt 体积/成本,调大这个值即可(见 facade._truncate_middle)。
+    max_fact_chars: int = Field(
+        default=0, ge=0, le=100_000,
+        description="单条 fact 注入上限(字符),0=不截断(召回优先)",
+    )
+
+    # 短库 block 占总预算的比例(0.4 = 短库 40% / 长期 60%)
+    # 🆕 当前 recall_prompt_budget_chars=0(不截断)时该值不生效,
+    # 保留是为了将来重新引入预算时不用改代码。
+    short_term_ratio: float = Field(
+        default=0.4, ge=0.0, le=1.0,
+        description="短库 block 占总预算比例(仅在启用预算时生效)",
+    )
+
     # ---- Phase 6.3+: 定时 consolidate (流水线 B) ----
 
     # 是否启动定时 consolidate(daily/weekly/monthly 三个 cron job)

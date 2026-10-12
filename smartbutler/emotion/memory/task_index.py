@@ -480,6 +480,68 @@ class TaskIndex:
             )
             conn.commit()
 
+    # ---------------------------------------------------------------------------
+    # 🆕 Phase 6.5+: judge 游标持久化
+    # ---------------------------------------------------------------------------
+
+    def load_processed_cursor(self) -> dict[str, set[str]]:
+        """加载上次运行时留下的 judge 游标。
+
+        Returns:
+            {thread_id: {message_id, ...}, ...}。空 dict 表示首次运行(无游标)。
+
+        设计:
+        - 进程启动时调用一次(在 TaskScheduler.start() 里)。
+        - 每个 thread_id 对应一个 set,游标只增不减(消息只追加,无需后退)。
+        - 从 task_index.db 而非 short_term.db 加载:
+          task_index 是 TaskScheduler 已有依赖,schema 改动风险更小。
+        """
+        result: dict[str, set[str]] = {}
+        try:
+            with self._lock, self._conn() as conn:
+                rows = conn.execute(
+                    "SELECT thread_id, processed_ids FROM _processed_cursor"
+                ).fetchall()
+            for row in rows:
+                try:
+                    ids_list = json.loads(row["processed_ids"] or "[]")
+                    if isinstance(ids_list, list):
+                        result[row["thread_id"]] = set(ids_list)
+                except (TypeError, ValueError):
+                    # 损坏的 JSON,当作无游标处理(首次运行/空表)
+                    pass
+        except Exception:
+            # schema 还没迁移(第一次运行前),静默返回空 dict
+            pass
+        return result
+
+    def save_processed_cursor(self, cursor: dict[str, set[str]]) -> None:
+        """把 judge 游标写回磁盘。
+
+        Args:
+            cursor: {thread_id: {message_id, ...}, ...}
+
+        设计:
+        - 每次 scan 完成(所有 thread 游标推进后)调用一次。
+        - 用 INSERT OR REPLACE 原子写入整个 cursor。
+        - 频率:每轮 scan 一次 ~= 分钟级;写入量仅 cursor dict(json 字符串),
+          即使进程 crash 也只是丢失最近一轮的游标(重判代价可接受)。
+        """
+        try:
+            with self._lock, self._conn() as conn:
+                conn.execute("DELETE FROM _processed_cursor")
+                rows = [
+                    (tid, json.dumps(list(ids), ensure_ascii=False))
+                    for tid, ids in cursor.items()
+                ]
+                conn.executemany(
+                    "INSERT OR REPLACE INTO _processed_cursor (thread_id, processed_ids) VALUES (?, ?)",
+                    rows,
+                )
+                conn.commit()
+        except Exception as e:
+            logger.warning("task_index.save_processed_cursor_failed: %s", e)
+
     # ---- 工具 ----
 
     def stats(self) -> dict[str, Any]:
@@ -596,6 +658,18 @@ CREATE INDEX IF NOT EXISTS idx_msg_thread
     ON task_messages (thread_id);
 CREATE INDEX IF NOT EXISTS idx_msg_spoken_at
     ON task_messages (spoken_at);
+
+-- 🆕 Phase 6.5+: judge 游标持久化(解决 dev_chat 重启后旧 thread 被重复 judge 的 bug)。
+-- 表结构:每个 thread 一行,存已 judge 过的 message_id 集合(JSON 数组)。
+-- 持久化到 task_index.db 而不是 short_term.db 的理由:
+-- 1. task_index 是 TaskScheduler 的已有依赖,不改 short_term 侧
+-- 2. short_term 侧是 LangGraph 的 API 层,改 schema 风险更大
+-- 3. 两者生命周期一致(都是 data/ 下的持久化文件)
+-- 只增不减:message 只追加,游标只推进不后退,无需 delete/update。
+CREATE TABLE IF NOT EXISTS _processed_cursor (
+    thread_id     TEXT PRIMARY KEY,
+    processed_ids TEXT NOT NULL   -- JSON list of message_id strings
+);
 """
 
 

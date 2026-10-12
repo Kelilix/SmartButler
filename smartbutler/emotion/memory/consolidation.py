@@ -1,57 +1,55 @@
-"""Consolidation —— 4 层分片升格管道(Phase 6.3 P1)。
+"""Consolidation —— 按时段聚合的升格管道。
 
-设计目标:
-- **升格 = 写新条目 + 软删除源条目**(永不物理删,见 vacuum.py)
-- **4 层分片** L1 daily / L2 weekly / L3 monthly / L4 permanent(同 collection,不同 tag)
-- **重要性分级压缩**:
-  - [0.0, 0.2) → 不进 consolidation,走 TTL
-  - [0.2, 0.5) → 只进 L1 daily
-  - [0.5, 0.8) → 进 L1 + L2 weekly + L3 monthly
-  - [0.8, 1.0] → 进 L1 + L2 + L3 + L4 permanent
-- **LLM 评分降级** —— 调 LLM 失败 → 走启发式重要性评分
-- **触发 ON_PROMOTE 钩子** —— 6.3 MemoryHooks ON_PROMOTE 接入
-- **降级** —— 任一环节失败 → 记 ERROR 日志,不影响 recall 主流程
+设计目标(2026-10-12 重写):
+- **聚合而非逐条** —— N 条 fact → **1 条**时段摘要,压缩率 N:1
+  - 旧实现是"1 条 fact → 1 条 daily",压缩率为 0,与 consolidation
+    降低 Qdrant 负担的目的完全相反(实测:宠物 task 8 轮 fact 2678 字符,
+    升格后仍是 2678 字符,一点没压)。
+  - 现在:daily 汇总"昨天的所有 fact"、weekly 汇总"本周所有 daily"、
+    monthly 汇总"本月所有 weekly",逐层收敛。
+- **3 层**(用户决策 2026-10-12):daily / weekly / monthly。
+  - permanent 层**不做** —— 月报已足够小且永久保留;
+    真正的"永久层"(习惯/画像)留给后续 habit 模块。
+- **LLM 真实总结** —— 通过 :class:`LLMSummarizer` 调 LLM 生成摘要,
+  失败降级到 :class:`HeuristicSummarizer` 拼接。
+- **源 fact 不立即删** —— 升格后源 fact **保留**(用户决策),
+  由 forget 策略按时间窗决定何时删除。
+  这样"第 4 个月删掉第 1 个月的 fact"能真正生效。
+- **降级** —— 任一环节失败 → 记日志,不影响 recall 主流程
 
 不变量:
-- consolidate 永不阻塞调用方(虽然现在是同步,后续可改 async 不破签名)
-- L4 permanent 必须有 importance ≥ 0.8
-- 升格产生的 source_keys 永远不空(记追溯链)
-- 5W1H 缺必填字段时该 fact 不进 consolidation(降级为 raw)
+- consolidate 永不阻塞调用方
+- 每次 consolidate 调用最多写 1 条新记忆(每层一次)
+- 源 fact 在升格期间**绝不软删**(用户决策:留给 forget 策略)
 """
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from enum import StrEnum, unique
 from typing import Any
 
 from smartbutler.capabilities.embedding.base import Embedder, EmbedderError
 from smartbutler.emotion.memory.levels import (
-    CONSOLIDATION_DAILY_THRESHOLD,
-    CONSOLIDATION_PERMANENT_THRESHOLD,
     CONSOLIDATION_TTL_THRESHOLD,
     DAILY_TO_WEEKLY_DAYS,
     MemoryLevel,
-    MONTHLY_TO_PERMANENT_DAYS,
     WEEKLY_TO_MONTHLY_DAYS,
-    importance_to_levels,
     level_tag,
 )
 from smartbutler.emotion.memory.long_term import (
     LongTermStore,
+    PAYLOAD_CREATED_AT,
     PAYLOAD_DELETED,
-    PAYLOAD_LEVEL,
+    PAYLOAD_IMPORTANCE,
     PAYLOAD_SOURCE_KEYS,
 )
 from smartbutler.emotion.memory.summarizer import (
-    FiveW1H,
-    FiveW1HExtractor,
     HeuristicSummarizer,
     LLMScorer,
     LLMSummarizer,
-    SummarizedFact,
 )
 from smartbutler.emotion.memory.hooks import MemoryEventType, MemoryHooks
 from smartbutler.utils.logging import get_logger
@@ -68,37 +66,56 @@ class ConsolidationLevel(StrEnum):
     MONTHLY = "monthly"
 
 
+#: 每周 / 每月近似天数(用于把"本周期"换算成时间窗)
+_DAYS_PER_WEEK = 7
+_DAYS_PER_MONTH = 30
+
+
 @dataclass
 class ConsolidationReport:
     """单次 consolidation 报告。"""
 
     level: ConsolidationLevel
     candidates_scanned: int = 0
+    #: 🆕 聚合后写入的摘要条数(每次最多 1)
     promoted: int = 0
-    forgotten: int = 0
+    #: 本次汇总覆盖的源 fact 数
+    source_count: int = 0
     skipped_low_importance: int = 0
-    skipped_invalid_5w1h: int = 0
+    skipped_empty: int = 0
+    #: 摘要生成方式:"llm" / "heuristic"
+    summary_method: str = ""
+    #: 本次覆盖的时间段描述(如 "昨天 2026-10-11")
+    period: str = ""
     errors: list[str] = field(default_factory=list)
     new_keys: list[str] = field(default_factory=list)
+    source_keys: list[str] = field(default_factory=list)
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
 
+    @property
+    def compression_ratio(self) -> float:
+        """压缩比:源 fact 数 / 产出摘要数。1.0 = 没压缩,10.0 = 10 条压成 1 条。"""
+        if self.promoted <= 0:
+            return 0.0
+        return round(self.source_count / self.promoted, 2)
+
 
 class Consolidator:
-    """4 层分片升格管道(Phase 6.3 P1)。
+    """按时段聚合的升格管道(3 层:daily / weekly / monthly)。
 
     典型用法::
 
         c = Consolidator(
             store=long_term,
             embedder=embedder,
-            extractor=FiveW1HExtractor(),
-            summarizer=HeuristicSummarizer(),
-            llm_scorer=LLMScorer(),       # P0 阶段返 None
-            llm_summarizer=LLMSummarizer(),  # P0 阶段返 None
+            llm_scorer=LLMScorer(llm),        # llm=None 则走启发式
+            llm_summarizer=LLMSummarizer(llm),  # llm=None 则走拼接兜底
             hooks=hooks,
         )
-        report = c.consolidate(level="daily")
+        report = await c.consolidate(level="daily")
+        # report.promoted == 1(一条日报)
+        # report.source_count == N(覆盖 N 条 fact)
     """
 
     def __init__(
@@ -106,19 +123,31 @@ class Consolidator:
         *,
         store: LongTermStore,
         embedder: Embedder,
-        extractor: FiveW1HExtractor,
-        summarizer: HeuristicSummarizer,
-        llm_scorer: LLMScorer,
-        llm_summarizer: LLMSummarizer,
+        llm_scorer: LLMScorer | None = None,
+        llm_summarizer: LLMSummarizer | None = None,
         hooks: MemoryHooks | None = None,
+        summarizer: HeuristicSummarizer | None = None,
+        extractor: Any | None = None,
+        min_importance: float = CONSOLIDATION_TTL_THRESHOLD,
     ) -> None:
+        """Args:
+            store: 长期存储(Qdrant)。
+            embedder: 向量化(摘要入库前要 embed)。
+            llm_scorer: LLM 评分器;None 或内部 llm=None 时走启发式 importance。
+            llm_summarizer: LLM 摘要器;None 或内部 llm=None 时走拼接兜底。
+            hooks: 记忆钩子(升格完成触发 ON_PROMOTE)。
+            summarizer: 启发式摘要兜底(默认新建)。
+            extractor: 保留兼容参数,新流程不再用 5W1H(不再逐条提炼)。
+            min_importance: 低于此 importance 的 fact 不进汇总。
+        """
         self._store = store
         self._embedder = embedder
-        self._extractor = extractor
-        self._summarizer = summarizer
-        self._llm_scorer = llm_scorer
-        self._llm_summarizer = llm_summarizer
+        self._llm_scorer = llm_scorer or LLMScorer()
+        self._llm_summarizer = llm_summarizer or LLMSummarizer()
         self._hooks = hooks
+        self._summarizer = summarizer or HeuristicSummarizer()
+        self._extractor = extractor  # 兼容保留
+        self._min_importance = min_importance
 
     async def consolidate(
         self,
@@ -127,232 +156,315 @@ class Consolidator:
         limit: int = 10_000,
         now: datetime | None = None,
     ) -> ConsolidationReport:
-        """触发一次 consolidation。
+        """把一个时间段的 fact 聚合成 1 条摘要。
 
         Args:
-            level: 目标层("daily"/"weekly"/"monthly")。
-                - "daily"  → 扫"无 level" 或 "level:raw" 的 fact,提炼后写 L1
-                - "weekly" → 扫 L1 daily,7 天前的,提炼后写 L2,软删 L1
-                - "monthly" → 扫 L2 weekly,30 天前的,提炼后写 L3,软删 L2
-            limit: 单次扫描上限(Qdrant scroll 默认 10000)。
+            level: 目标层。
+                - "daily"   → 汇总**昨天** 00:00-24:00 的未分层 fact → 1 条日报
+                - "weekly"  → 汇总**最近 7 天**的 daily 摘要 → 1 条周报
+                - "monthly" → 汇总**最近 30 天**的 weekly 摘要 → 1 条月报
+            limit: 单次扫描上限。
             now: 当前时间(测试时可注入)。
 
         Returns:
-            :class:`ConsolidationReport`。
+            :class:`ConsolidationReport`,``promoted`` 最大为 1。
         """
         now = now or datetime.now(UTC)
         if isinstance(level, str):
             level = ConsolidationLevel(level)
-        report = ConsolidationReport(level=level, candidates_scanned=0)
+        report = ConsolidationReport(level=level)
 
-        # 1. 扫候选
+        # 1. 按层级确定"扫哪个 level + 时间窗"
+        window = self._resolve_window(level, now)
+        report.period = window["label"]
+
+        source_level: str | None = None
         if level == ConsolidationLevel.DAILY:
-            candidates = self._scan_raw_or_unlevel(limit=limit)
-            target_levels = None  # 由 importance 决定
+            # 扫无 level 的 fact(auto_extract 写的原始 fact)
+            source_level = None
         elif level == ConsolidationLevel.WEEKLY:
-            candidates = self._scan_level(
-                MemoryLevel.DAILY,
-                older_than_days=DAILY_TO_WEEKLY_DAYS,
-                now=now,
-                limit=limit,
-            )
-            target_levels = [MemoryLevel.WEEKLY]
-        else:  # MONTHLY
-            candidates = self._scan_level(
-                MemoryLevel.WEEKLY,
-                older_than_days=WEEKLY_TO_MONTHLY_DAYS,
-                now=now,
-                limit=limit,
-            )
-            target_levels = [MemoryLevel.MONTHLY]
+            source_level = MemoryLevel.DAILY.value
+        else:
+            source_level = MemoryLevel.WEEKLY.value
+
+        candidates = self._scan(
+            level=source_level,
+            since=window["since"],
+            now=now,
+            limit=limit,
+        )
         report.candidates_scanned = len(candidates)
 
         if not candidates:
             report.finished_at = datetime.now(UTC)
+            logger.info(
+                "consolidate.%s no_candidates period=%s",
+                level.value, report.period,
+            )
             return report
 
-        # 2. 遍历候选 → 评 importance → 选 target levels → 提炼 5W1H → 升格
-        for cand in candidates:
+        # 2. importance 过滤(LLM 评分优先,失败降级启发式)
+        candidates, skipped_low = await self._filter_by_importance(candidates)
+        report.skipped_low_importance = skipped_low
+
+        if not candidates:
+            report.finished_at = datetime.now(UTC)
+            logger.info(
+                "consolidate.%s all_filtered scanned=%d skipped_low=%d",
+                level.value, report.candidates_scanned, skipped_low,
+            )
+            return report
+
+        # 3. LLM 总结成 1 条摘要(失败降级拼接)
+        target_level = MemoryLevel(level.value)
+        summary, method = await self._summarize(
+            candidates,
+            level=target_level,
+            period=report.period,
+        )
+        report.summary_method = method
+
+        if not summary:
+            report.skipped_empty += 1
+            report.finished_at = datetime.now(UTC)
+            return report
+
+        # 4. 入库:1 条新记忆,带 level tag + source_keys 溯源
+        new_key = await self._write_summary(
+            summary=summary,
+            target_level=target_level,
+            source_keys=[c["key"] for c in candidates],
+            importance=self._aggregate_importance(candidates),
+            period=report.period,
+            source_count=len(candidates),
+        )
+        if new_key is None:
+            report.errors.append("embed_failed")
+            report.finished_at = datetime.now(UTC)
+            return report
+
+        report.promoted = 1
+        report.source_count = len(candidates)
+        report.new_keys.append(new_key)
+        report.source_keys = [c["key"] for c in candidates]
+
+        # 5. ON_PROMOTE 钩子
+        if self._hooks:
             try:
-                # 2a. LLM 评分(降级 → 用现有 importance)
-                importance = cand["importance"]
-                llm_score = None
-                try:
-                    llm_score_list = await self._llm_scorer.score_batch([cand])
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("consolidate.llm_score_failed err=%s", e)
-                    llm_score_list = None
-                if llm_score_list:
-                    llm_score = llm_score_list[0].get("importance", importance)
-                    importance = float(llm_score)
-
-                # 2b. importance < 0.2 跳过
-                if importance < CONSOLIDATION_TTL_THRESHOLD:
-                    report.skipped_low_importance += 1
-                    continue
-
-                # 2c. 决定 target levels
-                if target_levels is None:
-                    levels_to_write = importance_to_levels(importance)
-                    # daily 触发时,只写 L1(weekly/monthly 由对应 trigger 写)
-                    levels_to_write = [
-                        lv for lv in levels_to_write if lv == MemoryLevel.DAILY
-                    ]
-                else:
-                    levels_to_write = target_levels
-
-                if not levels_to_write:
-                    report.skipped_low_importance += 1
-                    continue
-
-                # 2d. 5W1H 提炼 + 摘要
-                fw1h = self._extractor.extract(cand["content"])
-                if not fw1h.is_valid():
-                    report.skipped_invalid_5w1h += 1
-                    continue
-
-                # 2e. 升格 = 写新条目 + 软删除源条目
-                new_keys = await self._promote(
-                    source=cand,
-                    fw1h=fw1h,
-                    importance=importance,
-                    target_levels=levels_to_write,
+                self._hooks.trigger(
+                    MemoryEventType.ON_PROMOTE,
+                    key=new_key,
+                    source_keys=report.source_keys,
                 )
-                for nk in new_keys:
-                    report.new_keys.append(nk)
-                report.promoted += 1
-                report.forgotten += 1  # 源 fact 软删
-
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "consolidate.promote_failed key=%s err=%s",
-                    cand.get("key", "?"), e,
-                )
-                report.errors.append(cand.get("key", "?"))
-
-        # 3. 触发 ON_PROMOTE 钩子
-        if self._hooks and report.promoted > 0:
-            for nk in report.new_keys:
-                try:
-                    self._hooks.trigger(
-                        MemoryEventType.ON_PROMOTE,
-                        key=nk,
-                        source_keys=report.new_keys,
-                    )
-                except Exception:  # pragma: no cover - hooks 自身已 try/except
-                    pass
+            except Exception:  # pragma: no cover - hooks 自身已 try/except
+                pass
 
         report.finished_at = datetime.now(UTC)
         logger.info(
-            "consolidate.%s scanned=%d promoted=%d skipped_low=%d skipped_invalid=%d errors=%d",
-            level.value,
-            report.candidates_scanned,
-            report.promoted,
-            report.skipped_low_importance,
-            report.skipped_invalid_5w1h,
-            len(report.errors),
+            "consolidate.%s period=%s scanned=%d -> 1 %s summary "
+            "(method=%s importance=%.2f compression=%sx)",
+            level.value, report.period, report.source_count,
+            level.value, method,
+            self._aggregate_importance(candidates),
+            report.compression_ratio,
         )
         return report
 
+    # ------------------- 时间窗 -------------------
+
+    def _resolve_window(
+        self, level: ConsolidationLevel, now: datetime
+    ) -> dict[str, Any]:
+        """按层级算出"扫哪个时间窗" + 给人看的时段描述。"""
+        if level == ConsolidationLevel.DAILY:
+            # 🆕 用户决策:按**自然日**聚合 —— 昨天 00:00-24:00
+            today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            start = today - timedelta(days=1)
+            end = today
+            label = f"昨天 {start.date()} ~ {end.date()}"
+        elif level == ConsolidationLevel.WEEKLY:
+            # 最近 7 天(滚动)
+            end = now
+            start = now - timedelta(days=DAILY_TO_WEEKLY_DAYS)
+            label = f"最近{_DAYS_PER_WEEK}天 {start.date()} ~ {end.date()}"
+        else:
+            # 最近 30 天(滚动)
+            end = now
+            start = now - timedelta(days=WEEKLY_TO_MONTHLY_DAYS)
+            label = f"最近{_DAYS_PER_MONTH}天 {start.date()} ~ {end.date()}"
+
+        return {"since": start, "until": end, "label": label}
+
     # ------------------- 扫描 -------------------
 
-    def _scan_raw_or_unlevel(self, *, limit: int) -> list[dict[str, Any]]:
-        """daily 触发:扫无 level 字段 或 level:raw 的 fact(短期升 L1 的入口)。
-
-        Qdrant 端:用 level 字段 not exists 模拟 —— 退而求其次,客户端过滤。
-        """
-        all_items = self._store.list_keys_by_level(include_deleted=False, limit=limit)
-        out: list[dict[str, Any]] = []
-        for it in all_items:
-            if it.get("level"):  # 已有 level,跳过
-                continue
-            # 转化为 promote 用的字典
-            pl = self._store.get_payload(it["key"])
-            if pl is None or pl.get(PAYLOAD_DELETED):
-                continue
-            out.append({
-                "key": it["key"],
-                "content": it.get("content", ""),
-                "importance": it.get("importance", 0.5),
-                "created_at": it.get("created_at", ""),
-            })
-        return out
-
-    def _scan_level(
+    def _scan(
         self,
-        level: MemoryLevel,
         *,
-        older_than_days: int,
+        level: str | None,
+        since: datetime,
         now: datetime,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """weekly/monthly 触发:扫指定 level 且 age > older_than_days 的 fact。"""
-        from datetime import timedelta
+        """扫时间窗内的 fact(按 level 精确过滤)。
+
+        Args:
+            level: 源层级;"daily" 层级传 ``None`` 表示"无 level 字段"
+                (即 auto_extract 刚写的原始 fact)。
+            since: 窗口起(含)。
+            now: 窗口止(不含 future)。
+            limit: 扫描上限。
+        """
         all_items = self._store.list_keys_by_level(
-            level=level.value, include_deleted=False, limit=limit,
+            level=level, include_deleted=False, limit=limit,
         )
-        cutoff = (now - timedelta(days=older_than_days)).isoformat()
+        since_iso = since.isoformat()
+        now_iso = now.isoformat()
         out: list[dict[str, Any]] = []
         for it in all_items:
-            if it.get("created_at", "") >= cutoff:
-                continue  # 不够老
-            pl = self._store.get_payload(it["key"])
-            if pl is None or pl.get(PAYLOAD_DELETED):
+            created = it.get("created_at", "") or it.get(PAYLOAD_CREATED_AT, "")
+            if not created:
+                continue
+            # 窗口过滤:created_at ∈ [since, now)
+            if created < since_iso or created >= now_iso:
+                continue
+            if it.get(PAYLOAD_DELETED):
                 continue
             out.append({
                 "key": it["key"],
                 "content": it.get("content", ""),
-                "importance": it.get("importance", 0.5),
-                "created_at": it.get("created_at", ""),
+                "importance": float(it.get("importance", 0.5)),
+                "created_at": created,
             })
         return out
 
-    # ------------------- 升格 -------------------
+    # ------------------- 过滤 / 汇总 -------------------
 
-    async def _promote(
+    async def _filter_by_importance(
+        self, candidates: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], int]:
+        """按 importance 过滤(LLM 评分优先,降级用启发式值)。"""
+        try:
+            scored = await self._llm_scorer.score_batch(
+                [{**c, "current_importance": c["importance"]} for c in candidates]
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("consolidate.llm_score_failed err=%s", e)
+            scored = None
+
+        if scored:
+            # 用 LLM 分覆盖 importance
+            for cand, s in zip(candidates, scored):
+                if s.get("importance") is not None:
+                    cand["importance"] = float(s["importance"])
+
+        kept: list[dict[str, Any]] = []
+        skipped = 0
+        for c in candidates:
+            if c["importance"] < self._min_importance:
+                skipped += 1
+                continue
+            kept.append(c)
+        return kept, skipped
+
+    def _aggregate_importance(
+        self, candidates: list[dict[str, Any]]
+    ) -> float:
+        """汇总条目的 importance = 源 fact 的**最大值**。
+
+        为什么取 max 而不是均值:摘要代表这批记忆的整体价值,
+        只要有一条高价值就不该被低估。取均值会被大量低价值闲聊拉低,
+        导致重要事实所在的那天日报 importance 反而偏低。
+        """
+        if not candidates:
+            return 0.5
+        return max(c["importance"] for c in candidates)
+
+    async def _summarize(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        level: MemoryLevel,
+        period: str,
+    ) -> tuple[str, str]:
+        """生成 1 条时段摘要。返回 (摘要文本, 方法:llm/heuristic)。"""
+        summary: str | None = None
+        try:
+            summary = await self._llm_summarizer.summarize_period(
+                candidates, level=level.value, period=period,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("consolidate.summarize_failed err=%s", e)
+            summary = None
+
+        if summary and summary.strip():
+            return summary.strip(), "llm"
+
+        # 降级:启发式拼接
+        fallback = self._summarizer.summarize_text(
+            [c["content"] for c in candidates]
+        )
+        return fallback, "heuristic"
+
+    # ------------------- 写入 -------------------
+
+    async def _write_summary(
         self,
         *,
-        source: dict[str, Any],
-        fw1h: FiveW1H,
+        summary: str,
+        target_level: MemoryLevel,
+        source_keys: list[str],
         importance: float,
-        target_levels: list[MemoryLevel],
-    ) -> list[str]:
-        """升格 = 写新 fact (每 target level 一条) + 软删除源 fact。
-
-        Returns:
-            新写入的 keys(每个 level 一个)。
-        """
-        # 1. 写新 fact(每 target level 一条,level tag 各自不同)
-        # 摘要 = 5W1H 渲染
-        summary = fw1h.render()
+        period: str,
+        source_count: int,
+    ) -> str | None:
+        """把 1 条摘要写进 Qdrant。失败返回 None。"""
+        content = self._render_summary_content(
+            summary=summary,
+            target_level=target_level,
+            period=period,
+            source_count=source_count,
+        )
         try:
-            embedding = await self._embedder.embed(summary)
+            embedding = await self._embedder.embed(content)
         except EmbedderError as e:
-            logger.warning("consolidate.embed_failed source=%s err=%s", source["key"], e)
-            return []
+            logger.warning("consolidate.embed_failed err=%s", e)
+            return None
 
-        new_keys: list[str] = []
-        for lv in target_levels:
-            new_key = f"promoted:{lv.value}:{uuid.uuid4().hex[:12]}"
-            tags = [
-                level_tag(lv),
-                "source_fact:" + source["key"],
-            ]
-            self._store.store_memory(
-                new_key,
-                embedding,
-                summary,
-                importance=importance,
-                tags=tags,
-                level=lv.value,
-                source_keys=[source["key"]],
-            )
-            new_keys.append(new_key)
+        new_key = f"consolidated:{target_level.value}:{uuid.uuid4().hex[:12]}"
+        tags = [
+            level_tag(target_level),
+            f"period:{target_level.value}",
+            f"src_count:{source_count}",
+        ]
+        self._store.store_memory(
+            new_key,
+            embedding,
+            content,
+            importance=importance,
+            tags=tags,
+            level=target_level.value,
+            source_keys=source_keys,
+        )
+        return new_key
 
-        # 2. 软删除源 fact(调 forgetting.ForgettingService 但这里简化,直接打 tag)
-        await self._store.soft_delete(source["key"], reason="promote")
-
-        return new_keys
+    @staticmethod
+    def _render_summary_content(
+        *,
+        summary: str,
+        target_level: MemoryLevel,
+        period: str,
+        source_count: int,
+    ) -> str:
+        """给摘要加个轻量头部,方便 recall 时 LLM 理解这是哪段时间的总结。"""
+        header = {
+            MemoryLevel.DAILY.value: "【日报】",
+            MemoryLevel.WEEKLY.value: "【周报】",
+            MemoryLevel.MONTHLY.value: "【月报】",
+        }.get(target_level.value, "【总结】")
+        return (
+            f"{header}{period}(由 {source_count} 条记忆汇总)\n\n"
+            f"{summary}"
+        )
 
 
 __all__ = [

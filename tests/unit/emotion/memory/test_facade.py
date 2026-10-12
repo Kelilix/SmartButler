@@ -109,24 +109,111 @@ async def test_facade_format_for_prompt_returns_markdown(facade: tuple[MemoryFac
 
 
 @pytest.mark.asyncio
-async def test_facade_format_for_prompt_max_chars_truncate(facade: tuple[MemoryFacade, MemoryHooks, LongTermStore]) -> None:
-    """max_chars 截断。"""
+async def test_facade_format_for_prompt_does_not_truncate(facade: tuple[MemoryFacade, MemoryHooks, LongTermStore]) -> None:
+    """🆕 2026-10-12: **召回优先于 prompt 预算** —— ``max_chars`` 不再裁剪。
+
+    旧行为(已废弃):``max_chars=50`` 会把 100+ 字符的 fact 截断。
+    新行为:召回到什么原样注入什么,``max_chars`` 保留仅为签名兼容。
+
+    为什么:按字符位置截断会把 fact **中段**的关键事实砍掉 ——
+    实测宠物 task fact(8 轮 / 2678 字符)里"养了几个月,蜕过一次皮,
+    足展 5-6 厘米"在位置 1279,被 ``long_budget=1200`` 砍没,LLM 于是
+    回答"没记录过"。单条 fact 上限现由 ``.env`` 的
+    ``SMARTBUTLER_MEMORY_MAX_FACT_CHARS`` 控制(默认 0=不截断)。
+    """
     f, _, _ = facade
     await f.remember("内容 " * 50)  # 100+ 字符
     block = await f.format_for_prompt("内容", k=5, max_chars=50)
-    assert len(block) <= 50 + 3  # 允许 "..." 后缀
+    # 内容完整注入,不因 max_chars=50 被砍
+    assert "内容 " * 50 in block
+    assert len(block) > 50
 
 
 @pytest.mark.asyncio
-async def test_facade_source_isolation(facade: tuple[MemoryFacade, MemoryHooks, LongTermStore]) -> None:
-    """不同 source 的记忆不串。"""
+async def test_truncate_middle_keeps_head_and_tail() -> None:
+    """``_truncate_middle`` 砍中间保首尾(重新启用预算时的行为)。
+
+    保留测试是为了锁住这个函数的语义 —— 它现在默认不生效
+    (``max_fact_chars=0``),但一旦 ``.env`` 调大该值就会走到这里。
+    """
+    from smartbutler.emotion.memory.facade import _truncate_middle
+
+    # limit=None → 原样返回
+    text = "abcdefghij" * 30
+    assert _truncate_middle(text, None) == text
+
+    # 超限时首尾都在
+    out = _truncate_middle(text, 100)
+    assert len(out) <= 100
+    assert out.startswith("a")
+    assert out.endswith("j")
+    assert "省略中间" in out
+
+
+@pytest.mark.asyncio
+async def test_truncate_middle_is_identity_within_limit() -> None:
+    """未超限时 ``_truncate_middle`` 不改动内容。"""
+    from smartbutler.emotion.memory.facade import _truncate_middle
+
+    assert _truncate_middle("短文本", 100) == "短文本"
+
+
+@pytest.mark.asyncio
+async def test_facade_recall_crosses_users(facade: tuple[MemoryFacade, MemoryHooks, LongTermStore]) -> None:
+    """🆕 2026-10-12: 管家记忆是全局池 —— 不按 source 分箱。
+
+    旧行为(已废弃):alice 召回只看得到 alice 的记忆(source tag 过滤)。
+    新行为:管家用单一身份服务所有人,任何用户都能召回所有人的相关事实,
+    由 LLM 综合判断(male 说去上海 / female 说去北京 → 管家应同时看到两条,
+    然后追问"要改成北京吗")。
+    """
     f, _, _ = facade
     await f.remember("Alice 的旅行计划", ctx=MemoryContext(source="alice"))
     await f.remember("Bob 的购物清单", ctx=MemoryContext(source="bob"))
-    # alice 召 → 只看到 alice 的
+    # alice 召 → **也能**看到 bob 的(全局池)
     hits = await f.recall("计划", ctx=MemoryContext(source="alice"), k=5, min_importance=0.0)
-    assert all("Alice" in h["content"] for h in hits)
-    assert not any("Bob" in h["content"] for h in hits)
+    assert any("Alice" in h["content"] for h in hits)
+    assert any("Bob" in h["content"] for h in hits)
+
+
+@pytest.mark.asyncio
+async def test_facade_recall_ignores_source_mismatch(facade: tuple[MemoryFacade, MemoryHooks, LongTermStore]) -> None:
+    """回归:同一事实换个 source 存,另一个 source 也能召回到。
+
+    实测踩坑(2026-10-12):``--user u-male`` 问"火龙果培训内容",
+    库里存的是 ``source=u-male-v3-b-default``,tag 对不上 → 召回为空。
+    这个测试锁死该行为不再回归。
+    """
+    f, _, _ = facade
+    await f.remember(
+        "软件需求分析培训内容有火龙果软件",
+        ctx=MemoryContext(source="u-male-v3-b-default"),
+    )
+    # 用完全不同的 source 查 —— 仍应召回到
+    hits = await f.recall(
+        "火龙果 需求分析 培训", ctx=MemoryContext(source="u-male"), k=5,
+        min_importance=0.0,
+    )
+    assert any("火龙果" in h["content"] for h in hits), (
+        f"换个 source 就召不回了,说明 source 过滤没删干净:{hits}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_facade_recall_still_tags_source(facade: tuple[MemoryFacade, MemoryHooks, LongTermStore]) -> None:
+    """🆕 2026-10-12: 不参与过滤 ≠ 不记录。
+
+    source 仍写进 tags,供 CLI ``memory_cli recall --source`` 人工翻查。
+    """
+    f, _, _ = facade
+    key = await f.remember("带 source 的记忆", ctx=MemoryContext(source="alice"))
+    assert key
+    hits = await f.recall("记忆", k=5, min_importance=0.0)
+    tagged = [h for h in hits if h["content"] == "带 source 的记忆"]
+    assert tagged, "召回结果里找不到刚存的记忆"
+    assert "source:alice" in tagged[0]["tags"], (
+        f"source 没写进 tags:{tagged[0]['tags']}"
+    )
 
 
 @pytest.mark.asyncio

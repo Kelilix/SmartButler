@@ -27,28 +27,31 @@ def test_level_tag_format() -> None:
 
 
 def test_parse_recall_level_default() -> None:
-    """None → RecallLevel.DEFAULT(daily + weekly + permanent)。"""
+    """None → RecallLevel.DEFAULT(daily + weekly + monthly)。
+
+    🆕 2026-10-12:permanent 层停用,默认改为三层全查 —— 聚合后每层
+    条目都很少,全查成本可接受,避免漏层导致答不出来。
+    """
     tags = parse_recall_level(None)
     assert "level:daily" in tags
     assert "level:weekly" in tags
-    assert "level:permanent" in tags
+    assert "level:monthly" in tags
     assert "level:raw" not in tags
-    assert "level:monthly" not in tags
 
 
 def test_parse_recall_level_all() -> None:
-    """RecallLevel.ALL 含 5 层。"""
+    """RecallLevel.ALL 含 4 层(raw + 三层聚合)。"""
     tags = parse_recall_level(RecallLevel.ALL)
-    assert len(tags) == 5
+    assert len(tags) == 4
     assert "level:raw" in tags
     assert "level:monthly" in tags
 
 
 def test_parse_recall_level_string() -> None:
     """接受逗号分隔字符串。"""
-    tags = parse_recall_level("daily,permanent")
+    tags = parse_recall_level("daily,monthly")
     assert "level:daily" in tags
-    assert "level:permanent" in tags
+    assert "level:monthly" in tags
 
 
 def test_parse_recall_level_list_with_prefix() -> None:
@@ -78,24 +81,17 @@ def test_importance_to_levels_daily_only() -> None:
     assert levels == [MemoryLevel.DAILY]
 
 
-def test_importance_to_levels_daily_weekly_monthly() -> None:
-    """0.5-0.8 → L1 + L2 + L3。"""
-    levels = importance_to_levels(0.6)
-    assert levels == [
-        MemoryLevel.DAILY, MemoryLevel.WEEKLY, MemoryLevel.MONTHLY,
-    ]
-    levels = importance_to_levels(CONSOLIDATION_PERMANENT_THRESHOLD - 0.01)
-    assert MemoryLevel.PERMANENT not in levels
+def test_importance_to_levels_is_single_layer() -> None:
+    """🆕 2026-10-12:聚合模型下**任何** importance 都只进 L1。
 
-
-def test_importance_to_levels_includes_permanent() -> None:
-    """≥ 0.8 → L1 + L2 + L3 + L4 permanent。"""
-    levels = importance_to_levels(0.9)
-    assert MemoryLevel.PERMANENT in levels
-    assert levels == [
-        MemoryLevel.DAILY, MemoryLevel.WEEKLY, MemoryLevel.MONTHLY,
-        MemoryLevel.PERMANENT,
-    ]
+    旧实现按 importance 分三级(0.5 → L1+L2,0.8 → +permanent),
+    那是"逐条升格"的遗留。聚合后每条 fact 都先进当期日报,
+    weekly/monthly 由**摘要条目**收敛,不再对单条 fact 分层。
+    """
+    for imp in (0.3, 0.6, 0.9, 1.0):
+        assert importance_to_levels(imp) == [MemoryLevel.DAILY], f"imp={imp}"
+    # permanent 层已停用,任何 importance 都不该产出它
+    assert MemoryLevel.PERMANENT not in importance_to_levels(1.0)
 
 
 def test_level_rank_ordering() -> None:

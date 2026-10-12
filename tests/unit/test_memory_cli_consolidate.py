@@ -24,6 +24,7 @@ def _args(
     archive_path: str = "./data/deleted_archive.db",
     collection: str = "smartbutler_memory",
     vector_size: int = 1024,
+    no_llm: bool = True,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         level=level,
@@ -34,6 +35,8 @@ def _args(
         collection=collection,
         vector_size=vector_size,
         archive_path=archive_path,
+        # 🆕 2026-10-12:测试不调真实 LLM(默认 no_llm=True)
+        no_llm=no_llm,
     )
 
 
@@ -76,8 +79,8 @@ class TestCmdConsolidateDryRun:
         out = capsys.readouterr().out
         assert "DRY RUN" in out
         assert "candidates_scanned" in out
-        # 提示用户先 /remember
-        assert "remember" in out
+        # 🆕 2026-10-12:提示语改成"--no-llm / 去掉 dry-run",不再提 /remember
+        assert "--no-llm" in out
 
     def test_dry_run_level_weekly_uses_7d_threshold(
         self,

@@ -232,8 +232,18 @@ class AutoExtractHook:
                 lines.append(f"{tag} {content}")
             elif role in ("assistant", "ai"):
                 lines.append(f"[assistant] {content[:300]}")
-            elif role == "tool":
-                lines.append(f"[tool] {content[:100]}")
+            # 🆕 2026-10-12: **不再写入 tool 行**。
+            #
+            # 为什么:tool 的 content 是 HTTP 原始响应片段(如
+            # "[HTTP 200, content-type=text/html, length=5022]" + 网页正文),
+            # 对 LLM 回答"页面讲了什么"毫无价值,却有两个害处:
+            #   1. embedding 被 HTML 词表拉偏,和自然语言 query 不对齐;
+            #   2. 挤占字符预算 —— 实测那条课程 fact 里 tool 段占前 189 字符,
+            #      把 assistant 结论段顶到第 189 字符之后,旧的 200 字符
+            #      注入截断正好把结论砍在标签上([assista...])。
+            #
+            # 有价值的结论已经在 assistant 回复里(课程名/费用/报名条件),
+            # tool 噪音只会稀释它。
 
         if lines:
             return "\n".join(lines)

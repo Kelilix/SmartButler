@@ -121,6 +121,7 @@ class TaskScheduler:
         # 修复:按 thread 维护已 judge 过的 message_id,只把新消息喂给 segmenter。
         # message_id 从 LangGraph message.id 提取,稳定且唯一。
         # 只增不减 —— thread 消息只追加,无需回退。
+        # 🆕 Phase 6.5: 初始化为空 dict;在 start() 里从磁盘 load_processed_cursor() 恢复。
         self._processed_ids: dict[str, set[str]] = {}
         # 🔒 修复(2026-10-11):scan 互斥锁 —— 消除并发 judge 导致的重复 task。
         #
@@ -195,13 +196,19 @@ class TaskScheduler:
             return
         self._stopping = False
         self._stop.clear()
-        self._task = asyncio.create_task(self._loop(), name="task-scheduler-loop")
+        # 🆕 Phase 6.5: 从磁盘加载 judge 游标(解决 dev_chat 重启后旧 thread 被重复 judge 的 bug)。
+        # _processed_ids 持久化到 task_index.db,进程启动时读回。
+        # 这样 dev_chat 重启后,之前已 judge 过的 message_id 仍然有效,
+        # 旧 thread 的旧消息不会被重新喂给 segmenter。
+        self._processed_ids = self._task_index.load_processed_cursor()
         logger.info(
-            "task_scheduler.started",
+            "task_scheduler.started (cursor loaded threads=%d)",
+            len(self._processed_ids),
             interval=self._interval,
             on_message=self._on_message_enabled,
             min_interval=self._min_interval,
         )
+        self._task = asyncio.create_task(self._loop(), name="task-scheduler-loop")
 
     async def stop(self) -> None:
         # 🔒 先置"停止中"闸门:**在等任何东西之前**。
@@ -226,6 +233,14 @@ class TaskScheduler:
             self._debounce_handle = None
             self._debounce_pending_thread_id = None
             logger.info("task_scheduler.stop debounce_cancelled")
+
+        # 🆕 Phase 6.5: stop 前最后一次保存游标(确保优雅退出时不丢进度)
+        try:
+            self._task_index.save_processed_cursor(self._processed_ids)
+            logger.info("task_scheduler.stop cursor_saved")
+        except Exception as e:
+            logger.warning("task_scheduler.stop.save_cursor_failed: %s", e)
+
         # 🆕 Phase 6.4 P2: 等所有 fire-and-forget 的 on_message scan 跑完(避免退出会话丢日志)
         #
         # 🔒 2026-10-11: 改成**循环 drain**。原实现只等一次快照,但 scan 持锁
@@ -619,6 +634,15 @@ class TaskScheduler:
             scanned=scanned, actions=actions_total, duration_ms=duration_ms,
             ts=datetime.now(UTC).isoformat(),
         )
+        # 🆕 Phase 6.5: 扫描结束后把游标写回磁盘。
+        # 这样 dev_chat 重启后能恢复上次的进度。
+        # 代价:每轮 scan 多一次 SQLite 写,约等于毫秒级,可接受。
+        # 进程 crash 时最多丢失最近一轮的游标(重判代价可接受)。
+        try:
+            self._task_index.save_processed_cursor(self._processed_ids)
+        except Exception as e:
+            logger.warning("task_scheduler.save_cursor_failed: %s", e)
+
         return {
             "scanned": scanned,
             "actions": actions_total,

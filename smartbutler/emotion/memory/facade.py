@@ -35,6 +35,52 @@ from smartbutler.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _resolve_max_fact_chars() -> int | None:
+    """从 :class:`MemorySettings` 读单条 fact 注入上限,0 → ``None``(不截断)。
+
+    🆕 2026-10-12:原先是模块常量 ``_MAX_FACT_CHARS``,改读 ``.env``:
+    ``SMARTBUTLER_MEMORY_MAX_FACT_CHARS``,默认 0 = 不截断
+    (用户决策:召回优先于 prompt 预算,详见 :mod:`smartbutler.config.memory`)。
+
+    读取失败(比如 pydantic_settings 不可用)→ 退化为不截断,
+    保证"配置坏了也不能让记忆内容丢失"。
+    """
+    try:
+        from smartbutler.config.memory import load_memory_settings
+
+        value = load_memory_settings().max_fact_chars
+    except Exception as e:  # noqa: BLE001
+        logger.warning("facade.max_fact_chars_load_failed,按不截断处理: %s", e)
+        return None
+    return value or None
+
+
+def _truncate_middle(text: str, limit: int | None) -> str:
+    """超长文本截断:**保留首尾**,砍掉中间。``limit=None`` → 原样返回。
+
+    为什么不是直接 ``text[:limit]``:fact 是多轮对话流拼接,关键事实
+    可能在任意轮次(宠物 case 里在第 5 轮 / 位置 1279)。只保留头部
+    会把结论整段丢掉,LLM 就会答"我没记录过"。
+
+    首尾各留一半,中间用 ``...(\\n[省略 N 字符]\\n...)`` 标记,
+    让 LLM 知道这里有省略、不是用户没说过。
+
+    当前默认上限为 ``None``(不截断),本函数在重新启用预算时才生效;
+    保留它是为了不必重写。
+    """
+    if limit is None or len(text) <= limit:
+        return text
+
+    marker_budget = 40
+    keep = limit - marker_budget
+    head = keep // 2
+    tail = keep - head
+    dropped = len(text) - keep
+    marker = f"...\n[省略中间 {dropped} 字符]\n..."
+
+    return text[:head] + marker + text[-tail:]
+
+
 @dataclass
 class MemoryContext:
     """调用方提供的上下文(全部可空,空 = 单用户模式)。"""
@@ -228,6 +274,23 @@ class MemoryFacade:
     ) -> list[dict[str, Any]]:
         """召回相关记忆。语义检索 + 重要性过滤 + 时间衰减。
 
+        🆕 2026-10-12: **不再按 ``ctx.source`` 过滤**。
+
+        原因:管家是**面向所有用户的单一实体**,记忆池是全局的,
+        不按说话人分箱。正确的语义是——
+        male 用户说"下周三去上海"、female 用户说"下周三去北京",
+        任一方问"行程"时都应该召回**两条**,由 LLM 综合判断并追问
+        "male 说过下周三去上海,要改成北京吗?"。
+
+        旧实现用 ``tag=f"source:{ctx.source}"`` 过滤,导致:
+        - A 用户存的事实,B 用户(哪怕问的是同一件事)召不回
+        - 实测踩坑:``--user u-male`` 问"火龙果培训内容",
+          库里存的是 ``source=u-male-v3-b-default``,tag 对不上 → 召回为空
+        - 同一个人换个 user_id 命名(如测试脚本 vs 正式跑)就"失忆"
+
+        ``ctx.source`` 仍会写进 tags(供**人工排查/CLI 按 source 翻查**用,
+        见 ``memory_cli recall --source``),只是不再参与召回过滤。
+
         Args:
             min_score: 相似度下限(0-1,作用在归一化 raw_norm)。
                 低于此值丢弃,避免噪声进 prompt。
@@ -238,16 +301,15 @@ class MemoryFacade:
             return []
         if min_score is None:
             min_score = self._min_score
-        tag: str | None = None
-        if ctx and ctx.source:
-            tag = f"source:{ctx.source}"
         logger.info("facade.recall start query=%r k=%d min_importance=%.2f min_score=%.2f",
                     query[:50], k, min_importance, min_score)
         hits = await self._retriever.recall(
             query,
             k=k,
             min_importance=min_importance,
-            tag=tag,
+            # ⚠️ tag 恒为 None —— 管家记忆是全局池,不按 source 分箱(2026-10-12)。
+            # 要按 source 查请走 memory_cli recall --source(CLI 层显式传 tag)。
+            tag=None,
             min_score=min_score,
         )
         for h in hits:
@@ -269,9 +331,15 @@ class MemoryFacade:
     ) -> str:
         """召回 + 格式化成可注入 system prompt 的 markdown 片段。
 
-        🆕 Phase 6.3 P2: 先拼短库 task 窗口,再拼长期 recall。
-        短库占 ``max_chars * _short_term_ratio``,长期占剩余。
-        短库 / 长期任一失败 → 跳过该部分,不抛。
+        先拼短库 task 窗口,再拼长期 recall。短库 / 长期任一失败 →
+        跳过该部分,不抛。
+
+        🆕 2026-10-12:**不做总预算截断**(召回优先于 prompt 预算)。
+        ``max_chars`` 保留仅为签名兼容 + 将来重新引入预算控制时使用,
+        当前不参与裁剪 —— 实测按 max_chars 裁剪会把 fact 中段的关键事实
+        砍掉(详细踩坑记录见 :func:`_resolve_max_fact_chars`)。
+        单条 fact 的上限由 ``SMARTBUTLER_MEMORY_MAX_FACT_CHARS`` 控制,
+        默认 0 = 不截断。
         """
         # ---- 1. 短期库 view(2.5.1.2)----
         short_block = ""
@@ -312,21 +380,24 @@ class MemoryFacade:
             lines: list[str] = [f"### 相关历史记忆(共 {len(hits)} 条)"]
             for h in hits:
                 content = h.get("content", "")
-                if len(content) > 200:
-                    content = content[:197] + "..."
+                # 截断上限读 .env(`SMARTBUTLER_MEMORY_MAX_FACT_CHARS`),
+                # 默认 0 = 不截断(用户决策:召回优先于 prompt 预算)。
+                # 详细踩坑记录见 `_resolve_max_fact_chars` docstring。
+                content = _truncate_middle(content, _resolve_max_fact_chars())
                 lines.append(f"- {content}")
             long_block = "\n".join(lines)
 
-        # ---- 3. 拼装 + 限额分配 ----
-        if not short_block and not long_block:
-            return ""
-        # 短库占比 40%,长期占 60%(可调)
-        short_budget = int(max_chars * self._short_term_ratio)
-        long_budget = max_chars - short_budget
-        if short_block and len(short_block) > short_budget:
-            short_block = short_block[: short_budget - 3] + "..."
-        if long_block and len(long_block) > long_budget:
-            long_block = long_block[: long_budget - 3] + "..."
+        # ---- 3. 拼装 ----
+        #
+        # 🆕 2026-10-12 用户决策:**召回优先于 prompt 预算**。
+        # 原来这里按 `max_chars` 拆分 short/long 配额再各自截断,但实测会
+        # 把 fact 中段的关键事实砍掉(宠物 case:足展/年龄在位置 1279,
+        # long_budget=1200 直接砍没),LLM 于是答"没记录"。
+        #
+        # 所以现在**不做总预算裁剪**:召回到的内容原样注入,保证完整。
+        # `max_chars` 参数保留(签名兼容 + 将来重新引入预算时用),
+        # 当前不参与裁剪;单条 fact 的上限另由 .env 控制
+        # (`SMARTBUTLER_MEMORY_MAX_FACT_CHARS`,默认 0=不截断)。
         parts: list[str] = []
         if short_block:
             parts.append(short_block)
