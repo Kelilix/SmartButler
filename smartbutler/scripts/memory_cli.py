@@ -468,6 +468,250 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
     return 0
 
 
+# ===========================================================================
+# clear-all: 一键清空所有长短期记忆(危险操作!)
+#
+# 范围:
+#   1. 长期记忆 active + soft-deleted points(Qdrant collection)
+#   2. 长期记忆 archived SQLite 备份表(deleted_archive.db)
+#   3. 短期记忆(LangGraph checkpoints + writes,short_term.db)
+#
+# 实现策略(为什么用 delete_collection 而不是 scroll 全部 id 再 delete):
+#   - 一条条删 / 分批 delete 都依赖 scroll 拿全 id(>10K 还要翻页),
+#     慢、占内存、还要对每条算 point_id(hash)再 delete,容易漏
+#   - 嵌入式 Qdrant 的 collection 本质是一个目录,删了重建是 OS 级最干净
+#   - 重建是 _client.delete_collection + 下次 upsert 时按 vector_size/distance
+#     自动建(见 QdrantStorage 的"集合自动创建"逻辑)
+#
+# 短期记忆:SqliteSaver 的存储表是 ``checkpoints`` + ``writes``(LangGraph
+#   标准 schema),直接 ``DELETE FROM`` 两个表 + VACUUM 释放空间。
+#
+# 可选 [4]:data/task_index.db(6.5 task scheduler 状态)——
+#   跟"长短期记忆"是不同子系统,所以默认不动。
+#   加 ``--include-task-index`` 才一并清(用户决策:
+#   "管家所有内部状态全清"才传这个开关)。
+# ===========================================================================
+
+
+def cmd_clear_all(args: argparse.Namespace) -> int:
+    """clear-all: 一键清空所有长短期记忆。
+
+    危险操作 —— 三重安全检查:
+    1. ``--confirm yes`` 必须显式传
+    2. ``--yes-i-know-this-deletes-everything`` 必须显式传
+    3. ``--dry-run`` 默认开启(只打印会做什么,不动数据)
+    """
+    if args.confirm != "yes":
+        print(
+            "ERROR: --confirm must be 'yes' to proceed.\n"
+            "  Example: memory_cli clear-all --confirm yes --yes-i-know-this-deletes-everything",
+            file=sys.stderr,
+        )
+        return 2
+    if not getattr(args, "yes_i_know", False):
+        print(
+            "ERROR: 必须显式传 --yes-i-know-this-deletes-everything 作为最后一道防线。\n"
+            "  防止误操作删除全部记忆。",
+            file=sys.stderr,
+        )
+        return 2
+
+    dry = args.dry_run
+
+    # ----- 1) 长期记忆:Qdrant collection -----
+    long_path = Path(args.qdrant_path) if args.qdrant_path else None
+    long_url = args.qdrant_url
+    collection = args.collection
+
+    print("=" * 60)
+    print(" clear-all: 计划清空的项")
+    print("=" * 60)
+    print(f"  [1] 长期记忆 Qdrant collection")
+    print(f"      collection = {collection!r}")
+    print(f"      mode       = {'server' if long_url else 'embedded'}")
+    if long_path is not None:
+        print(f"      path       = {long_path}")
+    if long_url is not None:
+        print(f"      url        = {long_url}")
+    print()
+    print(f"  [2] 长期记忆 archived SQLite 备份表")
+    archive_path = Path(args.archive_path)
+    print(f"      path       = {archive_path}")
+    print()
+    print(f"  [3] 短期记忆 short-term SQLite")
+    stm_path = Path(args.stm_path)
+    print(f"      path       = {stm_path}")
+    if getattr(args, "include_task_index", False):
+        print()
+        print(f"  [4] Task 切分索引 SQLite(6.5 task scheduler 状态)")
+        ti_path = Path(args.task_index_path)
+        print(f"      path       = {ti_path}")
+    else:
+        print()
+        print(f"  [ℹ️ ] Task 切分索引 (data/task_index.db) 默认不动。")
+        print(f"        加 --include-task-index 一并清空(同时清空 tasks / task_messages / _processed_cursor)。")
+    print()
+
+    if dry:
+        print("⚠️  DRY RUN: 上面是要清的内容,实际未执行。")
+        print("   去掉 --dry-run 并加 --yes-i-know-this-deletes-everything 真跑。")
+        return 0
+
+    # ----- 1) 真跑:Qdrant collection -----
+    print("[1/3] 清空 Qdrant collection ...")
+    try:
+        store = _build_store(args)
+        q = store.qdrant
+        client = q._client  # noqa: SLF001 —— CLI 工具用,明确接受私有访问
+        collection_name = q.collection
+
+        # 存在性检查:不存在的 collection 走 recreate 反而要算 vector_size,
+        # 直接吞 not-found 异常更简单
+        try:
+            client.delete_collection(collection_name=collection_name)
+            print(f"      ✅ deleted collection {collection_name!r}")
+        except Exception as e:  # noqa: BLE001
+            # 服务模式下 collection 不存在会抛 UnexpectedResponse;嵌入式不存在会静默
+            err_name = type(e).__name__
+            if "NotFound" in err_name or "404" in str(e):
+                print(f"      ℹ️  collection {collection_name!r} 不存在,跳过")
+            else:
+                raise
+        # 重建空的 collection,这样下次 store_memory() 不用 lazy create,
+        # 避免冷启动首次 remember() 报"collection 不存在"
+        try:
+            from qdrant_client.models import Distance, VectorParams
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(
+                    size=q._vector_size,  # noqa: SLF001
+                    distance=Distance.COSINE,
+                ),
+            )
+            print(f"      ✅ recreated empty collection {collection_name!r}")
+        except Exception as e:  # noqa: BLE001
+            # 已存在也不致命(可能 service 模式有 race),让 store_memory 兜底
+            print(f"      ⚠️  recreate 跳过({type(e).__name__}: {e})")
+    except Exception as e:  # noqa: BLE001
+        # 关键:dev_chat 还在跑时,_build_store 会抛 AlreadyLocked
+        # 这种情况必须给清晰报错
+        err_name = type(e).__name__
+        if "AlreadyLocked" in err_name or "Permission" in err_name:
+            print(
+                f"      ⚠️  嵌入式 Qdrant 被另一个进程锁着(可能是 dev_chat 还活着)。\n"
+                f"          退出 dev_chat 再跑 clear-all 才安全。\n"
+                f"          ({err_name}: {e})",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"      ❌ Qdrant 清空失败:{err_name}: {e}", file=sys.stderr)
+        return 1
+
+    # ----- 1b) 物理兜底:嵌入式 Qdrant 残留 storage.sqlite 不会被 delete_collection 真正回收
+    # delete_collection 只改内存视图(嵌入式是 RAM 索引),磁盘 storage.sqlite 留着旧 points。
+    # 重建 collection 不会覆盖旧文件。QdrantClient 析构会刷盘,但 CLI 进程退出时 Windows
+    # portalocker 析构会报 NoneType 告警(已知 Qdrant 1.19 bug)——关闭 client 后再 rmtree
+    # 物理子目录,下次启动会让 QdrantClient 重建空 collection。
+    if not args.qdrant_url:
+        # 嵌入式模式才需要这个兜底
+        try:
+            qdrant_path = Path(str(q._path))  # noqa: SLF001
+            coll_dir = qdrant_path / "collection" / collection_name
+            # 先显式关 client(否则 portalocker 锁住无法删)
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if coll_dir.exists():
+                import shutil
+                shutil.rmtree(coll_dir)
+                print(f"      🧹 物理清理残留 collection 目录:{coll_dir}")
+        except Exception as e:  # noqa: BLE001
+            # 兜底失败也不致命(delete_collection + create_collection 已经在内存层面生效)
+            print(f"      ⚠️  物理清理失败(不影响逻辑清空):{type(e).__name__}: {e}", file=sys.stderr)
+
+    # ----- 2) 真跑:archived SQLite -----
+    print("[2/3] 清空 archived SQLite 备份表 ...")
+    if not archive_path.exists():
+        print(f"      ℹ️  备份文件不存在,跳过:{archive_path}")
+    else:
+        n = _wipe_sqlite(archive_path)
+        if n is None:
+            return 1
+        print(f"      ✅ 删了 {n} 行")
+
+    # ----- 3) 真跑:short-term SQLite -----
+    print("[3/3] 清空短期记忆 SQLite ...")
+    if not stm_path.exists():
+        print(f"      ℹ️  短期记忆文件不存在,跳过:{stm_path}")
+    else:
+        n = _wipe_sqlite(stm_path)
+        if n is None:
+            return 1
+        print(f"      ✅ 删了 {n} 行")
+
+    # ----- 可选 [4]:Task 切分索引 -----
+    if getattr(args, "include_task_index", False):
+        ti_path = Path(args.task_index_path)
+        print("[4/4] 清空 Task 切分索引 SQLite ...")
+        if not ti_path.exists():
+            print(f"      ℹ️  索引文件不存在,跳过:{ti_path}")
+        else:
+            n = _wipe_sqlite(ti_path)
+            if n is None:
+                return 1
+            print(f"      ✅ 删了 {n} 行")
+
+    print()
+    print("=" * 60)
+    if getattr(args, "include_task_index", False):
+        print(" ✅ clear-all 完成。所有长短期记忆 + Task 索引已清空。")
+    else:
+        print(" ✅ clear-all 完成。所有长短期记忆已清空(Task 索引未动)。")
+    print("=" * 60)
+    return 0
+
+
+def _wipe_sqlite(path: Path) -> int | None:
+    """清空一个 SQLite 文件里的所有表(全 DELETE + VACUUM)。
+
+    Args:
+        path: SQLite 文件路径(只读模式不能 DELETE,所以这里是读写)。
+
+    Returns:
+        删掉的行数;文件不存在返回 None(不致命);异常也返回 None 并打 stderr(致命)。
+    """
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(path), timeout=5.0)
+    except Exception as e:  # noqa: BLE001
+        print(f"      ❌ 打开失败:{type(e).__name__}: {e}", file=sys.stderr)
+        return None
+    try:
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [r[0] for r in cur.fetchall()]
+        if not tables:
+            print(f"      ℹ️  没有表(可能文件是空的):{path}")
+            return 0
+        n_total = 0
+        for tbl in tables:
+            n = conn.execute(f"SELECT COUNT(*) FROM \"{tbl}\"").fetchone()[0]
+            conn.execute(f"DELETE FROM \"{tbl}\"")
+            n_total += n
+        conn.commit()
+        # VACUUM 释放磁盘空间(失败不致命,数据已清)
+        try:
+            conn.execute("VACUUM")
+        except Exception as ve:  # noqa: BLE001
+            print(f"      ⚠️  VACUUM 失败(数据已清):{ve}")
+        return n_total
+    except Exception as e:  # noqa: BLE001
+        print(f"      ❌ 清空失败:{type(e).__name__}: {e}", file=sys.stderr)
+        return None
+    finally:
+        conn.close()
+
+
 def cmd_dump(args: argparse.Namespace) -> int:
     """dump: 翻出 Qdrant 里的原始 points(看"到底存了什么")。
 
@@ -998,6 +1242,10 @@ def main(argv: list[str] | None = None) -> int:
         "--stm-path", default="data/short_term.db",
         help="短期记忆 SQLite 路径(短期记忆子命令用)",
     )
+    parser.add_argument(
+        "--task-index-path", default="data/task_index.db",
+        help="Task 切分索引 SQLite 路径(clear-all --include-task-index 用)",
+    )
     subparsers = parser.add_subparsers(dest="cmd", required=True)
 
     # list-deleted
@@ -1250,6 +1498,39 @@ def main(argv: list[str] | None = None) -> int:
         "--verbose", "-v", action="store_true", help="连 metadata 一起打",
     )
     p_str.set_defaults(func=cmd_st_raw)
+
+    # clear-all(危险:一键清空所有长短期记忆)
+    p_clear = subparsers.add_parser(
+        "clear-all",
+        help="⚠️  一键清空所有长短期记忆(长期 active+soft-deleted+archived,短期全部)",
+    )
+    p_clear.add_argument(
+        "--confirm", default="no", choices=["yes", "no"],
+        help="必须是 'yes' 才执行(第一道确认)",
+    )
+    p_clear.add_argument(
+        "--yes-i-know-this-deletes-everything",
+        dest="yes_i_know", action="store_true", default=False,
+        help="显式确认(第二道防线,防止误操作)",
+    )
+    p_clear.add_argument(
+        "--dry-run", dest="dry_run", action="store_true", default=True,
+        help="(默认) 只显示会清什么,不动数据",
+    )
+    p_clear.add_argument(
+        "--no-dry-run", dest="dry_run", action="store_false",
+        help="真跑(慎用!清空后无法恢复)",
+    )
+    p_clear.add_argument(
+        "--include-task-index", dest="include_task_index",
+        action="store_true", default=False,
+        help=(
+            "额外清空 data/task_index.db(6.5 task scheduler 状态:"
+            "tasks / task_messages / _processed_cursor)。"
+            "默认不动,需显式 opt-in"
+        ),
+    )
+    p_clear.set_defaults(func=cmd_clear_all)
 
     args = parser.parse_args(argv)
     return args.func(args)

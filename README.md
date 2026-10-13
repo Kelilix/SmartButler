@@ -2,8 +2,8 @@
 
 > 有性格、有记忆、懂上下文的家用智能管家。
 >
-> **当前版本**:`v0.2.12`(`7` 个 commit;`545 unit + 5 integration + 24 e2e` 全部 ✅)。
-> **下一站**:Phase 6.3(4 层分片 + 固化 + 遗忘,详细设计见 `docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1)。
+> **当前版本**:`v0.3.0`(`9` 个 commit;`773 unit + 5 integration + 24 e2e` 全部 ✅)。
+> **下一站**:Phase 6.7(Learn 反馈事件流 + trait 演化触发器,接 `Personality.adjust_trait()`)。
 > **详细方案**:`docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md`(Memory 4 个子阶段设计)。
 > **架构总图**:`docs/TECHNICAL_DESIGN.md`(若不存在,见 git 历史 commit `828337e`)。
 
@@ -42,8 +42,8 @@ SmartButler 是部署在家庭里、和主人长期相处的**单一智能体实
 | **Phase 6.3** | Memory:4 层分片 + 固化 + 遗忘 + vacuum | ⏳ **下一站** | `consolidation.py`(L1/L2/L3 升格管道 + LLM 评分)+ `forgetting.py`(5 类遗忘 + 软删除)+ `levels.py`(4 层 tag)+ `summarizer.py`(5W1H 提炼)+ `task_boundary.py` + `vacuum.py`(双时间窗 7+30 天) + `archive_store.py` + `scripts/memory_cli.py`(手动 CLI)。详见 `docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1(含 §2.5.1.16) |
 | **Phase 6.4** | Memory:episodic + 跨层 rollup | ⏳ | `summarizer.py`(5W1H 提炼,已在 6.3)+ `episodic.py`(情景记忆,SQLite JSON) |
 | **Phase 6.5** | Memory:habit + cross-thread | ⏳ | `habit.py` + `cross_thread.py`(为 Phase 6b 留 hook) |
-| **Phase 6.6** | Personality | ⏳ | 静态 traits + injector + 接受用户显式指令 |
-| **Phase 6.7** | Learn | ⏳ | 反馈事件流 + trait 映射 + 触发 `personality.evolve()` |
+| **Phase 6.6** | Personality | ✅ | `emotion/personality/traits.py` + `loader.py`(YAML frontmatter md)+ `injector.py`(渲染 system prompt 片段);`ButlerPromptBuilder` 加 `personality_block` 参数;`ButlerOrchestrator.reload_personality()` 接 Learn 演化。详见 `README §2.7` 注释 |
+| **Phase 6.7** | Learn | ⏳ | 反馈事件流 + trait 映射 + 触发 `Personality.adjust_trait()` |
 | **Phase 6b** | ProactiveLoop 真实化 | ⏳(必须等 6 完成) | `LLMProactiveReasoning` 接 Memory + Persona + LLM 推理;`RuleBasedProactiveReasoning` **永不被删**(安全网) |
 | **Phase 7** | 事件驱动 + 路由 | 🟡 骨架(接口已就位,0 行实现) | `EventNormalizer` / `EventTrigger.route()` / 设备适配器 |
 | **Phase 8** | 核心 Sub-Agent | ⏳ | `HomeAgent`(HomeAssistant)/ `ScheduleAgent` / `SearchAgent` |
@@ -64,8 +64,8 @@ SmartButler 是部署在家庭里、和主人长期相处的**单一智能体实
 | **6.3 P1** Memory:4 层分片 + 固化 + 遗忘 + vacuum | `emotion/memory/{consolidation,forgetting,levels,summarizer,task_boundary,vacuum,archive_store}.py` + `scripts/memory_cli.py` | **~1060 行 + ~40 测试 + 2 e2e** | LLM 评分 + 5W1H 提炼 + 4 层 tag + 双时间窗 vacuum(7+30 天) | 6.2 ✅ + 用户产生"记太多/记错"反馈。**详细设计**:`docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1(含 §2.5.1.16 vacuum 治理) |
 | **6.4 P1** Memory:episodic + 跨层 rollup | `emotion/memory/{episodic,hierarchical_rollup}.py` | ~150 行 + ~10 测试 | 6.3 已有 4 层分片,6.4 只补对话轨迹 | 6.3 ✅ + 用户问"最近 3 个月偏好" |
 | **6.5 P1** Memory:能力补全 | `emotion/memory/{habit,cross_thread}.py` | ~150 行 | 6.4 的 summarizer | 6.4 ✅ + Phase 6b 启动 |
-| **6.6** Personality | `emotion/personality/{traits,state,injector}.py` | ~200 行 | **不依赖 6.5**——空壳 personality 独立可测 | 6.5 ✅(实际 6.1 即可并行) |
-| **6.7** Learn | `emotion/learn/{feedback_log,signal,evolution_hook}.py` | ~200 行 | 6.6 `personality.evolve()` | 6.6 ✅ |
+| **6.6** Personality | `emotion/personality/{traits,loader,injector}.py` | **~350 行 + ~77 测试** | **不依赖 6.5**——空壳 personality 独立可测 | 6.5 ✅(实际 6.1 即可并行) |
+| **6.7** Learn | `emotion/learn/{feedback_log,signal,evolution_hook}.py` | ~200 行 | 6.6 `personality.adjust_trait()` | 6.6 ✅ |
 
 **Phase 6 总自研量**:~1250 行 + ~50 测试,约 3-4 周。
 
@@ -83,6 +83,15 @@ SmartButler 是部署在家庭里、和主人长期相处的**单一智能体实
 - **R3 QwenEmbedder 限流/不可用**:Qwen 429/401/超时 → `StubEmbedder`(hash → 1024 维)接管,recall 精度降级但管家不崩。
 - **R4 consolidation 升格过快/过慢**(待 6.3):重要性分级([0.0, 0.2)/[0.2, 0.5)/[0.5, 0.8)/[0.8, 1.0] 4 档)容易把琐事升 L1 / 关键约定漏升 L4——6.3 单测必须 4 档各 ≥ 5 case + importance 重评分用例 ≥ 3 case。
 
+### 2.4.1 Phase 6.6 关键决策(2026-10-13)
+
+- **Personality 纯自研,不用 LangChain**——LangChain 没有"personality"模块,只有 prompt 模板工具,自研 ~350 行更可控。
+- **数据/行为分层**:Personality 是**数据**(Pydantic + trait 数值),不是 Agent;Learn(6.7)才是**行为**(触发 trait 调整)。
+- **5 个内置 trait**:`formality` / `humor` / `verbosity` / `warmth` / `proactiveness`,值域 [0, 1],Pydantic Field + 防御性 validator 双重约束。
+- **配置文件用 md 不用 YAML**:`personality.md` 走 YAML frontmatter(跟 SKILL.md 格式一致)+ body 自由注释;加载失败/缺字段全部降级到默认 Personality,管家不崩。
+- **三档翻译**:trait 数值 → low/mid/high → 中文档位描述("严肃认真"/"偶尔轻松"/"幽默风趣"),让 LLM 看到的是自然语言不是裸数字。
+- **不变量维持**:Personality 严格不调 LLM(不变量 #3);`Personality.adjust_trait()` 是数据 mutator,Learn 阶段调它+`orchestrator.reload_personality()` 刷缓存。
+
 ### 2.5 已交付的代码模块
 
 | 模块 | 路径 | 状态 | 说明 |
@@ -99,22 +108,22 @@ SmartButler 是部署在家庭里、和主人长期相处的**单一智能体实
 | Thinking(Proactive) | `smartbutler/thinking/proactive/` + `thinking/loop/proactive_loop.py` | ✅ 框架 | `RuleBasedProactiveReasoning`(降级后备,URGENT 主动 / 5min dedup / 其他沉默)+ `ProactiveDecision/Result` + 双循环架构。**真实化见 Phase 6b** |
 | 事件总线骨架 | `smartbutler/events/` | 🟡 骨架 | `EventBus` + 设备/语音/定时器事件协议 + `EventNormalizer`(接口)+ `EventTrigger.route()`(接口)+ `AnswerRouter`。**只放协议 + 抽象接口,0 行实现**——真实路由等 Phase 7 |
 | 情感层 - Memory | `smartbutler/emotion/memory/` | ✅ 6.1+6.2 P0 | `ShortTermMemory`(`AsyncSqliteSaver` 持久化 + 降级 `InMemorySaver`)+ `LongTermStore`(接 `QdrantStorage` 向量检索 + range query 服务端过滤)+ **`MemoryFacade`**(thinking 唯一入口 `remember`/`recall`/`format_for_prompt`)+ `MemoryHooks`(4 事件 + 异常隔离)+ `MemoryRetriever`(Embedder + Qdrant + 时间衰减重排)+ `ImportanceScorer`(启发式,P0 不调 LLM) |
-| 情感层 - Personality | `smartbutler/emotion/personality/` | ⏳ Phase 6.6 | 当前空目录,只占位 |
+| 情感层 - Personality | `smartbutler/emotion/personality/` | ✅ 6.6 | `Personality`(Pydantic)+ `TraitDimension`([0,1] 约束 + 防御性夹紧)+ 5 个内置 trait(formality/humor/verbosity/warmth/proactiveness)+ `adjust_trait(delta/new_value, source)` + `replace_guidelines()` + `to_dict/from_dict`;`load_personality(path=None)` 找 `<cwd>/personality.md` → `~/.smartbutler/personality.md` → 默认值(降级闭合);`save_personality()` 写 YAML frontmatter;`render_persona_block()` 三档翻译(low/mid/high)→ system prompt 片段;**Personality 严格不调 LLM**(不变量 §2.3);Learn 阶段调 `Personality.adjust_trait()` + `orchestrator.reload_personality()` |
 | 情感层 - Learn | `smartbutler/emotion/learn/` | ⏳ Phase 6.7 | 当前空目录,只占位 |
 | Skill 运行时 | `smartbutler/thinking/skills/` | ✅ Phase 5 | `SkillRuntime` + `Scanner` + 6 个文件工具 + 3 类路径 × 3 类模式权限(`allow`/`deny`/`interrupt`)+ `prompt_renderer` + `skill_admin` |
 | Skills 资源 | `smartbutler/skills/` | ✅ | 内置 skill 目录(`builtin/`)+ 用户级目录(`~/.smartbutler/skills/`,不存在静默跳过) |
 
-### 2.6 测试统计(实测,2026-10-10)
+### 2.6 测试统计(实测,2026-10-13)
 
 | 类别 | 数量 | 启用方式 | 覆盖 |
 |------|------|----------|------|
-| **单元测试** | **545** ✅ 全过 | `pytest tests/unit`(默认全跑) | capabilities(llm/tools/embedding/langmem)+ agents + thinking(loop/proactive/skills)+ emotion(memory)+ storage + config + logging |
+| **单元测试** | **773** ✅ 全过 | `pytest tests/unit`(默认全跑) | capabilities(llm/tools/embedding/langmem)+ agents + thinking(loop/proactive/skills)+ emotion(memory/personality)+ storage + config + logging |
 | **集成测试** | **5** | `pytest -m integration`(默认 skip) | TestTimeAgent 端到端(2)+ LLM 实时连通(3) |
 | **E2E 测试** | **24** | `pytest -m e2e`(默认 skip) | LLM 流式连通(14)+ **memory + thinking 端到端 10**(Phase 6.2 P0 新增) |
 
 > 数字实测命令:
 > ```bash
-> pytest tests/unit --collect-only        # → 545 tests collected
+> pytest tests/unit --collect-only        # → 773 tests collected
 > pytest tests/integration --collect-only # → 5
 > pytest tests/e2e --collect-only        # → 24
 > ```
@@ -123,8 +132,7 @@ SmartButler 是部署在家庭里、和主人长期相处的**单一智能体实
 ### 2.7 下次开工的待办(按 phase 排序)
 
 - [ ] **Phase 6.3:Memory 4 层分片 + 固化 + 遗忘 + vacuum**(~1060 行,~2-3 周)—— `emotion/memory/levels.py`(4 层 tag 规则)+ `consolidation.py`(L1/L2/L3 升格管道 + LLM 评分)+ `forgetting.py`(5 类遗忘 + 软删除 + 恢复)+ `summarizer.py`(5W1H 提炼 + LLM 摘要)+ `task_boundary.py`(短期 task 切分)+ `vacuum.py`(双时间窗 7+30 天 vacuum + VacuumReport)+ `archive_store.py`(archived SQLite 备份表)+ `scripts/memory_cli.py`(手动 CLI 入口)+ facade 加 6 个新 API(`consolidate` / `forget` / `restore` / `list_deleted` / `purge_now` / `vacuum_stats`)。**核心交付**:① 管家说"上周你订了去北京的票"(L2 weekly 召回)② 30 天前的开灯琐事自动软删(TTL)③ `python -m smartbutler.scripts.memory_cli vacuum --dry-run` 手动清软删,容量稳态只多 400 条(3MB)。**详细设计**: `docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1(2026-10-10 敲定,含 §2.5.1.16 vacuum 治理)。**触发条件**:6.2 P0 跑通 ✅ + 用户产生"记太多/记错"反馈。
-- [ ] **Phase 6.6:Personality**(~200 行,~1 周)—— 静态默认 traits + injector 拼 system_prompt + 接受用户显式指令。**不依赖 6.3+**——空壳 personality 独立可测。
-- [ ] **Phase 6.7:Learn**(~200 行,~1 周)—— 显式/隐式反馈事件流 + 反馈→trait 映射规则 + 触发 `personality.evolve()`。**严格不实现"自动生成 skill"**。
+- [ ] **Phase 6.7:Learn**(~200 行,~1 周)—— 显式/隐式反馈事件流 + 反馈→trait 映射规则 + 触发 `personality.adjust_trait()` + 调 `orchestrator.reload_personality()` 刷缓存。**严格不实现"自动生成 skill"**。**前置**:6.6 Personality ✅(已完成 traits / loader / injector,Learn 只调现成 API)。
 - [ ] **Phase 6b:ProactiveLoop 真实化**(~2-3 周,**必须等 Phase 6 完成后启动**)—— `LLMProactiveReasoning` 接 Memory + Persona + LLM 推理;`RuleBasedProactiveReasoning` **永不被删**(安全网,URGENT 事件 LLM 不可用时也要能主动开口)。
 - [ ] **Phase 7 真实实现**(~3-4 周)—— `EventNormalizer` 真实实现 + `EventTrigger.route()` 真实实现 + 至少 1 个设备适配器(建议先做 `timer.remind`)+ 架构不变量 #7/#8 单测钉死。
 - [ ] **Phase 8 预研**(不启动)—— `HomeAgent` 接入 HomeAssistant 的可行性,**仅在 Phase 7 + 真实 HA 环境就绪后**启动。
@@ -362,6 +370,7 @@ SMARTBUTLER_EMBEDDING_DIMENSION=1024   # 必须与 SMARTBUTLER_STORAGE_QDRANT_VE
 
 | 日期 | 版本 | 变更 | 关联 |
 |------|------|------|------|
+| 2026-10-13 | v0.3.0 | **Phase 6.6 Personality 落地**:5 维 trait 数据模型(Pydantic + [0,1] 约束) + personality.md(YAML frontmatter)加载/保存 + 三档翻译渲染 system prompt 片段 + ButlerOrchestrator 接入(`personality` 参数 + `reload_personality()` 刷缓存);77 新单测(773 total) | `emotion/personality/{traits,loader,injector}.py` |
 | 2026-10-10 | v0.2.12 | **Phase 6.2 P0 正式落地**:MemoryFacade + thinking 接入 + e2e 10 用例全过 | `docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` |
 | 2026-10-09 | v0.2.11 | 优化依赖,修复测试问题 | - |
 | 2026-10-09 | v0.2.10 | Skill loader + 6 个文件工具 | - |

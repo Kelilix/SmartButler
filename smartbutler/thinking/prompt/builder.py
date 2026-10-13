@@ -20,6 +20,8 @@ from langchain_core.tools import BaseTool
 
 # 管家固定人设 —— 简短、有性格、不啰嗦。
 # 后续 Phase 6 会用 Personality 注入器动态改写,这里只保留骨架。
+# 注意:当调用方传 ``personality_block`` 时,这一段被 Personality 替代(更丰富、含 trait 数值)
+# —— 老行为(不传 personality_block)继续走这一段,保证现有单测零修改。
 _BUTLER_PERSONA = """\
 你是 SmartButler 管家,一个**有性格、有记忆、懂上下文**的智能助手。
 你的目标:以最自然的方式帮用户解决问题,而不是机械地列工具。
@@ -51,6 +53,8 @@ class ButlerPromptBuilder:
         prompt = builder.build(
             tool_specs=[tool1.to_tool_spec(), tool2.to_langchain_tool()],
             skill_prompt_snippets=["# pdf-summary\\n...步骤..."],
+            memory_block="## 相关历史\\n...",
+            personality_block="你是「小管家」,管家的性格画像如下:...",
         )
         llm_with_tools = llm.bind_tools(tool_specs)
         # 把 prompt 作为第一条 system message 喂给 LLM
@@ -62,6 +66,7 @@ class ButlerPromptBuilder:
         tool_specs: list[BaseTool] | None = None,
         skill_prompt_snippets: list[str] | None = None,
         memory_block: str = "",
+        personality_block: str = "",
     ) -> str:
         """组装管家 system prompt。
 
@@ -71,11 +76,19 @@ class ButlerPromptBuilder:
             skill_prompt_snippets: Phase 5 注入的 Skill system_prompt 片段。
             memory_block: 🆕 Phase 6.2 P0,MemoryFacade.format_for_prompt() 的输出。
                 空字符串 = 拼"无相关历史";非空 = 拼"## 相关历史记忆\\n{block}"。
+            personality_block: 🆕 Phase 6.6,Personality 渲染出的 system prompt 片段。
+                空字符串 = 用默认 ``_BUTLER_PERSONA``(老行为,零影响);
+                非空 = 拼 Personality 段(覆盖默认人设,优先级最高)。
 
         Returns:
             最终 system prompt 字符串。
         """
-        parts: list[str] = [_BUTLER_PERSONA]
+        # 优先级: personality_block(若非空) > _BUTLER_PERSONA
+        parts: list[str] = []
+        if personality_block and personality_block.strip():
+            parts.append(personality_block.strip())
+        else:
+            parts.append(_BUTLER_PERSONA)
 
         if tool_specs:
             parts.append(self._render_tool_awareness(tool_specs))

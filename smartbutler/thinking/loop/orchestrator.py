@@ -21,11 +21,11 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-from datetime import datetime, UTC
 
 from smartbutler.agents.manager.manager import AgentManager
 from smartbutler.capabilities.llm.base import BaseLLM
@@ -103,6 +103,7 @@ class ButlerOrchestrator:
         skill_runtime: SkillRuntime | None = None,
         memory_facade: Any | None = None,
         short_term: Any | None = None,
+        personality: Any | None = None,
     ) -> None:
         """构造 orchestrator。
 
@@ -128,6 +129,10 @@ class ButlerOrchestrator:
             short_term: 🆕 Phase 6.2 P0,``ShortTermMemory`` 实例。
                 注入后,LangGraph checkpointer 改用 SqliteSaver,重启不丢短期上下文。
                 None → 用默认 InMemorySaver(重启即丢,Phase 6.2 P0 前行为)。
+            personality: 🆕 Phase 6.6,``Personality`` 实例(见 ``emotion/personality/traits.py``)。
+                注入后,管家 system prompt 改用 Personality 渲染(含 trait 数值 + 行为准则),
+                不再使用内置 ``_BUTLER_PERSONA``。
+                None → 不注入 personality(老行为,走内置默认人设,零影响)。
         """
         self._llm = llm
         self._tool_registry = tool_registry or ToolRegistry.get_default()
@@ -166,6 +171,11 @@ class ButlerOrchestrator:
         # Phase 6.2 P0: Short-term memory checkpointer(SqliteSaver)
         self._short_term = short_term
         self._short_term_saver_cache: Any | None = None  # 缓存已初始化的 saver 实例
+
+        # Phase 6.6: Personality(由 loader 解析 personality.md 注入,或 None 走默认人设)
+        self._personality = personality
+        # 缓存 Personality 渲染结果(避免每次 _build_graph_builder 都重渲染)
+        self._current_personality_block: str = ""
 
     # ---------- Skill 注入(Phase 5 占位) ----------
 
@@ -221,6 +231,42 @@ class ButlerOrchestrator:
         if self._memory_facade is None:
             return ""
         return self._current_memory_block or ""
+
+    # ---------- Phase 6.6 : Personality 注入 ----------
+
+    def _build_personality_block_sync(self) -> str:
+        """Phase 6.6:把 Personality 渲染成 system prompt 片段。
+
+        - ``self._personality is None`` → 返空字符串(走 ButlerPromptBuilder 内置默认人设)
+        - 有 Personality → 调 ``render_persona_block`` 渲染
+
+        渲染失败(序列化错之类)→ 返空字符串,管家继续工作(降级闭合)。
+        """
+        if self._personality is None:
+            return ""
+        if self._current_personality_block:
+            return self._current_personality_block
+        try:
+            from smartbutler.emotion.personality.injector import render_persona_block
+            self._current_personality_block = render_persona_block(self._personality)
+            return self._current_personality_block
+        except Exception as e:  # noqa: BLE001
+            _logger.exception(
+                "orchestrator.personality_render_failed", error=str(e),
+            )
+            return ""
+
+    def reload_personality(self, personality: Any) -> None:
+        """Phase 6.6 / 6.7:Learn 改完 Personality 后调这个,刷缓存+重建 graph。
+
+        典型用法::
+
+            orch.reload_personality(new_personality)
+            # 下次 ainvoke 会拿新的 system prompt
+        """
+        self._personality = personality
+        self._current_personality_block = ""  # 强制重渲染
+        self._compiled = None  # 强制 graph lazy rebuild
 
     # ---------- Graph 懒构建 ----------
 
@@ -304,10 +350,13 @@ class ButlerOrchestrator:
                 skill_snippets.append(skill_list_prompt)
         # 3a. 🆕 Phase 6.2 P0: 召回相关历史并格式化为 system prompt 片段
         memory_block = self._build_memory_block_sync()
+        # 3b. 🆕 Phase 6.6: 把 Personality 渲染成 system prompt 片段(覆盖默认人设)
+        personality_block = self._build_personality_block_sync()
         system_prompt = ButlerPromptBuilder().build(
             tool_specs=self._all_tools,
             skill_prompt_snippets=skill_snippets,
             memory_block=memory_block,
+            personality_block=personality_block,
         )
         compiled = (
             self._graph_builder_factory.with_llm(self._chat_adapter)
