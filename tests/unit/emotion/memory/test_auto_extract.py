@@ -173,21 +173,76 @@ async def test_on_task_complete_writes_fact(
     assert h.skipped_low_importance == 0
 
 
-async def test_low_importance_skipped(
+async def test_low_importance_no_filter_when_min_importance_zero(
     hooks: MemoryHooks, task_index: TaskIndex
 ) -> None:
-    """importance < min_importance → 跳过,不写 Qdrant。
+    """🆕 2026-10-13:``min_importance=0.0``(默认)→ 不门控,所有 fact 都写。
 
-    用 "hi" 这种极短无内容消息,启发式 importance ≈ 0.5。
+    背景:旧实现用 HeuristicScorer 启发式评分,<0.3 丢弃;新行为把门控
+    阈值外置到 ``min_importance`` 字段(.env:``AUTO_EXTRACT_MIN_IMPORTANCE``),
+    **0.0 = 不门控**(默认),>0 = 走启发式门控(老行为)。门控下放到
+    consolidator 阶段。详见 auto_extract.py docstring。
+    """
+    facade = MagicMock()
+    facade.remember = AsyncMock(return_value="k")
+    facade.hooks = MemoryHooks()
+    short_term = make_short_term("hi")
+    h = AutoExtractHook(
+        facade=facade, short_term=short_term, task_index=task_index,
+        min_importance=0.0,  # 默认值,wiring 不传时也是 0
+    )
+    assert h._filter_enabled is False
+    h.register(hooks)
+
+    # 给 task_index 加一条短消息
+    task_index.append_message(TaskMessageRecord(
+        task_id="t1",
+        message_id="m1",
+        thread_id="thread-1",
+        role="user",
+        user_id="u-male",
+        spoken_at="2026-01-01T00:00:00+00:00",
+        content="hi",
+    ))
+
+    hooks.trigger(
+        MemoryEventType.ON_TASK_COMPLETE,
+        task_id="t1",
+        category="chitchat",
+        content="hi",
+        status="chitchat_done",
+        thread_id="thread-1",
+    )
+    await _drain()
+
+    # min_importance=0 → 门控关闭,"hi" 也会写
+    assert facade.remember.await_count == 1
+    assert h.skipped_low_importance == 0
+    assert h.extracted_count == 1
+    # 写进去的 tags 应当带 user_id
+    tags = facade.remember.await_args.kwargs["tags"]
+    assert "user:u-male" in tags
+    # importance 是默认 0.5
+    assert facade.remember.await_args.kwargs["importance"] == 0.5
+
+
+async def test_low_importance_filter_active_when_min_importance_positive(
+    hooks: MemoryHooks, task_index: TaskIndex
+) -> None:
+    """``min_importance>0`` → HeuristicScorer 门控生效(老行为)。
+
+    何时用:wiring 读 .env 看到 ``SMARTBUTLER_MEMORY_AUTO_EXTRACT_MIN_IMPORTANCE
+    > 0`` 时直接把值传给 hook,作为回退到"老行为"的开关。
     """
     facade = MagicMock()
     facade.remember = AsyncMock()
     facade.hooks = MemoryHooks()
-    # 自己造个给 "hi" 的 short_term
     short_term = make_short_term("hi")
     h = AutoExtractHook(
-        facade=facade, short_term=short_term, task_index=task_index, min_importance=0.99
+        facade=facade, short_term=short_term, task_index=task_index,
+        min_importance=0.99,  # 显式打开门控
     )
+    assert h._filter_enabled is True
     h.register(hooks)
 
     hooks.trigger(
@@ -200,9 +255,8 @@ async def test_low_importance_skipped(
     )
     await _drain()
 
-    # 没调 remember
+    # 门控生效,没调 remember
     facade.remember.assert_not_awaited()
-    # 计数正确
     assert h.skipped_low_importance == 1
     assert h.extracted_count == 0
 

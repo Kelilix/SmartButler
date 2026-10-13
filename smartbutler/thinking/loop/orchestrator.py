@@ -172,6 +172,9 @@ class ButlerOrchestrator:
         self._short_term = short_term
         self._short_term_saver_cache: Any | None = None  # 缓存已初始化的 saver 实例
 
+        # Phase 6.4 P1: 当前对话用户(由 ainvoke/astream 设置,build graph 时注入 prompt)
+        self._current_user_id: str = ""
+
         # Phase 6.6: Personality(由 loader 解析 personality.md 注入,或 None 走默认人设)
         self._personality = personality
         # 缓存 Personality 渲染结果(避免每次 _build_graph_builder 都重渲染)
@@ -357,6 +360,7 @@ class ButlerOrchestrator:
             skill_prompt_snippets=skill_snippets,
             memory_block=memory_block,
             personality_block=personality_block,
+            current_user_id=self._current_user_id,
         )
         compiled = (
             self._graph_builder_factory.with_llm(self._chat_adapter)
@@ -458,7 +462,7 @@ class ButlerOrchestrator:
         if not user_input or not user_input.strip():
             return ""
 
-        # 🆕 Phase 6.2 P0: 刷新 memory_block 缓存
+        # 🆕 Phase 6.4 P1: 刷 memory_block + 记录当前 user_id
         if self._memory_facade is not None:
             try:
                 from smartbutler.emotion.memory.facade import MemoryContext
@@ -481,6 +485,8 @@ class ButlerOrchestrator:
                 _logger.exception("orchestrator.ainvoke memory_block_failed", error=str(e))
                 self._current_memory_block = ""
                 # 缓存不变,无需重建
+        # 🆕 Phase 6.4 P1: 记录当前 user_id(供 _build_graph_builder 注入 session context)
+        self._current_user_id = user_id
 
         compiled = await self._ensure_graph_async()
         # 🆕 Phase 6.4 P1: per-message metadata — 写进 additional_kwargs
@@ -548,6 +554,8 @@ class ButlerOrchestrator:
             except Exception as e:  # noqa: BLE001
                 _logger.exception("orchestrator.astream memory_block_failed", error=str(e))
                 self._current_memory_block = ""
+        # 🆕 Phase 6.4 P1: 记录当前 user_id(供 _build_graph_builder 注入 session context)
+        self._current_user_id = user_id
 
         compiled = await self._ensure_graph_async()
         # 🆕 Phase 6.4 P1: per-message metadata(同 ainvoke)

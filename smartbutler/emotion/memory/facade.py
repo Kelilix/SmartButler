@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -79,6 +80,57 @@ def _truncate_middle(text: str, limit: int | None) -> str:
     marker = f"...\n[省略中间 {dropped} 字符]\n..."
 
     return text[:head] + marker + text[-tail:]
+
+
+def _extract_user_id_from_hit(hit: dict[str, Any]) -> str:
+    """从 recall hit 中提取 user_id。
+
+    优先顺序:
+    1. tags 中的 ``user:xxx`` —— 2026-10-13 auto_extract 写入
+    2. tags 中的 ``source:xxx`` —— 旧路径(2.5.1 时代)写入
+    3. content 文本前缀 ``[user=xxx]`` —— 兜底:即便 tag 缺失,
+       从内容头部也能反查;这条是**最可靠的兜底**,因为 content 是
+       auto_extract._collect_user_content 实打实拼的。
+    4. hit["key"] 解析 —— 旧 ``mem:user_id:uuid`` 格式,**当前代码
+       已不再写此格式**,但保留解析以兼容历史数据
+    5. hit["user_id"] 显式字段 —— 兜底
+    6. 全部 miss → "未知"
+    """
+    # 1. tags.user:
+    for tag in hit.get("tags", []) or []:
+        if tag.startswith("user:"):
+            uid = tag[len("user:") :]
+            if uid:
+                return uid
+
+    # 2. tags.source:
+    for tag in hit.get("tags", []) or []:
+        if tag.startswith("source:"):
+            uid = tag[len("source:") :]
+            if uid:
+                return uid
+
+    # 3. content 文本前缀 [user=xxx]
+    content = hit.get("content", "") or ""
+    m = re.match(r"^\[user=([^\]]+)\]", content)
+    if m:
+        return m.group(1).strip()
+
+    # 4. key 解析(兼容旧 mem:user_id:uuid)
+    key = hit.get("key", "") or ""
+    if key:
+        parts = key.split(":")
+        if len(parts) >= 2 and parts[0] == "mem":
+            uid = parts[1]
+            if uid and uid != "unknown":
+                return uid
+
+    # 5. 显式 user_id 字段
+    uid = hit.get("user_id") or ""
+    if uid:
+        return uid
+
+    return "未知"
 
 
 @dataclass
@@ -380,11 +432,10 @@ class MemoryFacade:
             lines: list[str] = [f"### 相关历史记忆(共 {len(hits)} 条)"]
             for h in hits:
                 content = h.get("content", "")
-                # 截断上限读 .env(`SMARTBUTLER_MEMORY_MAX_FACT_CHARS`),
-                # 默认 0 = 不截断(用户决策:召回优先于 prompt 预算)。
-                # 详细踩坑记录见 `_resolve_max_fact_chars` docstring。
                 content = _truncate_middle(content, _resolve_max_fact_chars())
-                lines.append(f"- {content}")
+                # 从 key("mem:user_id:uuid") 或 tags("source:user_id") 提取 user_id
+                user_id = _extract_user_id_from_hit(h)
+                lines.append(f"- **[{user_id} 说]** {content}")
             long_block = "\n".join(lines)
 
         # ---- 3. 拼装 ----

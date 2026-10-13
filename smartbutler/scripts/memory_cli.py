@@ -559,6 +559,8 @@ def cmd_clear_all(args: argparse.Namespace) -> int:
 
     # ----- 1) 真跑:Qdrant collection -----
     print("[1/3] 清空 Qdrant collection ...")
+    q = None
+    client = None
     try:
         store = _build_store(args)
         q = store.qdrant
@@ -593,42 +595,60 @@ def cmd_clear_all(args: argparse.Namespace) -> int:
             # 已存在也不致命(可能 service 模式有 race),让 store_memory 兜底
             print(f"      ⚠️  recreate 跳过({type(e).__name__}: {e})")
     except Exception as e:  # noqa: BLE001
-        # 关键:dev_chat 还在跑时,_build_store 会抛 AlreadyLocked
-        # 这种情况必须给清晰报错
+        # 关键:dev_chat 还在跑时,_build_store 会抛
+        #   "Storage folder ... is already accessed by another instance"
+        # 这种情况不能直接放弃 —— 走"文件级物理清"兜底:
+        #   - 不依赖 QdrantClient(它连不上)
+        #   - 直接 truncate storage.sqlite + 删 lock/meta
+        #   - 下次 dev_chat 重启读到的是空 collection
+        # 但 service 模式(qdrant_url 设了)不能走这个路径,必须报错
         err_name = type(e).__name__
-        if "AlreadyLocked" in err_name or "Permission" in err_name:
+        err_str = str(e)
+        is_lock_conflict = (
+            "AlreadyLocked" in err_name
+            or "Permission" in err_name
+            or "another instance" in err_str
+        )
+        if is_lock_conflict and not args.qdrant_url:
             print(
-                f"      ⚠️  嵌入式 Qdrant 被另一个进程锁着(可能是 dev_chat 还活着)。\n"
-                f"          退出 dev_chat 再跑 clear-all 才安全。\n"
+                f"      ⚠️  嵌入式 Qdrant 被另一个进程锁着(可能 dev_chat 还活着)。\n"
+                f"          走'文件级物理清'兜底 —— 绕过 QdrantClient,直接动 storage.sqlite。\n"
                 f"          ({err_name}: {e})",
                 file=sys.stderr,
             )
+            # 用 QdrantStorage 直接构造拿 _path(不需要构造 client)
+            from smartbutler.emotion.memory.long_term import create_long_term_store as _cls2  # noqa: F401
+            from smartbutler.storage.qdrant import QdrantStorage
+            from smartbutler.config.base import PROJECT_ROOT
+            qp = (
+                Path(args.qdrant_path)
+                if args.qdrant_path
+                else PROJECT_ROOT / "data" / "qdrant"
+            )
+            # 构造一个"假" QdrantStorage 实例,只为了拿 _path
+            # 不调 __init__ 末尾的 QdrantClient 构造(那会触发连接)
+            q = QdrantStorage.__new__(QdrantStorage)
+            q._path = qp
+            q._vector_size = args.vector_size
+            q._collection = args.collection
+            client = None  # 走物理清路径,不需要 client
+        else:
+            print(f"      ❌ Qdrant 清空失败:{err_name}: {e}", file=sys.stderr)
             return 1
-        print(f"      ❌ Qdrant 清空失败:{err_name}: {e}", file=sys.stderr)
-        return 1
 
     # ----- 1b) 物理兜底:嵌入式 Qdrant 残留 storage.sqlite 不会被 delete_collection 真正回收
     # delete_collection 只改内存视图(嵌入式是 RAM 索引),磁盘 storage.sqlite 留着旧 points。
     # 重建 collection 不会覆盖旧文件。QdrantClient 析构会刷盘,但 CLI 进程退出时 Windows
     # portalocker 析构会报 NoneType 告警(已知 Qdrant 1.19 bug)——关闭 client 后再 rmtree
     # 物理子目录,下次启动会让 QdrantClient 重建空 collection。
-    if not args.qdrant_url:
+    if not args.qdrant_url and q is not None:
         # 嵌入式模式才需要这个兜底
-        try:
-            qdrant_path = Path(str(q._path))  # noqa: SLF001
-            coll_dir = qdrant_path / "collection" / collection_name
-            # 先显式关 client(否则 portalocker 锁住无法删)
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
-            if coll_dir.exists():
-                import shutil
-                shutil.rmtree(coll_dir)
-                print(f"      🧹 物理清理残留 collection 目录:{coll_dir}")
-        except Exception as e:  # noqa: BLE001
-            # 兜底失败也不致命(delete_collection + create_collection 已经在内存层面生效)
-            print(f"      ⚠️  物理清理失败(不影响逻辑清空):{type(e).__name__}: {e}", file=sys.stderr)
+        _physically_wipe_embedded_collection(
+            qdrant_storage=q,  # 传 QdrantStorage(q) 而不是裸 client
+            collection_name=q.collection,
+            vector_size=q._vector_size,  # noqa: SLF001
+            client=client,  # 可能为 None(走文件级清路径)
+        )
 
     # ----- 2) 真跑:archived SQLite -----
     print("[2/3] 清空 archived SQLite 备份表 ...")
@@ -670,6 +690,195 @@ def cmd_clear_all(args: argparse.Namespace) -> int:
         print(" ✅ clear-all 完成。所有长短期记忆已清空(Task 索引未动)。")
     print("=" * 60)
     return 0
+
+
+def _physically_wipe_embedded_collection(
+    *,
+    qdrant_storage: Any,
+    collection_name: str,
+    vector_size: int,
+    client: Any | None = None,
+) -> None:
+    """物理清理嵌入式 Qdrant 的 collection 目录(用户报的 WinError 32 修复)。
+
+    现象(2026-10-13 用户报告):
+      跑 ``clear-all --no-dry-run`` 后 ``memory_cli dump`` 还能看到数据。
+    根因:
+      1. ``delete_collection`` 只清内存里的 RAM 索引,**不**真正删
+         磁盘上的 ``storage.sqlite``。Qdrant 嵌入式用 SQLite 作底层
+         持久化,目录是 ``{qdrant_path}/collection/{name}/``。
+      2. 如果别的进程(典型:dev_chat)还持有这个 collection 的
+         QdrantClient,portalocker 把 ``storage.sqlite`` 锁住,导致
+         ``shutil.rmtree(coll_dir)`` 报 ``WinError 32 / PermissionError``。
+         旧实现只是 warn 不退出,用户以为清完了,实际下次启动时旧
+         point 还在(因为旧文件没被删)。
+    新行为(三步降级):
+      1. 关 client + gc,正常 rmtree 目录(理想路径)
+      2. 失败 → 直接 truncate ``storage.sqlite`` 到 0 字节 + 删
+         ``.lock`` / ``meta.json``(Qdrant 启动时若发现 ``storage.sqlite``
+         为空,会当"新库"重头初始化,等于物理清空)
+      3. 重建 client + 重新 create_collection(老 client 此时已
+         close + 状态混乱,必须换新 client 才能 ``create_collection``)
+
+    注意:即便第 1 步失败,只要第 2 步成功,下次 ``QdrantClient(...)``
+    启动时读到的就是**空 collection**。比"目录还在但内容截断"还
+    干净——Qdrant 不会用旧 schema 文件恢复旧 points。
+
+    🆕 client 可以是 None:当 dev_chat 还在跑导致 QdrantClient 连不上时,
+    调用方用 :meth:`QdrantStorage.__new__` 跳过 ``__init__`` 的 client
+    构造,这里只走文件级 truncate + 重建 client(create 会触发 portalocker
+    与 dev_chat 抢,可能失败 —— 此时给清晰报错让用户先关 dev_chat)。
+
+    ⚠️ 参数是 :class:`QdrantStorage` 实例(qdrant.py 里的),不是裸
+    ``QdrantClient``。QdrantClient._path 在 qdrant-client 1.19 是
+    None(路径藏在 qdrant_local 内部),拿不到。
+    """
+    import gc
+    import shutil
+
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, VectorParams
+
+    # ---- 拿到 collection 目录路径 ----
+    # 走 QdrantStorage._path(项目自己包的,稳定),不走 QdrantClient._path
+    # (qdrant-client 1.19 里是 None)
+    qdrant_path: Path | None = getattr(qdrant_storage, "_path", None)
+    if qdrant_path is None:
+        # 拿不到路径(server 模式或 API 变了)→ 跳过物理清理
+        print(
+            "      ℹ️  QdrantStorage 没 _path(可能 server 模式),跳过物理清理",
+            file=sys.stderr,
+        )
+        return
+    coll_dir = qdrant_path / "collection" / collection_name
+    storage_sqlite = coll_dir / "storage.sqlite"
+    lock_file = coll_dir / ".lock"
+    meta_json = coll_dir / "meta.json"
+
+    # ---- 步骤 A:关 client(若有),让 portalocker 释放 ----
+    if client is not None:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        # 强制 GC(嵌入式 Qdrant 内部有 Rust 端持有的对象,Python GC 不一定
+        # 立刻触发 __del__;多跑两轮保险)
+        gc.collect()
+        gc.collect()
+
+    # ---- 步骤 B:试 rmtree 整目录(理想路径)----
+    if coll_dir.exists():
+        try:
+            shutil.rmtree(coll_dir)
+            print(f"      🧹 [A] rmtree collection 目录:{coll_dir}")
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"      ⚠️  [A] rmtree 失败(可能 dev_chat 还在跑,锁住文件):"
+                f" {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            # ---- 步骤 C:退而求其次 —— 截断 storage.sqlite + 删 lock + 删 meta ----
+            wiped = False
+            if storage_sqlite.exists():
+                try:
+                    # 先尝试删 .lock(portalocker 主要靠这个,有时目录锁是因为它)
+                    if lock_file.exists():
+                        try:
+                            lock_file.unlink()
+                        except Exception as le:  # noqa: BLE001
+                            print(
+                                f"      ⚠️  删 .lock 失败(可能 dev_chat 仍持锁):"
+                                f" {type(le).__name__}: {le}",
+                                file=sys.stderr,
+                            )
+                    # 截断 storage.sqlite 到 0 字节(等价于"物理清空所有 point")
+                    # 用 'wb' 模式 open 再 close 即可(只删内容,保留 inode/权限)
+                    storage_sqlite.write_bytes(b"")
+                    # 删 meta.json,让 Qdrant 启动时按 collection_name
+                    # 重新生成,而不是读旧 schema
+                    if meta_json.exists():
+                        try:
+                            meta_json.unlink()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    print(
+                        f"      🧹 [B] 截断 storage.sqlite + 删 .lock/meta.json "
+                        f"(绕过 portalocker,下次启动会自动重头初始化):"
+                        f" {coll_dir}"
+                    )
+                    wiped = True
+                except Exception as e2:  # noqa: BLE001
+                    print(
+                        f"      ❌ [B] 截断 storage.sqlite 也失败:"
+                        f" {type(e2).__name__}: {e2}\n"
+                        f"         → 关掉 dev_chat(或其他持有 Qdrant 句柄的进程)"
+                        f" 后重跑 clear-all",
+                        file=sys.stderr,
+                    )
+                    return  # 没救了,留给下次重跑
+            if not wiped and not storage_sqlite.exists():
+                # coll_dir 在但没 storage.sqlite(可能已经部分清理),直接走重建
+                pass
+    else:
+        # coll_dir 都不存在,什么也不做
+        print(f"      ℹ️  collection 目录不存在,跳过物理清理:{coll_dir}")
+
+    # ---- 步骤 D:重新起一个 client,显式 create_collection ----
+    # 为什么换新 client:老 client 已被 close,内存里的 collection schema
+    # 视图也作废了(尤其是步骤 C 截断 storage.sqlite 后,老 client 还以为
+    # collection 存在),需要新 client 拿真实状态。
+    #
+    # 如果 client=None(走"文件级清"路径,被 dev_chat 锁了),这里 create
+    # 会再次失败 → 给清晰报错让用户先关 dev_chat。
+    try:
+        new_client = QdrantClient(path=str(qdrant_path))
+    except Exception as e:  # noqa: BLE001
+        err_str = str(e)
+        if "another instance" in err_str:
+            print(
+                f"      ⚠️  QdrantClient 被 dev_chat 锁着(another instance),\n"
+                f"         走'文件级清'已成功截断 storage.sqlite,等 dev_chat 关闭后\n"
+                f"         下次启动会自动用空 collection。无需进一步操作。\n"
+                f"         ({type(e).__name__}: {e})"
+            )
+        else:
+            print(
+                f"      ⚠️  重建 client 失败(不影响 clear-all 主流程):"
+                f" {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+        return
+    try:
+        try:
+            new_client.delete_collection(collection_name=collection_name)
+        except Exception:  # noqa: BLE001
+            pass
+        new_client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(
+                size=vector_size,
+                distance=Distance.COSINE,
+            ),
+        )
+        # 验证真的建好了(返回空列表 = 0 个 point)
+        cnt = new_client.count(
+            collection_name=collection_name, exact=True,
+        ).count
+        print(
+            f"      ✅ 重建空 collection:{collection_name!r}"
+            f" (count={cnt})"
+        )
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"      ⚠️  重建空 collection 失败(下次启动会 lazy create):"
+            f" {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+    finally:
+        try:
+            new_client.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _wipe_sqlite(path: Path) -> int | None:

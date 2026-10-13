@@ -117,11 +117,20 @@ class MemorySettings(SmartButlerBaseSettings, BaseSettings):
         description="Task 完成/chitchat_done 时自动 extract 写 Qdrant",
     )
 
-    # importance 门控:低于该值的 fact 丢弃(避免短闲聊污染长期)
-    # 0.0-0.2 琐事;0.2-0.5 事实;0.5-0.8 任务/约定;0.8-1.0 持久偏好
+    # importance 门控(老字段,新语义):**= 0 时**完全关闭启发式门控,
+    # 所有 fact 都进库(由 consolidator 决定去留);**> 0 时**走老行为,
+    # HeuristicScorer < 此值的 fact 丢弃。
+    #
+    # 🆕 2026-10-13 用户决策:门控放在 consolidator 阶段,不该放在
+    # 抽取阶段。理由见 auto_extract.py 顶部 docstring。
+    # 默认 0.0 = 全量抽取。
     auto_extract_min_importance: float = Field(
-        default=0.3, ge=0.0, le=1.0,
-        description="auto-extract 写 Qdrant 的 importance 下限",
+        default=0.0, ge=0.0, le=1.0,
+        description=(
+            "auto-extract 写 Qdrant 的 importance 下限。"
+            "0.0=全量抽取(默认,🆕 2026-10-13),consolidator 决定去留;"
+            ">0=走 HeuristicScorer 门控(老行为,显式打开)"
+        ),
     )
 
     # recall 相似度下限:归一化 raw_norm 低于此值的候选直接丢弃。

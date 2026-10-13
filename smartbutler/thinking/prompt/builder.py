@@ -43,6 +43,14 @@ _SKILL_SNIPPETS_HEADER = """\
 
 以下 Skills 已加载,内容会指导你处理特定类型任务时该怎么做。**不是**所有任务都要用,看场景。"""
 
+# 当前会话上下文段(由 orchestrator 注入)
+_SESSION_CONTEXT_TEMPLATE = """\
+## 当前会话上下文
+- 当前对话用户: **{current_user_id}**
+- **重要**:你正在和【{current_user_id}】对话,不要把其他人说过的话当成眼前用户的身份。
+  历史记忆里每条都有 "[xxx 说]" 前缀,这是信息来源标记——如果前缀不是【{current_user_id}】,
+  那说明这条记忆是别人说的,与当前对话用户无关。"""
+
 
 class ButlerPromptBuilder:
     """管家 system prompt 组装器。
@@ -67,6 +75,7 @@ class ButlerPromptBuilder:
         skill_prompt_snippets: list[str] | None = None,
         memory_block: str = "",
         personality_block: str = "",
+        current_user_id: str = "",
     ) -> str:
         """组装管家 system prompt。
 
@@ -75,10 +84,13 @@ class ButlerPromptBuilder:
                 兼容 BaseTool(取 name/description)和 LangChain tool(也取 name/description)。
             skill_prompt_snippets: Phase 5 注入的 Skill system_prompt 片段。
             memory_block: 🆕 Phase 6.2 P0,MemoryFacade.format_for_prompt() 的输出。
-                空字符串 = 拼"无相关历史";非空 = 拼"## 相关历史记忆\\n{block}"。
+                空字符串 = 拼"无相关历史";非空 = 拼"## 相关历史记忆\n{block}"。
             personality_block: 🆕 Phase 6.6,Personality 渲染出的 system prompt 片段。
                 空字符串 = 用默认 ``_BUTLER_PERSONA``(老行为,零影响);
                 非空 = 拼 Personality 段(覆盖默认人设,优先级最高)。
+            current_user_id: 🆕 Phase 6.4 P1,当前对话用户的 user_id。
+                非空时在人格段后面注入会话上下文,告知 LLM 当前在和谁对话。
+                空 = 不注入(老行为向后兼容)。
 
         Returns:
             最终 system prompt 字符串。
@@ -89,6 +101,9 @@ class ButlerPromptBuilder:
             parts.append(personality_block.strip())
         else:
             parts.append(_BUTLER_PERSONA)
+
+        if current_user_id:
+            parts.append(_SESSION_CONTEXT_TEMPLATE.format(current_user_id=current_user_id))
 
         if tool_specs:
             parts.append(self._render_tool_awareness(tool_specs))
