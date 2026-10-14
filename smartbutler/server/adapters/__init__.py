@@ -44,6 +44,16 @@ class ReactiveSubmission:
 
     Phase 7.5+ 可在此基础上加 ``content_blocks: list[ContentBlock]`` 支持
     多模态(图片 / 音频),本阶段只走文本。
+
+    🆕 7.4 metadata 协议注释(钩子 5):
+        约定键(可加新键,但**不动 dataclass 字段**——沿用不变量 #8 协议稳定):
+        - ``modality_tags: list[str]``
+            - 文本交互 → ``["text"]``
+            - VoiceAdapter(7.6) → ``["text", "audio"]``
+            - CameraAdapter(7.8) → ``["text", "image", "video"]``
+        - ``image_ref: str``  —— 7.8 写入原始图片路径
+        - ``audio_ref: str``  —— 7.6 写入原始音频路径
+        7.9 多模态召回时按 modality_tags 过滤;7.4-7.8 业务层不读这些键。
     """
 
     user_input: str
@@ -88,6 +98,14 @@ class ButlerReply:
     - ``source``: 哪条入口产生 — ``"reactive"`` / ``"proactive"``
     - ``related_event_id``: Proactive 时挂的关联事件 ID
     - ``metadata``: 自由扩展(后续可塞 tool_call 统计 / latency 等)
+
+    🆕 7.4 metadata 协议注释(钩子 5):
+        约定键(可加新键,**不动 dataclass 字段**——沿用不变量 #8 协议稳定):
+        - ``modality_tags: list[str]``
+            - 纯文本答复 → ``["text"]``
+            - 含 TTS(7.7) → ``["text", "audio"]``
+        - ``latency_ms: float``  —— 后续 7.5 性能监控
+        - ``tool_call_count: int`` —— 后续 7.5 工具调用统计
     """
 
     content: str

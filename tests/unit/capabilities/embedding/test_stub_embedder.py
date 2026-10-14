@@ -90,3 +90,54 @@ async def test_stub_implements_protocol() -> None:
     assert hasattr(e, "embed")
     assert hasattr(e, "embed_batch")
     assert hasattr(e, "dimension")
+
+
+# ---------------------------------------------------------------------------
+# 🆕 7.4 H1:Embedder Protocol 多模态方法测试
+# 7.4-7.8:默认抛 NotImplementedError(Stub 继续抛,降级闭合)
+# 7.9:由 EmbeddingGemma2Embedder 重写
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stub_embed_image_raises_not_implemented() -> None:
+    """7.4 H1:StubEmbedder.embed_image 抛 NotImplementedError(7.9 启动前)。"""
+    e = StubEmbedder(dimension=8)
+    with pytest.raises(NotImplementedError) as exc_info:
+        await e.embed_image("/tmp/xxx.jpg")
+    assert "image embedding" in str(exc_info.value)
+    assert "7.9" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_stub_embed_audio_raises_not_implemented() -> None:
+    """7.4 H1:StubEmbedder.embed_audio 抛 NotImplementedError(7.9 启动前)。"""
+    e = StubEmbedder(dimension=8)
+    with pytest.raises(NotImplementedError) as exc_info:
+        await e.embed_audio("/tmp/xxx.wav")
+    assert "audio embedding" in str(exc_info.value)
+    assert "7.9" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_stub_embed_video_raises_not_implemented() -> None:
+    """7.4 H1:StubEmbedder.embed_video 抛 NotImplementedError(7.9 启动前)。"""
+    e = StubEmbedder(dimension=8)
+    with pytest.raises(NotImplementedError) as exc_info:
+        await e.embed_video("/tmp/xxx.mp4")
+    assert "video embedding" in str(exc_info.value)
+    assert "7.9" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_protocol_multimodal_methods_signature() -> None:
+    """7.4 H1:Embedder Protocol 暴露 3 个多模态方法(可用 isinstance + hasattr 校验)。"""
+    e: Embedder = StubEmbedder(dimension=8)
+    assert hasattr(e, "embed_image")
+    assert hasattr(e, "embed_audio")
+    assert hasattr(e, "embed_video")
+    assert callable(e.embed_image)
+    assert callable(e.embed_audio)
+    assert callable(e.embed_video)
+    # Protocol runtime_checkable
+    assert isinstance(e, Embedder)

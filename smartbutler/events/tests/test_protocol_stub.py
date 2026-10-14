@@ -301,3 +301,102 @@ class TestProtocolStability:
         )
         for field in ("device_type", "action", "current_state", "device_id"):
             assert hasattr(e, field), f"DeviceEvent 字段 {field} 缺失"
+
+
+# === 🆕 7.4 H4:BaseEvent.media_refs 多模态扩展位 ===
+
+class TestBaseEventMultimodal:
+    def test_media_refs_default_empty_dict(self) -> None:
+        """7.4 H4:不传 media_refs 时,默认空 dict(老调用零修改)。"""
+        e = BaseEvent(
+            source=EventSource.DEVICE,
+            topic="device.door.opened",
+            user_id="u",
+            timestamp=datetime.now(ZoneInfo("Asia/Shanghai")),
+        )
+        assert e.media_refs == {}
+        assert isinstance(e.media_refs, dict)
+
+    def test_media_refs_accepted(self) -> None:
+        """7.4 H4:7.6/7.8 写入 image / video / audio 路径。"""
+        e = BaseEvent(
+            source=EventSource.CAMERA if hasattr(EventSource, "CAMERA") else EventSource.DEVICE,
+            topic="device.camera.perception",
+            user_id="u",
+            timestamp=datetime.now(ZoneInfo("Asia/Shanghai")),
+            media_refs={
+                "image": "/data/butler/img/2026/10/14/xxx.jpg",
+                "video": "/data/butler/vid/2026/10/14/xxx.mp4",
+            },
+        )
+        assert e.media_refs["image"] == "/data/butler/img/2026/10/14/xxx.jpg"
+        assert e.media_refs["video"] == "/data/butler/vid/2026/10/14/xxx.mp4"
+
+    def test_event_still_frozen_with_media_refs(self) -> None:
+        """7.4 H4:media_refs 加进来后事件仍 frozen(Pydantic 冻结)。"""
+        e = BaseEvent(
+            source=EventSource.DEVICE,
+            topic="device.door.opened",
+            user_id="u",
+            timestamp=datetime.now(ZoneInfo("Asia/Shanghai")),
+            media_refs={"image": "/tmp/xxx.jpg"},
+        )
+        with pytest.raises(ValidationError):
+            e.media_refs = {"audio": "/tmp/xxx.wav"}  # type: ignore[misc]
+
+    def test_media_refs_extra_field_rejected(self) -> None:
+        """7.4 H4:BaseEvent 仍 extra='forbid',乱传字段被拒。"""
+        with pytest.raises(ValidationError):
+            BaseEvent(
+                source=EventSource.DEVICE,
+                topic="device.door.opened",
+                user_id="u",
+                timestamp=datetime.now(ZoneInfo("Asia/Shanghai")),
+                random_garbage_field="oops",  # type: ignore[call-arg]
+            )
+
+
+# === 🆕 7.4 H5:ReactiveSubmission / ButlerReply metadata 协议注释 ===
+
+class TestMetadataProtocolNotes:
+    """7.4 H5:metadata 是 dict 扩展位,7.6/7.8 在 metadata 内部加 modality_tags 键(不动 dataclass 字段)。"""
+
+    def test_reactive_submission_metadata_empty_by_default(self) -> None:
+        from smartbutler.server.adapters import ReactiveSubmission
+        sub = ReactiveSubmission(user_input="hi")
+        assert sub.metadata == {}
+        # modality_tags / image_ref / audio_ref 都在 metadata 内部约定,不是 dataclass 字段
+        assert not hasattr(sub, "modality_tags")
+        assert not hasattr(sub, "image_ref")
+        assert not hasattr(sub, "audio_ref")
+
+    def test_reactive_submission_metadata_accepts_modality_tags(self) -> None:
+        from smartbutler.server.adapters import ReactiveSubmission
+        sub = ReactiveSubmission(
+            user_input="hi",
+            metadata={
+                "modality_tags": ["text", "audio"],
+                "audio_ref": "/data/butler/aud/xxx.wav",
+            },
+        )
+        assert sub.metadata["modality_tags"] == ["text", "audio"]
+        assert sub.metadata["audio_ref"] == "/data/butler/aud/xxx.wav"
+
+    def test_butler_reply_metadata_accepts_modality_tags(self) -> None:
+        from smartbutler.server.adapters import ButlerReply
+        reply = ButlerReply(
+            content="ok",
+            metadata={
+                "modality_tags": ["text", "audio"],
+                "latency_ms": 123.4,
+            },
+        )
+        assert reply.metadata["modality_tags"] == ["text", "audio"]
+        assert reply.metadata["latency_ms"] == 123.4
+
+    def test_reactive_submission_still_frozen(self) -> None:
+        """7.4 H5 兼容性:ReactiveSubmission 仍 frozen(7.4 没破坏不变量 #8)。"""
+        from smartbutler.server.adapters import ReactiveSubmission
+        sub = ReactiveSubmission(user_input="hi")
+        with pytest.raises((AttributeError, Exception)):
+            sub.user_input = "hacker"  # type: ignore[misc]

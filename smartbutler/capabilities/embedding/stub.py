@@ -39,6 +39,29 @@ class StubEmbedder:
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         return [await self.embed(t) for t in texts]
 
+    # 🆕 7.4 H1:多模态方法(默认 NotImplementedError,7.9 启动时由
+    # EmbeddingGemma2Embedder 重写)。这里加在 StubEmbedder 是因为
+    # Protocol 默认实现不能被子类继承——Python 在子类实例上找属性
+    # 找不到直接 AttributeError,业务层看到的不是"协议契约未实现"
+    # 而是"属性不存在",对调试不友好。
+    async def embed_image(self, image_path: str) -> list[float]:
+        raise NotImplementedError(
+            "StubEmbedder 不支持 image embedding,7.9 启动时由"
+            " EmbeddingGemma2Embedder 实现,见 PHASE_7_TECHNICAL_DESIGN.md §12.6 H1"
+        )
+
+    async def embed_audio(self, audio_path: str) -> list[float]:
+        raise NotImplementedError(
+            "StubEmbedder 不支持 audio embedding,7.9 启动时由"
+            " EmbeddingGemma2Embedder 实现,见 PHASE_7_TECHNICAL_DESIGN.md §12.6 H1"
+        )
+
+    async def embed_video(self, video_path: str) -> list[float]:
+        raise NotImplementedError(
+            "StubEmbedder 不支持 video embedding,7.9 启动时由"
+            " EmbeddingGemma2Embedder 实现,见 PHASE_7_TECHNICAL_DESIGN.md §12.6 H1"
+        )
+
     def _hash_to_vector(self, text: str) -> list[float]:
         """SHA-256 → 字节 → 归一化到 [-1, 1] → 截断/重复到 dimension 维。
 

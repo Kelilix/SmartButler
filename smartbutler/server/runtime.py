@@ -38,6 +38,8 @@ import structlog
 
 from smartbutler.events.core.event import BaseEvent, EventPriority, EventSource
 from smartbutler.events.core.event_bus import EventBus
+from smartbutler.events.core.normalizer import EventNormalizer
+from smartbutler.events.core.trigger import EventTrigger
 from smartbutler.server.adapters import (
     ButlerReply,
     InputAdapter,
@@ -57,12 +59,19 @@ _logger = structlog.get_logger(__name__)
 
 
 class ServerConfig:
-    """Server 运行配置(简化版,Phase 7.1 只保留必要开关)。"""
+    """Server 运行配置(Phase 7.1 + 7.4 扩展)。"""
 
     __slots__ = (
         "event_bus",
         "enable_event_bus",
         "auto_subscribe_proactive",
+        # 🆕 7.4:Normalizer + Trigger
+        "normalizer",
+        "trigger",
+        "enable_normalizer",
+        "enable_trigger",
+        "normalizer_window_sec",
+        "trigger_max_per_minute",
     )
 
     def __init__(
@@ -71,6 +80,13 @@ class ServerConfig:
         event_bus: EventBus | None = None,
         enable_event_bus: bool = True,
         auto_subscribe_proactive: bool = True,
+        # 🆕 7.4 字段
+        normalizer: "EventNormalizer | None" = None,
+        trigger: "EventTrigger | None" = None,
+        enable_normalizer: bool = True,
+        enable_trigger: bool = True,
+        normalizer_window_sec: float = 5.0,
+        trigger_max_per_minute: int = 20,
     ) -> None:
         """
         Args:
@@ -78,10 +94,24 @@ class ServerConfig:
             enable_event_bus: 是否启用 EventBus(关掉时 Server 只走直接入口)。
             auto_subscribe_proactive: start() 时是否自动注册 Proactive 消费者
                 (把 EventBus 上的事件转给 ProactiveLoop)。
+            normalizer: 🆕 7.4 注入的 EventNormalizer(默认 None → DedupNormalizer())。
+            trigger: 🆕 7.4 注入的 EventTrigger(默认 None → DefaultEventTrigger(orchestrator=...))。
+                ⚠️ 必须在 ButlerServer.__init__ 之后用 server.set_trigger(...) 注入,
+                因为 trigger 依赖 orchestrator,启动时构造比较复杂。
+            enable_normalizer: 🆕 7.4 是否启用 Normalizer(关掉时直接走 ProactiveLoop 老逻辑)。
+            enable_trigger: 🆕 7.4 是否启用 Trigger(关掉时走老 _on_bus_event 旁路)。
+            normalizer_window_sec: 🆕 7.4 DedupNormalizer 默认窗口(秒)。
+            trigger_max_per_minute: 🆕 7.4 DefaultEventTrigger 默认限速(条/分钟)。
         """
         self.event_bus = event_bus
         self.enable_event_bus = enable_event_bus
         self.auto_subscribe_proactive = auto_subscribe_proactive
+        self.normalizer = normalizer
+        self.trigger = trigger
+        self.enable_normalizer = enable_normalizer
+        self.enable_trigger = enable_trigger
+        self.normalizer_window_sec = normalizer_window_sec
+        self.trigger_max_per_minute = trigger_max_per_minute
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +159,11 @@ class ButlerServer:
         self._input_adapter: InputAdapter | None = input_adapter
         self._output_adapters: list[OutputAdapter] = list(output_adapters or [])
 
+        # 🆕 7.4:Normalizer + Trigger
+        # 延迟注入(因为 trigger 需要 orchestrator)
+        self._normalizer: EventNormalizer | None = None
+        self._trigger: EventTrigger | None = None
+
         # 内部状态
         self._started = False
         self._stopped = True
@@ -153,11 +188,38 @@ class ButlerServer:
                     self._on_bus_event,
                     consumer_group="butler-server-proactive",
                 )
+
+        # 🆕 7.4:Normalizer / Trigger 默认构造
+        if self._config.enable_normalizer and self._normalizer is None:
+            from smartbutler.events.core.normalizer_dedup import DedupNormalizer
+            self._normalizer = DedupNormalizer(
+                window_sec=self._config.normalizer_window_sec,
+            )
+            _logger.info(
+                "butler_server.normalizer_initialized",
+                type=type(self._normalizer).__name__,
+                window_sec=self._config.normalizer_window_sec,
+            )
+        if self._config.enable_trigger and self._trigger is None:
+            from smartbutler.events.core.trigger_default import DefaultEventTrigger
+            self._trigger = DefaultEventTrigger(
+                orchestrator=self._orchestrator,
+                max_per_minute=self._config.trigger_max_per_minute,
+            )
+            _logger.info(
+                "butler_server.trigger_initialized",
+                type=type(self._trigger).__name__,
+                max_per_minute=self._config.trigger_max_per_minute,
+            )
+
+        if self._config.enable_event_bus:
             _logger.info(
                 "butler_server.started",
                 event_bus=type(self._event_bus).__name__,
                 output_count=len(self._output_adapters),
                 has_input=self._input_adapter is not None,
+                has_normalizer=self._normalizer is not None,
+                has_trigger=self._trigger is not None,
             )
         else:
             _logger.info(
@@ -268,6 +330,21 @@ class ButlerServer:
         """运行时换输入适配器(下次 start 生效;若已 start,需要 stop+start 才会拉新 sink)。"""
         self._input_adapter = adapter
 
+    # 🆕 7.4:Normalizer / Trigger 注入方法
+    def set_normalizer(self, normalizer: EventNormalizer) -> None:
+        """运行时注入 Normalizer(必须在 start() 前调用)。"""
+        if self._started:
+            _logger.warning("butler_server.set_normalizer after_start ignored")
+            return
+        self._normalizer = normalizer
+
+    def set_trigger(self, trigger: EventTrigger) -> None:
+        """运行时注入 EventTrigger(必须在 start() 前调用)。"""
+        if self._started:
+            _logger.warning("butler_server.set_trigger after_start ignored")
+            return
+        self._trigger = trigger
+
     # ----------------- 内部 -----------------
 
     def _to_base_event(self, sub: ProactiveSubmission) -> BaseEvent:
@@ -298,28 +375,83 @@ class ButlerServer:
         await self.submit_proactive(sub)
 
     async def _on_bus_event(self, event: BaseEvent) -> None:
-        """EventBus consumer 默认 handler:转给 ProactiveLoop。"""
-        try:
-            result = await self._orchestrator.proactive_tick(
-                event, user_id=event.user_id
-            )
-        except Exception as exc:  # noqa: BLE001
-            _logger.error(
-                "butler_server.bus_event.tick_error",
-                event_id=event.event_id,
-                topic=event.topic,
-                error=str(exc),
-                exc_type=type(exc).__name__,
-            )
-            return
-        # silent → 不下发
-        if not getattr(result, "acted", False):
-            return
-        message = getattr(result, "message", None) or ""
-        if not message.strip():
+        """EventBus consumer 默认 handler:🆕 7.4 走 Normalizer + Trigger。
+
+        流程:
+        1. 归一化(Normalizer)→ None = 丢弃
+        2. 限速(Trigger.should_handle)→ False = 丢弃
+        3. 处理(Trigger.handle)→ 拿到 answer 文本
+        4. 包装成 ButlerReply 广播给 OutputAdapter
+        5. 老逻辑(无 Normalizer / Trigger)→ 直接调 proactive_tick(沿用 §0.2 老路径)
+        """
+        # 1) Normalizer
+        if self._normalizer is not None:
+            try:
+                normalized = await self._normalizer.normalize(event)
+            except Exception as exc:  # noqa: BLE001
+                _logger.error(
+                    "butler_server.normalizer_error",
+                    event_id=event.event_id,
+                    error=str(exc),
+                    exc_type=type(exc).__name__,
+                )
+                return  # 归一化失败 = 丢弃(防爆管)
+            if normalized is None:
+                return  # Normalizer 判定丢弃(dedup)
+            event = normalized  # 后续用 normalized
+        # 2) Trigger.should_handle(限速)
+        if self._trigger is not None:
+            try:
+                if not await self._trigger.should_handle(event):
+                    return  # 限速,丢弃
+            except Exception as exc:  # noqa: BLE001
+                _logger.error(
+                    "butler_server.trigger.should_handle_error",
+                    event_id=event.event_id,
+                    error=str(exc),
+                    exc_type=type(exc).__name__,
+                )
+                return  # 限速检查失败 = 丢弃
+        # 3) Trigger.handle(路由 + 调循环 + 兜底)
+        if self._trigger is not None:
+            try:
+                answer = await self._trigger.handle(event)
+            except Exception as exc:  # noqa: BLE001
+                # Trigger 内部不抛(不变量),但兜底兜底
+                _logger.error(
+                    "butler_server.trigger.handle_error",
+                    event_id=event.event_id,
+                    error=str(exc),
+                    exc_type=type(exc).__name__,
+                )
+                return
+        else:
+            # 4) 老逻辑:无 Trigger → 直接调 proactive_tick(沿用 §0.2 老路径)
+            try:
+                result = await self._orchestrator.proactive_tick(
+                    event, user_id=event.user_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                _logger.error(
+                    "butler_server.bus_event.tick_error",
+                    event_id=event.event_id,
+                    topic=event.topic,
+                    error=str(exc),
+                    exc_type=type(exc).__name__,
+                )
+                return
+            # silent → 不下发
+            if not getattr(result, "acted", False):
+                return
+            message = getattr(result, "message", None) or ""
+            if not message.strip():
+                return
+            answer = message
+        # 5) 包装成 reply,广播给 OutputAdapter
+        if not answer or not answer.strip():
             return
         reply = ButlerReply(
-            content=message,
+            content=answer,
             user_id=event.user_id,
             session_id=f"proactive-{event.event_id}",
             source="proactive",

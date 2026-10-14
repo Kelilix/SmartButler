@@ -71,6 +71,9 @@ class MemoryRetriever:
         tags: list[str] | None = None,
         source: str = "",
         importance: float | None = None,
+        # 🆕 7.4 多模态扩展位(Qdrant payload schema-less,默认 None 不存字段)
+        image_ref: str | None = None,
+        audio_ref: str | None = None,
     ) -> str:
         """存一条长期记忆。返回 key。
 
@@ -79,6 +82,10 @@ class MemoryRetriever:
             tags: 标签列表(可选)。
             source: 说话人/来源,会自动追加到 tags 方便 recall 过滤。
             importance: 显式指定重要性,None 则自动启发式评分。
+            image_ref: 🆕 7.4 原始图片文件路径(7.8 CameraAdapter 传入,
+                7.9 启动时由 EmbeddingGemma2Embedder 补 image_embedding)。
+                None = 不存字段(Qdrant payload 不出现 image_ref)。
+            audio_ref: 🆕 7.4 原始音频文件路径(7.6 VoiceAdapter 传入,同上)。
         """
         if not content or not content.strip():
             raise ValueError("content 不能为空")
@@ -94,12 +101,21 @@ class MemoryRetriever:
         all_tags = list(tags or [])
         if source:
             all_tags.append(f"source:{source}")
+        # 🆕 7.4 多模态 tag(7.9 召回时按 modality_tags 过滤)
+        if image_ref is not None:
+            all_tags.append("modality:image")
+        if audio_ref is not None:
+            all_tags.append("modality:audio")
         key = self._make_key(source)
-        # 写存储
+        # 写存储(透传 image_ref / audio_ref,store_memory 已支持 7.4 多模态字段)
         self._store.store_memory(
             key, emb, content, importance=score, tags=all_tags,
+            image_ref=image_ref, audio_ref=audio_ref,
         )
-        logger.debug("retriever.remember key=%s score=%.2f", key, score)
+        logger.debug(
+            "retriever.remember key=%s score=%.2f image_ref=%s audio_ref=%s",
+            key, score, image_ref, audio_ref,
+        )
         return key
 
     async def recall(

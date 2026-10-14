@@ -116,6 +116,22 @@ class BaseEvent(BaseModel):
         default=None,
         description="关联 ID,多事件描述同一业务",
     )
+    # 🆕 7.4 多模态扩展位(钩子 5)
+    # 7.6/7.8 写入:{'image': '/data/butler/img/2026/10/14/xxx.jpg',
+    #                'video': '/data/butler/vid/2026/10/14/xxx.mp4',
+    #                'audio': '/data/butler/aud/2026/10/14/xxx.wav'}
+    # 7.9 多模态 embedding 时直接读这个字段定位原始文件。
+    # 不变量:Normalizer 看到此字段一律原样透传,不修改。
+    media_refs: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "多模态媒体引用映射(7.4 扩展位)。\n"
+            "7.6 VoiceAdapter 写入 audio_ref,7.8 CameraAdapter 写入 image/video_ref。\n"
+            "7.9 启动后,Embedder.embed_image/embed_audio 直接读这个字段定位文件。\n"
+            "默认空 dict;老调用零修改。\n"
+            "不变量(Normalizer):本字段必须原样透传,不修改。"
+        ),
+    )
 
     # --- 派生方法 ---
 

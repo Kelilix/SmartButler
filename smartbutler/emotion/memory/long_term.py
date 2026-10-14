@@ -47,6 +47,12 @@ PAYLOAD_DELETED_AT = "deleted_at"          # iso 字符串
 PAYLOAD_DELETED_REASON = "deleted_reason"  # ForgetReason.value
 PAYLOAD_CREATED_AT = "created_at"          # iso 字符串
 PAYLOAD_SOURCE_KEYS = "source_keys"        # 升格溯源,list[str]
+# 🆕 7.4 多模态扩展位(7.9 启动时由 EmbeddingGemma2Embedder 补 image_embedding)
+PAYLOAD_IMAGE_REF = "image_ref"            # 7.8 写入(可选),7.9 多模态 embedding 用
+PAYLOAD_AUDIO_REF = "audio_ref"            # 7.6 写入(可选),7.9 多模态 embedding 用
+PAYLOAD_IMAGE_EMBEDDING = "image_embedding"  # list[float] 序列化(7.9 启动时补,7.4 留位)
+PAYLOAD_EMBEDDING_MODEL = "embedding_model"  # 记录哪个模型生成的 embedding(如 "embeddinggemma-2")
+# 7.4 兼容性:旧 payload 没有这 4 字段也 OK,业务层读不到就当 None
 
 
 class LongTermStore:
@@ -84,8 +90,17 @@ class LongTermStore:
         level: str | None = None,
         source_keys: list[str] | None = None,
         created_at: datetime | None = None,
+        # 🆕 7.4 多模态扩展位(Qdrant payload schema-less,默认 None,7.9 启动时由
+        # EmbeddingGemma2Embedder 补 image_embedding + embedding_model)。
+        # - image_ref / audio_ref:7.6/7.8 写入原始文件路径(可选,不强约束)
+        # - image_embedding:bytes 或 list[float](7.4 留位,7.9 启动时补)
+        # - embedding_model:str,记录哪个模型生成的 image_embedding
+        image_ref: str | None = None,
+        audio_ref: str | None = None,
+        image_embedding: bytes | list[float] | None = None,
+        embedding_model: str | None = None,
     ) -> None:
-        """存一条记忆(P0 + 6.3 字段)。
+        """存一条记忆(P0 + 6.3 字段 + 7.4 多模态扩展位)。
 
         Args:
             key: 唯一 key(常用"user:xxx:fact:yyy")。
@@ -96,6 +111,11 @@ class LongTermStore:
             level: 6.3 新增,4 层分片之一(daily/weekly/monthly/permanent),None = 不打 level tag。
             source_keys: 6.3 新增,升格溯源(本 fact 由哪些源 fact 升格而来)。
             created_at: 6.3 新增,创建时间(默认 = now UTC)。
+            image_ref: 🆕 7.4 原始图片文件路径(7.8 CameraAdapter 传入,7.9 多模态 embedding 用)。
+            audio_ref: 🆕 7.4 原始音频文件路径(7.6 VoiceAdapter 传入,7.9 多模态 embedding 用)。
+            image_embedding: 🆕 7.4 多模态向量(7.9 启动时由 EmbeddingGemma2Embedder 补;
+                7.4-7.8 传 None,Qdrant payload 不存这个字段)。
+            embedding_model: 🆕 7.4 embedding 模型名(如 "embeddinggemma-2",7.9 启动时写)。
         """
         ts = (created_at or datetime.now(UTC)).isoformat()
         payload: dict[str, Any] = {
@@ -108,10 +128,21 @@ class LongTermStore:
             payload[PAYLOAD_LEVEL] = level
         if source_keys is not None:
             payload[PAYLOAD_SOURCE_KEYS] = list(source_keys)
+        # 🆕 7.4 多模态字段(Qdrant payload schema-less,None = 不写字段)
+        if image_ref is not None:
+            payload[PAYLOAD_IMAGE_REF] = str(image_ref)
+        if audio_ref is not None:
+            payload[PAYLOAD_AUDIO_REF] = str(audio_ref)
+        if image_embedding is not None:
+            # list[float] 序列化(list → JSON,Qdrant 会自动处理)
+            payload[PAYLOAD_IMAGE_EMBEDDING] = list(image_embedding)
+        if embedding_model is not None:
+            payload[PAYLOAD_EMBEDDING_MODEL] = str(embedding_model)
         self._q.upsert_with_vector(key, embedding, payload)
         logger.debug(
-            "long_term.store key=%s importance=%.2f level=%s tags=%s",
-            key, importance, level, tags or [],
+            "long_term.store key=%s importance=%.2f level=%s tags=%s"
+            " image_ref=%s audio_ref=%s",
+            key, importance, level, tags or [], image_ref, audio_ref,
         )
 
     def search_memory(
@@ -172,6 +203,16 @@ class LongTermStore:
                 row["deleted_reason"] = payload[PAYLOAD_DELETED_REASON]
             if PAYLOAD_SOURCE_KEYS in payload:
                 row["source_keys"] = payload[PAYLOAD_SOURCE_KEYS]
+            # 🆕 7.4 多模态字段透传(Qdrant payload schema-less,没有这些字段时
+            # 不在 row 里出现,业务层 .get() 兜底 → None)
+            if PAYLOAD_IMAGE_REF in payload:
+                row["image_ref"] = payload[PAYLOAD_IMAGE_REF]
+            if PAYLOAD_AUDIO_REF in payload:
+                row["audio_ref"] = payload[PAYLOAD_AUDIO_REF]
+            if PAYLOAD_IMAGE_EMBEDDING in payload:
+                row["image_embedding"] = payload[PAYLOAD_IMAGE_EMBEDDING]
+            if PAYLOAD_EMBEDDING_MODEL in payload:
+                row["embedding_model"] = payload[PAYLOAD_EMBEDDING_MODEL]
             out.append(row)
         return out
 
@@ -400,4 +441,9 @@ __all__ = [
     "PAYLOAD_DELETED_REASON",
     "PAYLOAD_CREATED_AT",
     "PAYLOAD_SOURCE_KEYS",
+    # 🆕 7.4 多模态扩展位(7.9 启动时由 EmbeddingGemma2Embedder 复用)
+    "PAYLOAD_IMAGE_REF",
+    "PAYLOAD_AUDIO_REF",
+    "PAYLOAD_IMAGE_EMBEDDING",
+    "PAYLOAD_EMBEDDING_MODEL",
 ]

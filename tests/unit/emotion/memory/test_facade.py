@@ -241,3 +241,65 @@ def test_memory_context_defaults() -> None:
     assert ctx.user_id is None
     assert ctx.source == ""
     assert ctx.session_id is None
+
+
+# ---------------------------------------------------------------------------
+# 🆕 7.4 H3:MemoryFacade.remember 多模态 ref 测试
+# 7.4 透传 image_ref / audio_ref 到 LongTermStore;7.9 启动时由
+# EmbeddingGemma2Embedder 补 image_embedding。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_facade_remember_with_image_ref(
+    facade: tuple[MemoryFacade, MemoryHooks, LongTermStore],
+) -> None:
+    """7.4 H3:facade.remember 接受 image_ref,透传到 LongTermStore + modality tag。"""
+    f, _, store = facade
+    key = await f.remember(
+        "看图说话",
+        ctx=MemoryContext(source="camera"),
+        image_ref="/data/butler/img/2026/10/14/xxx.jpg",
+    )
+    assert key
+    # 透传到 store:查 payload 应含 image_ref
+    payload = store.get_payload(key)
+    assert payload is not None
+    assert payload["image_ref"] == "/data/butler/img/2026/10/14/xxx.jpg"
+    # tags 含 modality:image(供 7.9 按 modality 过滤)
+    assert "modality:image" in payload["tags"]
+
+
+@pytest.mark.asyncio
+async def test_facade_remember_with_audio_ref(
+    facade: tuple[MemoryFacade, MemoryHooks, LongTermStore],
+) -> None:
+    """7.4 H3:facade.remember 接受 audio_ref,透传到 LongTermStore + modality tag。"""
+    f, _, store = facade
+    key = await f.remember(
+        "听音说话",
+        ctx=MemoryContext(source="voice"),
+        audio_ref="/data/butler/aud/2026/10/14/xxx.wav",
+    )
+    assert key
+    payload = store.get_payload(key)
+    assert payload is not None
+    assert payload["audio_ref"] == "/data/butler/aud/2026/10/14/xxx.wav"
+    assert "modality:audio" in payload["tags"]
+
+
+@pytest.mark.asyncio
+async def test_facade_remember_legacy_no_modality_tag(
+    facade: tuple[MemoryFacade, MemoryHooks, LongTermStore],
+) -> None:
+    """7.4 H3 兼容性:老调用(无 image_ref / audio_ref)零破坏,tag 不带 modality:。"""
+    f, _, store = facade
+    key = await f.remember("老调用零破坏", ctx=MemoryContext(source="user"))
+    payload = store.get_payload(key)
+    assert payload is not None
+    # 不应有 modality: 前缀的 tag
+    for t in payload["tags"]:
+        assert not t.startswith("modality:"), f"老调用不应该写 modality: tag,得到 {t}"
+    # 也不应有 image_ref / audio_ref 字段
+    assert "image_ref" not in payload
+    assert "audio_ref" not in payload

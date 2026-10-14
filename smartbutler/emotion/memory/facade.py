@@ -300,8 +300,19 @@ class MemoryFacade:
         ctx: MemoryContext | None = None,
         tags: list[str] | None = None,
         importance: float | None = None,
+        # 🆕 7.4 多模态扩展位(默认 None 不存字段,7.6/7.8 传值)
+        image_ref: str | None = None,
+        audio_ref: str | None = None,
     ) -> str:
-        """存一条长期记忆。返回 key。"""
+        """存一条长期记忆。返回 key。
+
+        🆕 7.4 扩展:支持多模态 ref(image_ref / audio_ref)。
+        - image_ref: 原始图片文件路径,7.8 CameraAdapter 传入
+        - audio_ref: 原始音频文件路径,7.6 VoiceAdapter 传入
+        - 7.4-7.8 只存 Qdrant payload 字段,不做向量化
+        - 7.9 启动时由 EmbeddingGemma2Embedder 补 image_embedding
+        - 老调用(只传 content / ctx / tags / importance)零修改,完全兼容
+        """
         if not content or not content.strip():
             raise ValueError("content 不能为空")
         source = ctx.source if ctx else ""
@@ -310,9 +321,14 @@ class MemoryFacade:
             tags=list(tags) if tags else None,
             source=source,
             importance=importance,
+            image_ref=image_ref,  # 🆕 7.4 透传
+            audio_ref=audio_ref,  # 🆕 7.4 透传
         )
         self._hooks.trigger(MemoryEventType.ON_STORE, key=key, content=content)
-        logger.debug("facade.remember", key=key, source=source)
+        logger.debug(
+            "facade.remember key=%s source=%s image_ref=%s audio_ref=%s",
+            key, source, image_ref, audio_ref,
+        )
         return key
 
     async def recall(

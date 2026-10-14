@@ -101,3 +101,72 @@ def test_factory_path_and_url_conflict_raises(tmp_path: Path) -> None:
 
     with pytest.raises(StorageError):
         QdrantStorage(path=tmp_path / "q", url="http://localhost:6333")
+
+
+# ---------------------------------------------------------------------------
+# 🆕 7.4 H2:LongTermStore 多模态 payload 字段测试
+# ---------------------------------------------------------------------------
+
+
+def test_store_image_ref_and_audio_ref(lt: LongTermStore) -> None:
+    """7.4 H2:store_memory 支持 image_ref / audio_ref 两个新字段。"""
+    base = [0.1, 0.2, 0.3, 0.4]
+    lt.store_memory(
+        "img_key", base, "看图说话",
+        image_ref="/data/butler/img/2026/10/14/xxx.jpg",
+        audio_ref=None,
+    )
+    lt.store_memory(
+        "aud_key", base, "听音说话",
+        image_ref=None,
+        audio_ref="/data/butler/aud/2026/10/14/xxx.wav",
+    )
+    # 检索时应能透传
+    hits = lt.search_memory(base, k=5)
+    by_key = {h["key"]: h for h in hits}
+    assert by_key["img_key"]["image_ref"] == "/data/butler/img/2026/10/14/xxx.jpg"
+    assert "audio_ref" not in by_key["img_key"]  # None 时不存字段
+    assert by_key["aud_key"]["audio_ref"] == "/data/butler/aud/2026/10/14/xxx.wav"
+    assert "image_ref" not in by_key["aud_key"]
+
+
+def test_store_image_embedding_and_model(lt: LongTermStore) -> None:
+    """7.4 H2:store_memory 支持 image_embedding / embedding_model 字段(7.9 启动时由 EmbeddingGemma2Embedder 写)。"""
+    base = [0.1, 0.2, 0.3, 0.4]
+    img_vec = [0.5, 0.6, 0.7, 0.8, 0.9]  # 任意长度(768 维在真实场景)
+    lt.store_memory(
+        "img_emb_key", base, "image fact",
+        image_ref="/tmp/xxx.jpg",
+        image_embedding=img_vec,
+        embedding_model="embeddinggemma-2",
+    )
+    hits = lt.search_memory(base, k=5)
+    by_key = {h["key"]: h for h in hits}
+    assert by_key["img_emb_key"]["image_embedding"] == img_vec
+    assert by_key["img_emb_key"]["embedding_model"] == "embeddinggemma-2"
+
+
+def test_store_legacy_no_multimodal_fields(lt: LongTermStore) -> None:
+    """7.4 H2 兼容性:老调用(只传老字段)零破坏,payload 没有 image_ref 等字段。"""
+    base = [0.1, 0.2, 0.3, 0.4]
+    lt.store_memory("legacy", base, "old style", importance=0.5, tags=["x"])
+    hits = lt.search_memory(base, k=5)
+    by_key = {h["key"]: h for h in hits}
+    assert "image_ref" not in by_key["legacy"]
+    assert "audio_ref" not in by_key["legacy"]
+    assert "image_embedding" not in by_key["legacy"]
+    assert "embedding_model" not in by_key["legacy"]
+
+
+def test_payload_constants_exposed() -> None:
+    """7.4 H2:4 个多模态字段常量在 __all__ 里(供 7.9 EmbeddingGemma2Embedder 复用)。"""
+    from smartbutler.emotion.memory import long_term as lt_mod
+    assert "PAYLOAD_IMAGE_REF" in lt_mod.__all__
+    assert "PAYLOAD_AUDIO_REF" in lt_mod.__all__
+    assert "PAYLOAD_IMAGE_EMBEDDING" in lt_mod.__all__
+    assert "PAYLOAD_EMBEDDING_MODEL" in lt_mod.__all__
+    # 字段名常量值
+    assert lt_mod.PAYLOAD_IMAGE_REF == "image_ref"
+    assert lt_mod.PAYLOAD_AUDIO_REF == "audio_ref"
+    assert lt_mod.PAYLOAD_IMAGE_EMBEDDING == "image_embedding"
+    assert lt_mod.PAYLOAD_EMBEDDING_MODEL == "embedding_model"
