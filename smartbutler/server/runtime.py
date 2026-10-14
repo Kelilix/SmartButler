@@ -40,6 +40,7 @@ from smartbutler.events.core.event import BaseEvent, EventPriority, EventSource
 from smartbutler.events.core.event_bus import EventBus
 from smartbutler.events.core.normalizer import EventNormalizer
 from smartbutler.events.core.trigger import EventTrigger
+from smartbutler.events.routing.answer_router import AnswerRouter
 from smartbutler.server.adapters import (
     ButlerReply,
     InputAdapter,
@@ -164,6 +165,10 @@ class ButlerServer:
         self._normalizer: EventNormalizer | None = None
         self._trigger: EventTrigger | None = None
 
+        # 🆕 7.5:AnswerRouter(Proactive 链路用,Reactive 链路不经过)
+        # 延迟注入(可选;None → 走老逻辑,广播全部 OutputAdapter)
+        self._answer_router: AnswerRouter | None = None
+
         # 内部状态
         self._started = False
         self._stopped = True
@@ -220,12 +225,14 @@ class ButlerServer:
                 has_input=self._input_adapter is not None,
                 has_normalizer=self._normalizer is not None,
                 has_trigger=self._trigger is not None,
+                has_answer_router=self._answer_router is not None,  # 🆕 7.5
             )
         else:
             _logger.info(
                 "butler_server.started event_bus_disabled",
                 output_count=len(self._output_adapters),
                 has_input=self._input_adapter is not None,
+                has_answer_router=self._answer_router is not None,  # 🆕 7.5
             )
 
         # 2) Input adapter
@@ -345,6 +352,39 @@ class ButlerServer:
             return
         self._trigger = trigger
 
+    # 🆕 7.5:AnswerRouter 注入
+    def set_answer_router(self, router: AnswerRouter) -> None:
+        """运行时注入 AnswerRouter(必须在 start() 前调用)。
+
+        注入后,Proactive 链路(``_on_bus_event`` 拿到的 answer)会先走
+        ``AnswerRouter.route()`` 选目标设备;Reactive 链路(``submit_reactive``)不走。
+
+        不注入(默认)→ Proactive 链路保持老逻辑,广播全部 OutputAdapter。
+        """
+        if self._started:
+            _logger.warning("butler_server.set_answer_router after_start ignored")
+            return
+        self._answer_router = router
+
+    def set_presence_service(
+        self, presence_service: "PresenceService"  # noqa: F821
+    ) -> None:
+        """运行时注入 PresenceService(给 AnswerRouter 用,7.5 D3)。
+
+        注入只是记录到 server;真正的使用方是 AnswerRouter(由用户
+        在构造 AnswerRouter 时注入 PresenceService,这里只是占位
+        防止忘记连接)。
+
+        不强制要求注入 —— 不注入时 AnswerRouter 仍可工作(用自己注入的)。
+        """
+        # 故意不持有,只打日志 + 占位(PresenceService 的真实注入点
+        # 在用户构造 ConsoleAnswerRouter 时就完成)
+        _logger.info(
+            "butler_server.set_presence_service",
+            type=type(presence_service).__name__,
+            note="presence_service is owned by AnswerRouter, server is just observer",
+        )
+
     # ----------------- 内部 -----------------
 
     def _to_base_event(self, sub: ProactiveSubmission) -> BaseEvent:
@@ -375,14 +415,15 @@ class ButlerServer:
         await self.submit_proactive(sub)
 
     async def _on_bus_event(self, event: BaseEvent) -> None:
-        """EventBus consumer 默认 handler:🆕 7.4 走 Normalizer + Trigger。
+        """EventBus consumer 默认 handler:🆕 7.4 Normalizer+Trigger / 7.5 AnswerRouter。
 
         流程:
         1. 归一化(Normalizer)→ None = 丢弃
         2. 限速(Trigger.should_handle)→ False = 丢弃
         3. 处理(Trigger.handle)→ 拿到 answer 文本
-        4. 包装成 ButlerReply 广播给 OutputAdapter
-        5. 老逻辑(无 Normalizer / Trigger)→ 直接调 proactive_tick(沿用 §0.2 老路径)
+        4. 老逻辑(无 Trigger)→ 直接调 proactive_tick(沿用 §0.2 老路径)
+        5. 答案空校验
+        6. AnswerRouter 选路(7.5,有则走,无则老逻辑 broadcast 全部)
         """
         # 1) Normalizer
         if self._normalizer is not None:
@@ -447,9 +488,35 @@ class ButlerServer:
             if not message.strip():
                 return
             answer = message
-        # 5) 包装成 reply,广播给 OutputAdapter
+        # 5) 答案空校验(无论走 AnswerRouter 还是老逻辑都跳)
         if not answer or not answer.strip():
             return
+
+        # 6) 🆕 7.5:AnswerRouter 选路(Proactive 链路用,Reactive 不走)
+        #    注入 → 走 AnswerRouter.route();不注入 → 老逻辑 broadcast 全部
+        if self._answer_router is not None:
+            try:
+                result = await self._answer_router.route(
+                    event, answer, priority=event.priority
+                )
+            except Exception as exc:  # noqa: BLE001
+                _logger.error(
+                    "butler_server.answer_router.route_error",
+                    event_id=event.event_id,
+                    error=str(exc),
+                    exc_type=type(exc).__name__,
+                )
+                return  # AnswerRouter 失败 = 不下发(防爆管)
+            # route() 内部已 await push,这里直接结束
+            if not result.acted:
+                _logger.debug(
+                    "butler_server.answer_router.not_acted",
+                    event_id=event.event_id,
+                    reason=result.silence_reason,
+                )
+            return
+
+        # 6) 老逻辑:无 AnswerRouter → 走 _dispatch_reply broadcast 全部
         reply = ButlerReply(
             content=answer,
             user_id=event.user_id,

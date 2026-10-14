@@ -162,8 +162,10 @@ class InMemoryOutputAdapter(OutputAdapter):
         assert out.replies[0].content == "..."
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, device_id: str | None = None) -> None:
         self.replies: list[ButlerReply] = []
+        # 7.5:显式 device_id 便于 DeviceRegistry.get(device_id)路由
+        self.device_id: str | None = device_id
 
     async def push(self, reply: ButlerReply) -> None:
         self.replies.append(reply)

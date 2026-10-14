@@ -26,6 +26,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from smartbutler.events.core.event import BaseEvent, EventPriority
+from smartbutler.events.routing.route_result import RouteResult
 
 
 class AnswerRouter(ABC):
@@ -38,8 +39,8 @@ class AnswerRouter(ABC):
         answer: str,
         *,
         priority: EventPriority | None = None,
-    ) -> bool:
-        """路由 answer 到目标设备。
+    ) -> RouteResult:
+        """路由 answer 到目标设备(7.5 D1:返 RouteResult 而非 bool)。
 
         Args:
             event: 触发本 answer 的原始事件(用于取 user_id / 设备上下文)
@@ -47,8 +48,11 @@ class AnswerRouter(ABC):
             priority: 覆盖事件原始优先级(默认用 event.priority)
 
         Returns:
-            - True: 成功路由
-            - False: 路由失败(已 fallback)
+            RouteResult(acted / pushed_device_ids / fallback_used / silence_reason / error_device_ids)
+
+        约束(D4):
+            实现必须 ``await`` 所有 push 完成再返,调用方根据 result 即可知
+            "推了哪些 / 推失败几个"。
         """
         ...
 
