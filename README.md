@@ -3,7 +3,7 @@
 > 有性格、有记忆、懂上下文的家用智能管家。
 >
 > **当前版本**:`v0.3.0`(`9` 个 commit;`773 unit + 5 integration + 24 e2e` 全部 ✅)。
-> **下一站**:Phase 7.4(EventBus 链路 Normalizer + Trigger 真实化,~1 周)。
+> **下一站**:Phase 7.5(AnswerRouter + PresenceService,2026-10-14 设计敲定 D1-D4,见 `docs/PHASE_7_TECHNICAL_DESIGN.md` §4)。
 > **详细方案**:
 > - `docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md`(Memory 4 个子阶段设计)
 > - `docs/PHASE_7_TECHNICAL_DESIGN.md`(Phase 7 全周期 7.0-7.8 设计 + **§12 多模态记忆决策** + 7.9 观察项)
@@ -48,7 +48,7 @@ SmartButler 是部署在家庭里、和主人长期相处的**单一智能体实
 | **Phase 6.6** | Personality | ✅ | `emotion/personality/traits.py` + `loader.py`(YAML frontmatter md)+ `injector.py`(渲染 system prompt 片段);`ButlerPromptBuilder` 加 `personality_block` 参数;`ButlerOrchestrator.reload_personality()` 接 Learn 演化。详见 `README §2.7` 注释 |
 | **Phase 6.7** | Learn | ⏳ | 反馈事件流 + trait 映射 + 触发 `Personality.adjust_trait()` |
 | **Phase 6b** | ProactiveLoop 真实化 | ⏳(必须等 6 完成) | `LLMProactiveReasoning` 接 Memory + Persona + LLM 推理;`RuleBasedProactiveReasoning` **永不被删**(安全网) |
-| **Phase 7** | 事件驱动 + 路由 | 🟡 拆细(协议 + Server 已落库,中间环节待补) | **已落地**:7.0 协议 + 7.1 InMemoryEventBus/Server/Adapter + 7.2 ButlerReply 结构化 + 7.3 内存总线。**下一站 7.4**:Normalizer + Trigger 真实化(见 `docs/PHASE_7_TECHNICAL_DESIGN.md` §3)。**后续**:7.5 AnswerRouter+OutputAdapter / 7.6 VoiceAdapter / 7.7 TTS / 7.8 CameraAdapter / **7.9 多模态记忆(EmbeddingGemma 2,观察项,不启动)** |
+| **Phase 7** | 事件驱动 + 路由 | 🟡 拆细(协议 + Server 已落库,中间环节待补) | **已落地**:7.0 协议 + 7.1 InMemoryEventBus/Server/Adapter + 7.2 ButlerReply 结构化 + 7.3 内存总线 + 7.4 Normalizer+Trigger ✅。**下一站 7.5**:AnswerRouter+PresenceService(2026-10-14 设计敲定,见 `docs/PHASE_7_TECHNICAL_DESIGN.md` §4 D1-D4)。**后续**:7.6 VoiceAdapter / 7.7 TTS / 7.8 CameraAdapter / **7.9 多模态记忆(EmbeddingGemma 2,观察项,不启动)** |
 | **Phase 8** | 核心 Sub-Agent | ⏳ | `HomeAgent`(HomeAssistant)/ `ScheduleAgent` / `SearchAgent` |
 | **Phase 9** | 多模态感知 | ⏳ | ASR + TTS + Vision |
 | **Phase 10** | 主动服务 | ⏳ | 摄像头/麦克风监听/计划任务(与 Phase 7 联动) |
@@ -378,7 +378,9 @@ SMARTBUTLER_EMBEDDING_DIMENSION=1024   # 必须与 SMARTBUTLER_STORAGE_QDRANT_VE
 
 | 日期 | 版本 | 变更 | 关联 |
 |------|------|------|------|
-| 2026-10-14 | v0.4.1 | **🆕 7.4 实施时为 7.9 多模态记忆预留的 5 个钩子落地**:`docs/PHASE_7_TECHNICAL_DESIGN.md` §12.6 新增(总 10 个子小节),5 个钩子总成本 7.4 内 0.5 天 + ~40 行代码,**7.9 启动从 1-2 周改造变 0 改造**;**H2 强制**(Day 1 加 SQLite 列,错过 = 7.9 启动几小时锁表);H1/H3/H4 强烈建议;H5 建议;§3 7.4 待办同步加 5 个钩子;**7.4 总工作量从 150 行 → 190 行,1 周节奏不变** | `docs/PHASE_7_TECHNICAL_DESIGN.md §12.6` |
+| 2026-10-14 | v0.4.3 | **🆕 7.5 详细设计敲定 D1-D4**:AnswerRouter 返 `RouteResult` 而非 `bool`(D1);新增 `DeviceRegistry` 抽象集中管 OutputAdapter 池(D2);`SimplePresenceService` 7.5 阶段只接 dev_chat + 测试(D3);`route()` 内部 `await` 所有 push(D4);§4 重写(从 30 行 → 200 行);README §2.7 下一站从 7.4 → 7.5;**7.5 实施总工作量 415 行 + 180 测试,1-1.5 周** | `docs/PHASE_7_TECHNICAL_DESIGN.md §4` |
+| 2026-10-14 | v0.4.2 | **🆕 Phase 7.4 实施 — 5 钩子 + Normalizer+Trigger + ServerConfig**:5 钩子落地(H1/H2/H3/H4/H5,7.9 多模态记忆预留);`DedupNormalizer`(event_id+window 去重,LRU 10000);`DefaultEventTrigger`(限速 20/min,route → Proactive,内部 try/except);`ServerConfig` 加 normalizer/trigger 字段 + start() 自动构造;`_on_bus_event` 走 Normalizer → Trigger → ButlerReply;5 case 端到端测试(test_event_bus_e2e.py);**821/821 测试全过(原 773 → 821,+48 新测试)** | `docs/PHASE_7_TECHNICAL_DESIGN.md §3 + §12.6` |
+| 2026-10-14 | v0.4.1 | **🆕 7.4 实施时为 7.9 多模态记忆预留 5 个钩子落地**:`docs/PHASE_7_TECHNICAL_DESIGN.md` §12.6 新增(总 10 个子小节),5 个钩子总成本 7.4 内 0.5 天 + ~40 行代码,**7.9 启动从 1-2 周改造变 0 改造**;**H2 强制**(Day 1 加 Qdrant payload 字段,错过 = 7.9 启动要迁移数据,几小时锁表);H1/H3/H4 强烈建议;H5 建议;§3 7.4 待办同步加 5 个钩子;**7.4 总工作量从 150 行 → 190 行,1 周节奏不变** | `docs/PHASE_7_TECHNICAL_DESIGN.md §12.6` |
 | 2026-10-14 | v0.4.0 | **🆕 多模态记忆决策敲定 + 音视频流水线收口 + 7.9 观察项**:`docs/PHASE_7_TECHNICAL_DESIGN.md` §12 新增,7.6/7.8 感知层采集音视频但记忆层统一转文本(Qwen text embedding,**不上**多模态 embedding);`ReactiveSubmission.metadata` / `ButlerReply.metadata` 留扩展位;**7.9 EmbeddingGemma 2** 标为"未来观察项,不启动",触发条件任一:用户 3 个月主动以图搜图 ≥ 5 次 / 7.8 召回命中率 < 70% / Qwen2-VL-7B 本地稳定跑 / Phase 8+ 多节点;7.8 验收加 case 6/7 硬条件(感知层文本化进记忆 + 召回验证);§1.1 架构图 + §1.2 数据流 + §1.3 不变量 #11-#13 同步加"感知层多模态,记忆层单模态"约束;**7.6/7.8 工作量不变**,新增 7.9 预备工作量 ~380 行(暂不写) | `docs/PHASE_7_TECHNICAL_DESIGN.md §12` |
 | 2026-10-14 | v0.3.1 | **Phase 7 技术方案落地**:`docs/PHASE_7_TECHNICAL_DESIGN.md` 新建,盘点真实状态(7.0+7.1+7.2+7.3 全部已落库)+ 拆 7.4 Normalizer+Trigger / 7.5 AnswerRouter+Presence / 7.6 VoiceAdapter / 7.7 TTS / 7.8 Camera 5 个子阶段(总自研量 ~1900 行 + ~580 测试,约 5-7 周);README 阶段表 + 已交付模块表 + 待办列表同步更新 | `docs/PHASE_7_TECHNICAL_DESIGN.md` |
 | 2026-10-13 | v0.3.0 | **Phase 6.6 Personality 落地**:5 维 trait 数据模型(Pydantic + [0,1] 约束) + personality.md(YAML frontmatter)加载/保存 + 三档翻译渲染 system prompt 片段 + ButlerOrchestrator 接入(`personality` 参数 + `reload_personality()` 刷缓存);77 新单测(773 total) | `emotion/personality/{traits,loader,injector}.py` |

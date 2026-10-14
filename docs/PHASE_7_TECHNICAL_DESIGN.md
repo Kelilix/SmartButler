@@ -377,60 +377,289 @@ async def _on_bus_event(self, event: BaseEvent) -> None:
 
 > **承上启下**——7.4 让事件链路**不爆管**,7.5 让 ProactiveResult **正确选择 OutputAdapter**。
 
-### 4.1 ConsoleAnswerRouter(最小实现)
+### 4.1 四个实施前敲定的决策
 
-**职责**:拿到 `BaseEvent + answer + priority`,选目标 OutputAdapter 列表。
+| # | 决策 | 结论 | 理由 |
+|---|------|------|------|
+| **D1** | `AnswerRouter.route` 返 `RouteResult` 而非 `bool` | ✅ **改** | 返 bool 只能表示成/败,无法告诉调用方推了几个设备、哪个失败;`RouteResult` 可观测性好,单测好写 |
+| **D2** | 加 `DeviceRegistry` 抽象(集中管 OutputAdapter 池) | ✅ **加** | 7.6 VoiceAdapter/7.7 TTS/7.8 Camera 都要"按 device_id 找 OutputAdapter";集中 Registry,所有 router/adapter 共用,7.5+ 不用回头补 |
+| **D3** | `SimplePresenceService` 7.5 阶段**只接 dev_chat + 测试**,不开 HTTP/CLI | ✅ **dev_chat + 测试** | 7.5a 是"用户手动配置",最轻量接入是 dev_chat REPL `/presence set/get`;CLI 留 7.5+;HTTP 等 7.5b 接门锁数据流时一并做 |
+| **D4** | `AnswerRouter.route` 内部 `await` 所有 push 完成再返 | ✅ **同步等** | 跟 `ProactiveLoop.tick` 风格一致,单测好写(断言 `output.replies` 数量);Proactive 本是后台任务,慢点没事 |
 
-**实现要点**:
-- `priority=URGENT` → 推所有 OutputAdapter
-- `priority=NORMAL` → 推 PresenceService 选定的 1 个 OutputAdapter
-- `priority=SILENT` → 不推(打 DEBUG 日志)
-- PresenceService 返 None → fallback 到"全部 OutputAdapter 列表的第 1 个"(默认)
+### 4.2 RouteResult dataclass(D1)
 
-**接口不变**:`class ConsoleAnswerRouter(AnswerRouter)` — 完全沿用 `answer_router.py:32-54` 抽象。
+```python
+# smartbutler/events/routing/route_result.py
+from __future__ import annotations
 
-### 4.2 SimplePresenceService(最小实现)
+from dataclasses import dataclass, field
 
-**职责**:回答"用户当前最合适的输出设备是谁"。
+@dataclass(frozen=True)
+class RouteResult:
+    """AnswerRouter.route 的返回值。
 
-**实现要点**(沿用 `presence.py:11-15` 的 5 阶段简化到 7.5a):
-- **数据源**:`dict[user_id, PresenceInfo]`(用户显式调 `update()` 写入)
-- 7.5 不接蓝牙 / GPS / 摄像头(留给 Phase 8+)
-- `get_active_device(user_id)` 返最近写入的 PresenceInfo
-- `should_notify(priority)` 沿用 `presence.py:46-54` 实现(已在抽象里)
+    替代原 `AnswerRouter.route` 的 `bool` 返回值。
+    """
 
-**接口不变**:`class SimplePresenceService(PresenceService)` — 完全沿用 `presence.py:60-71` 抽象。
+    acted: bool
+        """是否有任何 OutputAdapter 被触达(False = SILENT / 全部失败)。"""
+    pushed_device_ids: list[str] = field(default_factory=list)
+        """实际推送到的 device_id 列表,顺序同 push 调用顺序。"""
+    fallback_used: bool = False
+        """PresenceService 返 None → 走了 fallback,调用方应打 INFO 日志。"""
+    silence_reason: str | None = None
+        """acted=False 时的原因(SILENT / 全部 push 失败)。"""
+    error_device_ids: list[str] = field(default_factory=list)
+        """推送失败的 device_id(可能 device 离线 / 超时)。"""
+```
 
-### 4.3 多 OutputAdapter 选路
+### 4.3 DeviceRegistry(D2)
 
-**ButlerServer 改造**:
-- 现有 `_dispatch_reply`(runtime.py:331-337)是无脑广播到所有 OutputAdapter
-- 7.5 改造:从 `_dispatch_reply` 改成"先问 AnswerRouter 选目标,再 broadcast"
-- **向后兼容**:AnswerRouter 未注入时,走老逻辑(广播全部)— 保证 dev_chat 文本链路不破
+```python
+# smartbutler/events/routing/device_registry.py
+"""集中管理所有 OutputAdapter(Phase 7.5)。
 
-### 4.4 端到端测试(7.5 验收)
+AnswerRouter / ButlerServer / FutureTTSAdapter / CameraAdapter 都注入同一个 Registry,
+不再各自持有 adapter 列表。
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from smartbutler.server.adapters import OutputAdapter
+
+class DeviceRegistry:
+    """OutputAdapter 注册表。"""
+
+    def __init__(self, adapters: list[OutputAdapter] | None = None) -> None:
+        self._by_id: dict[str, OutputAdapter] = {}
+        self._all: list[OutputAdapter] = list(adapters) if adapters else []
+        for ad in self._all:
+            self._by_id[self._device_id(ad)] = ad
+
+    def register(self, adapter: OutputAdapter) -> None:
+        """运行时注册一个 OutputAdapter。"""
+        self._all.append(adapter)
+        self._by_id[self._device_id(adapter)] = adapter
+
+    def get(self, device_id: str) -> OutputAdapter | None:
+        """按 device_id 查一个 OutputAdapter。"""
+        return self._by_id.get(device_id)
+
+    def all(self) -> list[OutputAdapter]:
+        """所有 OutputAdapter(顺序同注册顺序)。"""
+        return list(self._all)
+
+    def first(self) -> OutputAdapter | None:
+        """第一个注册的 OutputAdapter(fallback 用)。"""
+        return self._all[0] if self._all else None
+
+    @staticmethod
+    def _device_id(adapter: OutputAdapter) -> str:
+        """从 OutputAdapter 拿 device_id(约定:类名含 device_id 属性)。"""
+        # 约定:OutputAdapter 有 device_id 属性(PrinterOutputAdapter → "printer")
+        # 无 device_id → 用 adapter 类的 lower 名
+        return getattr(adapter, "device_id", type(adapter).__name__.lower())
+```
+
+### 4.4 ConsoleAnswerRouter(最小实现)
+
+**职责**:拿到 `BaseEvent + answer + priority`,选目标 OutputAdapter 列表,然后 `await` push 完成。
+
+**改造点**:
+- 继承抽象:`class ConsoleAnswerRouter(AnswerRouter)` — 沿用 `answer_router.py:32-54`
+- `route()` 返 `RouteResult` ✅(D1)
+- 注入 `DeviceRegistry` ✅(D2)
+- 注入 `PresenceService` ✅(D2)
+- `route()` 内部 `await` 所有 push ✅(D4)
+
+```python
+# smartbutler/events/routing/answer_router_console.py
+class ConsoleAnswerRouter(AnswerRouter):
+    def __init__(
+        self,
+        registry: DeviceRegistry,
+        presence_service: PresenceService,
+    ) -> None:
+        self._registry = registry
+        self._presence = presence_service
+
+    async def route(
+        self,
+        event: BaseEvent,
+        answer: str,
+        *,
+        priority: EventPriority | None = None,
+    ) -> RouteResult:  # D1:返 RouteResult
+        effective_priority = priority or event.priority
+
+        if effective_priority == EventPriority.SILENT:
+            return RouteResult(acted=False, silence_reason="SILENT")
+
+        # URGENT:推所有
+        if effective_priority == EventPriority.URGENT:
+            return await self._push_all(answer)
+
+        # NORMAL:按 PresenceService 选
+        presence = await self._presence.get_active_device(event.user_id)
+        if presence is None:
+            # D2:DeviceRegistry fallback
+            first = self._registry.first()
+            if first is None:
+                return RouteResult(acted=False, silence_reason="no_output_adapter")
+            return await self._push_one(first, answer)
+
+        if not presence.should_notify("normal"):
+            return RouteResult(acted=False, silence_reason="dnd_or_sleeping")
+
+        adapter = self._registry.get(presence.device_id)
+        if adapter is None:
+            return RouteResult(
+                acted=False,
+                fallback_used=True,
+                silence_reason=f"device_not_found:{presence.device_id}",
+            )
+        return await self._push_one(adapter, answer)
+
+    async def _push_one(self, adapter: OutputAdapter, answer: str) -> RouteResult:
+        """D4:同步等 push 完成。"""
+        from smartbutler.server.adapters import ButlerReply
+        try:
+            reply = ButlerReply(content=answer, user_id="default", source="proactive")
+            await adapter.push(reply)
+            return RouteResult(
+                acted=True,
+                pushed_device_ids=[self._registry._device_id(adapter)],
+            )
+        except Exception as exc:  # noqa: BLE001
+            return RouteResult(
+                acted=False,
+                pushed_device_ids=[],
+                error_device_ids=[self._registry._device_id(adapter)],
+                silence_reason=f"push_error:{exc}",
+            )
+
+    async def _push_all(self, answer: str) -> RouteResult:
+        """URGENT:推所有,并联 gather。"""
+        import asyncio
+        from smartbutler.server.adapters import ButlerReply
+        reply = ButlerReply(content=answer, user_id="default", source="proactive")
+        pushed: list[str] = []
+        errors: list[str] = []
+        for ad in self._registry.all():
+            try:
+                await ad.push(reply)
+                pushed.append(self._registry._device_id(ad))
+            except Exception:  # noqa: BLE001
+                errors.append(self._registry._device_id(ad))
+        return RouteResult(
+            acted=bool(pushed),
+            pushed_device_ids=pushed,
+            error_device_ids=errors,
+        )
+```
+
+### 4.5 SimplePresenceService(D3:dev_chat + 测试)
+
+**职责**:回答"用户当前最合适的输出设备是谁"(7.5a:用户手动配置,in-memory dict)。
+
+```python
+# smartbutler/events/routing/presence_simple.py
+class SimplePresenceService(PresenceService):
+    """Phase 7.5a:in-memory dict,用户显式 update()。
+
+    接入点(2026-10-14 决策 D3):
+    - 单测:直接调 presence.update(user_id, PresenceInfo(...))
+    - dev_chat:加 /presence set/get 命令
+    - 7.5+ 不开 HTTP/CLI(等 7.5b 接门锁数据流时一并做)
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, PresenceInfo] = {}
+
+    async def get_active_device(self, user_id: str) -> PresenceInfo | None:
+        """返回最近一次 update 的 PresenceInfo。"""
+        return self._store.get(user_id)
+
+    async def update(self, user_id: str, info: PresenceInfo) -> None:
+        """用户显式写入在场信息(7.5a:dev_chat / 单测调)。"""
+        self._store[user_id] = info
+```
+
+### 4.6 ButlerServer 改造(接入 Registry + AnswerRouter)
+
+**改造点**:
+1. `ServerConfig` 加 `device_registry` 字段
+2. `ButlerServer` 持有 `DeviceRegistry`
+3. `ButlerServer.set_answer_router(router)` 注入 AnswerRouter
+4. `submit_reactive` → 走**老逻辑**(broadcast 全部,不用 AnswerRouter) ✅
+5. `_on_bus_event` → Proactive 链路走 AnswerRouter
+
+```python
+# smartbutler/server/runtime.py
+
+class ServerConfig:
+    __slots__ = (
+        # ... 7.4 字段 ...
+        "device_registry",  # 🆕 7.5 D2
+        "answer_router",    # 🆕 7.5 D1
+    )
+    def __init__(self, ..., device_registry=None, answer_router=None): ...
+
+class ButlerServer:
+    def set_answer_router(self, router: AnswerRouter) -> None:
+        self._answer_router = router
+
+    async def _on_bus_event(self, event: BaseEvent) -> None:
+        # ... Normalizer + Trigger(7.4) ...
+        # 7.5:Proactive 链路走 AnswerRouter
+        if hasattr(self, "_answer_router") and self._answer_router is not None:
+            try:
+                result = await self._answer_router.route(
+                    event, answer,
+                    priority=event.priority,
+                )
+            except Exception:  # noqa: BLE001
+                return  # AnswerRouter 失败 = 不下发
+            if not result.acted:
+                return
+            # route() 已 await push;直接结束
+            return
+        # 老逻辑:走 proactive_tick → broadcast 全部(Reactive / 无 AnswerRouter 时)
+        # ... (保持 7.4 逻辑不变) ...
+```
+
+**向后兼容**:`answer_router=None` 时走老逻辑 ✅。
+
+### 4.7 端到端测试(7.5 验收)
 
 `tests/server/test_answer_router_e2e.py`:
-- **case 1**:Reactive 链路(`submit_reactive`)→ 走默认 OutputAdapter(无 AnswerRouter)
-- **case 2**:Proactive 链路 + `priority=NORMAL` → 走 PresenceService 选定的 OutputAdapter
-- **case 3**:Proactive 链路 + `priority=URGENT` → 推所有 OutputAdapter
-- **case 4**:Proactive 链路 + `priority=SILENT` → 不推
-- **case 5**:PresenceService 返 None → fallback 到第 1 个 OutputAdapter(不挂)
-- **case 6**:Reactive 链路 + AnswerRouter 注入 → 仍然走 Reactive 默认 OutputAdapter(Reactive 不走 AnswerRouter,见 §1.2 注)
 
-> **注**:Reactive 链路**不**走 AnswerRouter——`submit_reactive` 同步等答复,输出通道由调用方决定(REPL 走 stdout,GUI 走屏显)。AnswerRouter 只服务 Proactive 链路。
+| case | 描述 | 关键断言 |
+|------|------|---------|
+| **1** | Reactive 链路 → 走默认 OutputAdapter(无 AnswerRouter) | `len(output.replies) == 1` |
+| **2** | Proactive + NORMAL → PresenceService 选定的 OutputAdapter | `output.replies[0].device_id == "speaker.living_room"` |
+| **3** | Proactive + URGENT → 推所有 OutputAdapter | `len(output.replies) == 3` |
+| **4** | Proactive + SILENT → 不推 | `len(output.replies) == 0` |
+| **5** | PresenceService 返 None → fallback 到第 1 个 OutputAdapter | `result.fallback_used == True` |
+| **6** | Reactive + AnswerRouter 注入 → 仍走 Reactive 默认(Reactive 不走 AnswerRouter) | `len(output.replies) == 1` |
 
-### 4.5 7.5 工作量
+### 4.8 7.5 工作量(修订后,含 D1-D4 增量)
 
-| 任务 | 行数 | 1-2 周节奏 |
-|------|------|-----------|
-| `answer_router_console.py` | ~70 行 | Day 1-2 |
-| `presence_simple.py` | ~50 行 | Day 2-3 |
-| `runtime.py` 改 `_dispatch_reply` | ~15 行 | Day 3 |
-| `tests/server/test_answer_router_e2e.py` | ~150 行 6 case | Day 4-5 |
-| 调通 + 文档 | — | Day 6-7 |
+| 任务 | 行数 | 时机 | 备注 |
+|------|------|------|------|
+| `route_result.py` | ~15 行 | Day 1 | D1:新增 |
+| `device_registry.py` | ~50 行 | Day 1 | D2:新增 |
+| `answer_router_console.py` | ~90 行 | Day 1-2 | 含 D1/D4 |
+| `presence_simple.py` | ~30 行 | Day 2 | 含 D3 |
+| `server/runtime.py` 加 Registry + AnswerRouter | ~30 行 | Day 3 | 含 D2 |
+| `dev_chat.py` 加 `/presence set/get` | ~20 行 | Day 3 | D3 接入 |
+| `tests/server/test_answer_router_e2e.py` | ~180 行 6 case | Day 4-5 | 含 D1/D2/D3/D4 |
+| 调通 + README 变更记录 | — | Day 6-7 | |
 
-**最坏情况 1-2 周**——PoC 不需要 PresenceService 7.5b/c/d/e,可以先**只**实现 PresenceService 的 in-memory dict 简化版。
+**总计**:~415 行 + ~180 测试,**1-1.5 周**。比原 §4.5 排期多 ~130 行,但省掉 7.6/7.7/7.8 回头补 DeviceRegistry 的成本。
+
+**最坏情况 1.5 周**——如果 D3(PresenceService dev_chat 接入)觉得太重,可以**只做单测不做 dev_chat**接入,省 ~20 行,+0.5 天。
 
 ---
 
