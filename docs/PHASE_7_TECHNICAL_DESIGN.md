@@ -1000,3 +1000,363 @@ suggestions = ["锁好门窗", "把灯调暗"]
 5. **业务层零修改**——`thinking/loop/orchestrator.py` 只看 `MemoryFacade` Protocol,不知道底下是哪个 embedder
 
 **总结**:**今天不上**多模态 embedding 是"延迟决策",**不是"不做决策"**——3-6 个月后看真实数据再决定。
+
+### 12.6 7.4 落地时为 7.9 预留的 5 个钩子(本节是协议扩展位规范)
+
+> **本节是 7.4 实施时必须打下的"小桩"**——目的:**7.9 启动时 0 协议改造**。
+> 总成本:**7.4 内 0.5 天,~40 行代码**;收益:**7.9 启动从"1-2 周改造"变成"1 周加 EmbeddingGemma 2 实现"**。
+> 漏掉任何 1 个,7.9 启动都要补,补起来至少 0.5-1 天,**血亏**。
+
+#### 12.6.1 钩子总表
+
+| # | 钩子 | 位置 | 成本 | 时机 | 不留的后果 |
+|---|------|------|------|------|-----------|
+| **H1** | `Embedder` Protocol 加 3 个多模态方法 | `capabilities/embedding/base.py` | 12 行 | 7.4 Day 2 | 7.9 加模型时所有 Embedder 实现都要重写 |
+| **H2** | `LongTermStore` SQLite 表加 4 列 | `emotion/memory/long_term.py` | 10 行 | **7.4 Day 1(必须最早)** | 7.9 启动要 `ALTER TABLE` + 数据迁移(几十 GB 锁表几小时) |
+| **H3** | `MemoryFacade.remember()` 加 2 个可选 kw-only | `emotion/memory/facade.py` | 5 行 | 7.4 Day 3 | 7.9 启动要再改 facade + 所有调用点 |
+| **H4** | `BaseEvent.media_refs` 字段 | `events/core/event.py` | 6 行 | 7.4 Day 3 | 7.9 多模态 embedding 时找不到原始音视频文件 |
+| **H5** | `metadata["modality_tags"]` 协议注释 | `server/adapters/__init__.py` + 文档 | 5 行注释 | 7.4 Day 3 | 7.9 召回时无法按"文本/音频/视频"过滤 |
+
+**7.4 总工作量** 从 150 行 → **190 行**,多 **1 个工作日**成本。
+
+#### 12.6.2 H1:`Embedder` Protocol 加 3 个多模态方法
+
+```python
+# smartbutler/capabilities/embedding/base.py
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Embedder(Protocol):
+    """统一 Embedder 抽象(7.4 扩展:加 3 个多模态方法)。"""
+
+    @property
+    def dimension(self) -> int:
+        """向量维度(如 1024 / 512 / 768)。"""
+        ...
+
+    async def embed(self, text: str) -> list[float]:
+        """文本 embedding(Qwen / Stub / Gemma 都已实现)。"""
+        ...
+
+    # 🆕 7.4 加:多模态方法(7.4-7.8 默认抛 NotImplementedError)
+    # 7.9 启动时由 EmbeddingGemma2Embedder 实现这 3 个
+    # QwenEmbedder / StubEmbedder 继续抛(降级闭合)
+    async def embed_image(self, image_path: str) -> list[float]:
+        """图片 embedding。7.9 启动前一律抛 NotImplementedError。"""
+        raise NotImplementedError(
+            "image embedding 7.9 启动时实现,见 PHASE_7_TECHNICAL_DESIGN.md §12"
+        )
+
+    async def embed_audio(self, audio_path: str) -> list[float]:
+        """音频 embedding。7.9 启动前一律抛 NotImplementedError。"""
+        raise NotImplementedError(
+            "audio embedding 7.9 启动时实现,见 PHASE_7_TECHNICAL_DESIGN.md §12"
+        )
+
+    async def embed_video(self, video_path: str) -> list[float]:
+        """视频 embedding。7.9 启动前一律抛 NotImplementedError。"""
+        raise NotImplementedError(
+            "video embedding 7.9 启动时实现,见 PHASE_7_TECHNICAL_DESIGN.md §12"
+        )
+```
+
+**为什么必须 7.4 做**:
+- Protocol 是契约——一旦其他模块依赖 `Embedder` 知道有 `embed_image`,**未来 7.9 直接加实现即可**
+- 7.4-7.8 业务层**完全不知道**这 3 个方法存在(默认抛 NotImplementedError)
+- 7.9 启动时 `EmbeddingGemma2Embedder` 实现这 3 个,`QwenEmbedder` / `StubEmbedder` 继续抛——**降级闭合**
+
+**验收**:`tests/unit/test_embedder_protocol.py` 加 3 个 case,断言:
+- `QwenEmbedder().embed_image("xxx.jpg")` → 抛 `NotImplementedError`
+- `StubEmbedder().embed_audio("xxx.wav")` → 抛 `NotImplementedError`
+- Protocol 用 `@runtime_checkable` 后,`isinstance(QwenEmbedder(), Embedder)` 为 True
+
+#### 12.6.3 H2:`LongTermStore` SQLite 表加 4 列(7.4 Day 1 必做)
+
+> **Qdrant 端是 schema-less(JSON payload),7.4 不用动**。**SQLite 端有 schema,7.4 必须加列**——错过 7.4,后续加列要"加约束",触发 vacuum / 索引重建。
+
+```python
+# smartbutler/emotion/memory/long_term.py
+class LongTermStore:
+    _EPISODIC_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS episodic (
+        id TEXT PRIMARY KEY,
+        text TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        importance REAL,
+        source TEXT,
+        image_ref TEXT,            -- 🆕 H3 钩子:7.4 加(7.6/7.8 写,7.9 才用)
+        audio_ref TEXT,            -- 🆕 H3 钩子:7.4 加
+        image_embedding BLOB,      -- 🆕 H2 钩子:7.4 加,默认 NULL,7.9 启动时补
+        embedding_model TEXT,      -- 🆕 H2 钩子:7.4 加,默认 NULL,记录哪个模型生成的 embedding
+        metadata JSON,
+        created_at TIMESTAMP,
+        ...
+    );
+    """
+
+    async def _ensure_schema(self):
+        await self._conn.execute(self._EPISODIC_SCHEMA)
+
+        # 🆕 12.6.3:防御性 ALTER(若表已存在,SQLite 幂等加列)
+        for col, typedef in [
+            ("image_ref", "TEXT"),       # H3
+            ("audio_ref", "TEXT"),       # H3
+            ("image_embedding", "BLOB"),  # H2
+            ("embedding_model", "TEXT"),  # H2
+        ]:
+            try:
+                await self._conn.execute(
+                    f"ALTER TABLE episodic ADD COLUMN {col} {typedef}"
+                )
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+        await self._conn.commit()
+```
+
+**为什么必须 7.4 Day 1 做**:
+- **7.4 之前** SQLite 表**还不存在**或**只有几行测试数据**——**7.4 加列是"新表加列",0 迁移**
+- **7.4 之后** 加列 = "加约束" → 触发 `VACUUM` + 索引重建,大表**几小时锁表**
+- **错过 7.4,7.9 启动时** = `ALTER TABLE` 加 `image_embedding BLOB` + `UPDATE` 全表补向量(几十万行,慢几小时)
+
+**验收**:
+- `tests/unit/emotion/memory/test_long_term_schema.py` 加 1 个 case,断言新表 schema **含这 4 列**
+- 加 1 个 case,断言"老表 + ALTER"幂等(跑 2 次 `_ensure_schema` 不报错)
+- 加 1 个 case,断言"老表无这 4 列"→ ALTER 后这 4 列**存在**且可写
+
+#### 12.6.4 H3:`MemoryFacade.remember()` 加 2 个可选 kw-only
+
+```python
+# smartbutler/emotion/memory/facade.py
+async def remember(
+    self,
+    text: str,
+    user_id: str = "default",
+    importance: float | None = None,
+    source: str = "user",  # "user" / "voice" / "perception" / "skill" / "system"
+    *,
+    image_ref: str | None = None,   # 🆕 7.4 加,7.8 CameraAdapter 传
+    audio_ref: str | None = None,   # 🆕 7.4 加,7.6 VoiceAdapter 传
+    metadata: dict[str, Any] | None = None,  # 已经存在
+) -> RememberResult:
+    ...
+    # 落到 LongTermStore:这两个字段先持久化,但 7.4-7.8 不做向量化
+    payload = {
+        "text": text,
+        "user_id": user_id,
+        "importance": importance,
+        "source": source,
+        "image_ref": image_ref,
+        "audio_ref": audio_ref,
+        "metadata": {
+            **(metadata or {}),
+            "image_ref": image_ref,   # 同步写到 metadata,方便 7.9 直接读
+            "audio_ref": audio_ref,
+        },
+    }
+```
+
+**为什么是 0 改造成本**:
+- `image_ref` / `audio_ref` 默认 `None`——**所有老调用完全不变**
+- 7.4-7.8 业务层不知道这两个参数存在
+- 7.6 VoiceAdapter 调用:`remember(text=asr_text, source="voice", audio_ref=event.media_refs.get("audio"))`
+- 7.8 CameraAdapter 调用:`remember(text=caption, source="perception", image_ref=image_path, metadata={...})`
+- 7.9 启动时,新增 `embedder.embed_image(image_ref)` 调一次,**完全不改 facade**
+
+**验收**:
+- `tests/unit/emotion/memory/test_facade.py` 加 2 个 case:
+  - 老调用 `remember(text="x", source="user")` → 正常,`image_ref` / `audio_ref` 为 None 持久化
+  - 新调用 `remember(text="x", source="voice", audio_ref="/tmp/xxx.wav")` → `image_ref` / `audio_ref` 落 SQLite + metadata 同步
+
+#### 12.6.5 H4:`BaseEvent.media_refs` 字段(7.4 加可空字段,默认 dict)
+
+```python
+# smartbutler/events/core/event.py
+@dataclass(frozen=True)
+class BaseEvent:
+    event_id: str
+    source: EventSource
+    priority: EventPriority
+    user_id: str
+    timestamp: datetime
+    topic: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    parent_agent_tag: str | None = None
+
+    # 🆕 7.4 加(钩子 5)
+    media_refs: dict[str, str] = field(
+        default_factory=dict,
+        metadata={
+            "doc": (
+                "扩展位:media_type -> file_path 映射。\n"
+                "7.6/7.8 写入如:\n"
+                "  {'image': '/data/butler/img/2026/10/14/xxx.jpg',\n"
+                "   'video': '/data/butler/vid/2026/10/14/xxx.mp4',\n"
+                "   'audio': '/data/butler/aud/2026/10/14/xxx.wav'}\n"
+                "7.9 多模态 embedding 时直接读这个字段定位原始文件,"
+                "调 embedder.embed_image(media_refs['image'])。\n"
+                "不变量 #2:Normalizer 看到此字段一律原样透传,不修改。"
+            )
+        }
+    )
+```
+
+**为什么 0 成本**:
+- 默认 `field(default_factory=dict)`,**老调用完全不变**
+- `BaseEvent` 是 frozen,新字段**必须放最末尾 + 带默认值**(沿用不变量 #2)
+- **7.4-7.8 业务层不读这个字段**——只在 publish 7.6/7.8 事件时**写入**
+- 7.9 启动时直接 `event.media_refs["image"]` 拿原始文件路径
+
+**不变量检验**(沿用 §1.3 #2 `Normalizer 不修改原事件`):
+- `DedupNormalizer` 看到 `media_refs` **原样透传**,不动它
+- `EventTrigger` 拿到 `media_refs` **原样透传到 `parent_agent_tag` 后的 metadata**
+
+**验收**:
+- `tests/events/test_base_event.py` 加 3 个 case:
+  - `BaseEvent(event_id="x", ...)` 不传 `media_refs` → 默认 `{}`
+  - `BaseEvent(event_id="x", ..., media_refs={"image": "/tmp/x.jpg"})` → 字段可访问
+  - `BaseEvent` 是 frozen → 改 `event.media_refs["image"] = "y"` 抛 `dataclasses.FrozenInstanceError`
+  - `DedupNormalizer.normalize(event)` 返原事件 → `event.media_refs` 字段**原样**
+
+#### 12.6.6 H5:`metadata["modality_tags"]` 协议注释(7.4 加 5 行注释)
+
+```python
+# smartbutler/server/adapters/__init__.py
+class ReactiveSubmission(BaseModel):
+    user_input: str
+    user_id: str
+    session_id: str
+    source: Literal["reactive"] = "reactive"
+    parent_agent: str | None = None
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="""
+        扩展位。约定键:
+
+        - modality_tags: list[str]    🆕 7.4 协议层注释
+            - 文本交互 → ["text"]
+            - VoiceAdapter(7.6) → ["text", "audio"]
+            - CameraAdapter(7.8) → ["text", "image", "video"]
+
+        - image_ref: str              🆕 7.4 协议层注释
+            7.6/7.8 写入原始文件路径,7.9 多模态 embedding 用
+        - audio_ref: str              🆕 7.4 协议层注释
+            同上
+
+        ⚠️ 不允许:
+        - 加 dataclass 字段(沿用不变量 #8 协议稳定)
+        - 删 / 改已有键(同上)
+        - 必填任何键(老调用兼容性)
+        """
+    )
+```
+
+**`ButlerReply.metadata` 同样加注释**(沿用 `server/adapters/__init__.py` 同一文件)。
+
+**为什么 0 行代码成本**:
+- `metadata: dict[str, Any]` 已经在,**完全够用**
+- 只改 `description` 注释,**老调用零修改**
+- 7.9 召回时直接 `reply.metadata.get("modality_tags", ["text"])` 过滤
+
+**验收**:无独立单测——**这是协议注释,不是代码逻辑**。在 `tests/server/test_event_bus_e2e.py` 加 1 个 case 验证老调用不传 `modality_tags` 时管家仍正常工作。
+
+#### 12.6.7 7.4-7.8 实施时**绝对不要做**的 3 件事
+
+```python
+# ❌ 1. 不要在 7.6/7.8 里实现多模态 embedding
+async def _on_voice_event(self, event):
+    asr_text = ...
+    image_vector = self._qwen_vl.encode(asr_audio)  # ❌ 7.9 才做
+    await self._memory.remember(text=asr_text, image_vector=image_vector)
+
+# ✅ 正确做法:7.6/7.8 只存 ref,不做向量化
+async def _on_voice_event(self, event):
+    asr_text = ...
+    await self._memory.remember(
+        text=asr_text,
+        source="voice",
+        audio_ref=event.media_refs.get("audio"),  # H4
+        metadata={"modality_tags": ["text", "audio"]},  # H5
+    )
+    # 7.9 启动时再补 image_vector / audio_vector
+```
+
+**理由**:7.4-7.8 引入多模态模型会**拖慢启动 + 增加依赖 + 反复加 1GB+ 内存**,得不偿失。
+
+```python
+# ❌ 2. 不要把 image_ref / audio_ref 当强约束
+async def remember(self, text, *, image_ref: str, audio_ref: str):  # ❌ 破坏老调用
+
+# ✅ 正确做法:允许 None
+async def remember(
+    self, text, *,
+    image_ref: str | None = None,  # ✅ 可空
+    audio_ref: str | None = None,  # ✅ 可空
+):
+```
+
+**理由**:
+- 7.6 VoiceAdapter 走 ASR,**不一定每条都有原始音频**(流式可能丢弃)
+- 7.8 CameraAdapter 评估"是否存档原始图/视频"有争议——**可能只存 caption 不存原始数据**(沿用不变量 #12)
+- 7.9 启动时,**有 `image_ref` 的走多模态 embedding,没有的纯文本召回**,优雅降级
+
+```python
+# ❌ 3. 不要在 7.6/7.8 改 ReactiveSubmission / ButlerReply 的已有字段
+class ReactiveSubmission:
+    metadata: dict[str, Any] = ...  # 类型/默认值不变
+    # 不要加新 dataclass 字段(沿用不变量 #8:协议稳定)
+
+# ✅ 正确做法:只在 metadata 内部新增键(modality_tags / image_ref / audio_ref)
+# ✅ 不动 dataclass 字段
+```
+
+**理由**:沿用 §1.3 不变量 #8,新键加在 `metadata` dict 里是**协议扩展**(允许),加 dataclass 字段是**协议破坏**(禁止)。
+
+#### 12.6.8 7.4 实施时的工作流(按这顺序来)
+
+| Day | 任务 | 行数 | 钩子 |
+|-----|------|------|------|
+| **Day 1** | 改 `LongTermStore._ensure_schema` 加 4 列 | 10 | **H2(必须最早)** |
+| **Day 2** | 改 `Embedder` Protocol 加 3 个方法 | 12 | **H1** |
+| **Day 3** | 改 `BaseEvent.media_refs` 字段 | 6 | **H4** |
+| **Day 3** | 改 `MemoryFacade.remember` 加 2 个 kw-only | 5 | **H3** |
+| **Day 3** | 改 `ReactiveSubmission.metadata` / `ButlerReply.metadata` 加注释 | 5 | **H5** |
+| **Day 4** | 写 `tests/unit/test_embedder_protocol.py`(H1 验证)| 30 | — |
+| **Day 4** | 写 `tests/unit/emotion/memory/test_long_term_schema.py`(H2 验证)| 25 | — |
+| **Day 4** | 写 `tests/emotion/memory/test_facade.py` H3 用例 | 20 | — |
+| **Day 5** | 写 `tests/events/test_base_event.py` H4 用例 | 20 | — |
+| **Day 5** | 跑 7.4 原 5 case 端到端测试(不破) | — | — |
+| **Day 6-7** | 7.4 原计划(Normalizer + Trigger + _on_bus_event 改造)| ~150 | — |
+
+**7.4 总工作量**:190 行 + 200 测试(原 150 + 钩子 40)+ 200 钩子测试 = **~590 行,1 周节奏不变**。
+
+#### 12.6.9 7.9 启动时,这些钩子如何用
+
+| 7.9 任务 | 用哪个钩子 | 改造量 |
+|---------|-----------|-------|
+| `EmbeddingGemma2Embedder` 实现 3 个多模态方法 | **H1** | 0 改(只是把 `raise NotImplementedError` 换成 `return model.encode(...)`)|
+| `LongTermStore` 加 image_embedding 写入 | **H2** | 0 改(列已存在) |
+| 7.8 老数据补 image_embedding | **H2** | 1 条 SQL:`UPDATE episodic SET image_embedding=? WHERE image_ref IS NOT NULL` |
+| `MemoryFacade.remember()` 加 `image=` 参数 | **H3** | 0 改(已支持 image_ref) |
+| `CameraAdapter` 7.8 已经有 image_ref 进记忆 | **H3** | 0 改 |
+| `EventBus` 7.8 已经有 media_refs 字段 | **H4** | 0 改 |
+| 召回时按 modality 过滤 | **H5** | 0 改(`metadata.get("modality_tags", ["text"])`) |
+
+**7.9 总改造量** = `EmbeddingGemma2Embedder` 1 个新文件(~150 行) + 1 条 SQL 补数据 + 1 处 `MemoryFacade.recall` 加 `modality_tags` 过滤逻辑(~10 行)。
+
+**对比 7.4 不留钩子**:`ALTER TABLE` + Embedder Protocol 重写(2-3 天) + EventBus 协议重写(1 天) + facade 改造(半天) → **1-2 周**。
+
+**省 0.5 天,赚 1-2 周**。
+
+#### 12.6.10 总结:7.4 Day 1 加列是"强制项",其他 4 个是"强烈建议"
+
+| 钩子 | 强制程度 | 漏掉成本 |
+|------|---------|---------|
+| **H2** `LongTermStore` 加 4 列 | **🔴 强制** | 7.9 启动要迁移数据,几小时锁表 |
+| **H1** `Embedder` Protocol 加方法 | 🟡 强烈建议 | 7.9 加新 embedder 时所有实现要重写 |
+| **H3** `MemoryFacade.remember` 加 kw-only | 🟡 强烈建议 | 7.9 启动要再改 facade + 所有调用点 |
+| **H4** `BaseEvent.media_refs` 字段 | 🟡 强烈建议 | 7.9 找不到原始文件,7.6/7.8 又得重写 |
+| **H5** `modality_tags` 注释 | 🟢 建议 | 7.9 召回时少一个过滤维度,可补 |
+
+**最坏情况**:只做 H2(强制项),其他 4 个 7.9 启动时再补——**多 0.5-1 天**,可控。
+**最好情况**:5 个都做,**7.9 启动 0 改造**——多 0.5 天,省 1-2 周。
