@@ -1,1355 +1,1002 @@
-# Phase 7: 事件总线 + 生产入口
+# Phase 7 技术方案:事件驱动 + 路由
 
-> 状态: 设计阶段，代码未实现。
-> 前置: Phase 6.6 Personality ✅ 已完成，Phase 6.3 Memory 3层分片 ✅ 已完成。
-> 目标: 替换 `scripts/dev_chat.py`，成为真正的生产启动入口。
-> **最新更新（2026-10-13 v0.7.1）**：
->   - §6 实施计划收紧 YAGNI 边界：Phase 7.1 只做 Server 高层 API，**不写任何 Adapter**
->   - 明确"未来设备接入 = 写独立脚本调高层 API，不属于 ButlerServer 核心代码"
->   - Phase 7.2 验收标准改为"演示脚本调 `event_bus.publish()`"，不再假设 HA 已接入
+> **范围**:Phase 7 全周期(7.0 协议 / 7.1 Server / 7.2 结构化 reply / 7.3 内存总线 / 7.4 Normalizer+Trigger / 7.5 AnswerRouter+OutputAdapter / 7.6 VoiceAdapter / 7.7 TTS / 7.8 CameraAdapter / **7.9 多模态记忆(观察项,不启动)**)
+> **不包含**:Phase 6b ProactiveLoop 真实化(LLMProactiveReasoning)/ Phase 8 领域 Sub-Agent / 后续多节点 Redis Streams
+> **前置依赖**:Phase 6.1+6.2 P0 Memory ✅ / Phase 4b ProactiveLoop 框架 ✅ / Phase 5 Skill ✅
+> **关联 ADR**:`smartbutler/events/ADR-008-event-driven.md`(事件驱动决策)+ `smartbutler/thinking/ADR-009-proactive-reactive-dual-loop.md`(双循环)+ `README §3` 架构约束
 
----
+> **🆕 重大修正(2026-10-14)**:原 ADR-008 的"Redis Streams / 8 周拆分"对单进程 dev_chat **过度设计**。
+> **现状**:协议 + Server + 内存总线 + Stub Adapter **均已落地**(见 §0.1),EventBus 链路**已经能跑通**。
+> **真正缺的是中间环节**:Normalizer / EventTrigger / AnswerRouter **抽象已定义,0 行实现**——直接由 `ButlerServer._on_bus_event` 旁路了。
+> **修正后的节奏**:先补齐 Normalizer + Trigger(7.4)+ 真实 OutputAdapter(7.5/7.7),再做真硬件(7.6 Voice / 7.8 Camera)。Redis 升级留 Phase 8+ 多节点。
 
-## 0. 关键约定：Reactive vs Proactive 的本质区别
-
-> ⚠️ **本节是设计核心。** 后续 §1 的架构图、§6 实施计划都建立在此基础上。
-
-### 0.1 一句话区别
-
-| Loop | 入口 | 触发 | 默认行为 |
-|---|---|---|---|
-| **ReactiveLoop** | `ButlerServer.submit_reactive(input, session_id)` | 用户主动调 | **有问必答**（无 silent） |
-| **ProactiveLoop** | `EventBus handler` → `ButlerServer._on_device_event(event)` | 设备事件经 EventBus 路由 | **有判必沉**（70%+ silent） |
-
-**两条路径**：
-- **路径 A（Reactive）**：用户 → InputAdapter → `submit_reactive()` → TaskDispatcher → ReactiveLoop → Orchestrator
-- **路径 B（Proactive）**：设备 → InputAdapter → `EventBus.publish()` → EventBus consumer → `_on_device_event()` → ProactiveLoop → Orchestrator（仅在 should_respond=True 时）
-
-### 0.2 三个层次的区分
-
-| 层次 | Reactive | Proactive |
-|---|---|---|
-| **入口形态** | 用户/Adapter 显式调 `ButlerServer.submit_reactive()` | EventBus 推送触发 `_on_device_event(event)` |
-| **循环结构** | `ReactiveLoop.run(input) → str`（无 silent 选项） | `ProactiveLoop.tick(event) → ProactiveResult(acted/silent)` |
-| **调用栈** | InputAdapter → TaskDispatcher → ReactiveLoop → Orchestrator → Response | InputAdapter → EventBus → consumer → _on_device_event → ProactiveLoop → (Orchestrator) → AnswerRouter |
-
-### 0.3 TaskScheduler 不是第三个 loop
-
-`TaskScheduler` 和 `ConsolidationScheduler` 看起来像"第三类循环"，但它们**不参与用户对话回路**：
-
-| 维度 | ReactiveLoop | ProactiveLoop | TaskScheduler |
-|---|---|---|---|
-| 触发者 | 用户/Adapter 显式 | EventBus handler | 后台周期 timer / `on_message_received` |
-| 是否参与对话 | ✅ 主对话回路 | ✅ 主动回路 | ❌ 后台记忆维护 |
-| 调 `orchestrator.ainvoke`? | ✅ 必须 | ✅ 只在 should_respond=True | ❌ 调 `segmenter.segment()`（不同 API） |
-| 返回值 | `str`（管家响应） | `ProactiveResult`（acted/silent） | `dict`（扫描统计） |
-| 输出 | 返回调用方 | 推到 AnswerRouter | 触发 AutoExtract 回调 |
-| 是否要 LLM | ✅（管家 LLM） | ✅（管家 LLM） | ✅（segmenter LLM） |
-
-**TaskScheduler 调的是 `TaskSegmenter.segment()`，不调 `ButlerOrchestrator.ainvoke()`**。它是"后台整理记忆"，和管家对话回路解耦。
+> **🆕 多模态记忆决策(2026-10-14,本轮敲定)**:**感知层(7.6/7.8)采集音视频,但记忆层(7.6/7.8/7.9)统一先转文本进 MemoryFacade**——`text + QwenEmbedder` 是默认,**家用 95% 场景召回精度足够**。
+> - **理由 1**:Omni VLM(7.8 接入)产出 `caption + matched_rules + speeches + suggestions` 本就是结构化文本,直接 `MemoryFacade.remember(text=caption)` 走现有 Qwen text embedding。
+> - **理由 2**:"这条裙子 vs 昨天那条蓝裙子"这种场景,只要 Omni caption 抽到"蓝"就能召回到;caption 漏掉才需要多模态 embedding,**95% 情况不会漏**。
+> - **理由 3**:"以图搜图 / 跨模态检索"家用 1 年触发 1-5 次,投入 CLIP/ImageBind/EmbeddingGemma 2(1GB+ 依赖)不划算。
+> - **结论**:**7.6/7.8 跑通感知流,记忆层不引入多模态 embedding**。`ReactiveSubmission.metadata: dict[str, Any]` 和 `ButlerReply.metadata: dict[str, Any]` **已经预留扩展位**。
+> - **7.9 EmbeddingGemma 2** 标为 **"未来观察项,不启动"**——等 3-6 个月后看真实用户行为,触发条件见 §12.3。
+> - **本设计文档同步补充 §12 "多模态记忆决策"**——详细记录这条决策的依据和未来切换路径。
 
 ---
 
-## 1. 核心设计决策
+## 0. 当前状态盘点(2026-10-14)
 
-### 1.1 总线并发模型：并发输入 → 串行任务
+### 0.1 已交付(7.0 + 7.1 + 7.2 + 7.3)
 
-> ⚠️ **本图展示路径 A + 路径 B 的完整回路**。背景任务（TaskScheduler / ConsolidationScheduler）与对话回路解耦，不在此图。
+| 模块 | 文件 | 状态 |
+|------|------|------|
+| **BaseEvent 协议** | `smartbutler/events/core/event.py` | ✅(`EventSource`/`EventPriority` 4×3 枚举)|
+| **EventBus 抽象接口** | `smartbutler/events/core/event_bus.py` | ✅(publish/subscribe/start/stop/ack/replay) |
+| **EventNormalizer 抽象** | `smartbutler/events/core/normalizer.py` | ✅(纯接口) |
+| **EventTrigger 抽象** | `smartbutler/events/core/trigger.py` | ✅(纯接口) |
+| **AnswerRouter 抽象** | `smartbutler/events/routing/answer_router.py` | ✅(纯接口) |
+| **PresenceService 抽象** | `smartbutler/events/routing/presence.py` | ✅(纯接口) |
+| **DeviceEvent 协议** | `smartbutler/events/protocol/device_event.py` | ✅(DeviceType 14 枚举) |
+| **VoiceEvent 协议** | `smartbutler/events/protocol/voice_event.py` | ✅(VoiceAction 4 枚举) |
+| **TimerEvent 协议** | `smartbutler/events/protocol/timer_event.py` | ✅ |
+| **InMemoryEventBus** | `smartbutler/server/bus.py` | ✅(支持通配符 + history + replay) |
+| **ButlerServer** | `smartbutler/server/runtime.py` | ✅(submit_reactive / submit_proactive / start / stop) |
+| **ServerConfig** | 同上 | ✅(event_bus 注入 + enable_event_bus 开关) |
+| **ReactiveSubmission / ProactiveSubmission / ButlerReply** | `smartbutler/server/adapters/__init__.py` | ✅(ButlerReply 含 `source="reactive"/"proactive"` 区分) |
+| **InputAdapter 抽象** | 同上 | ✅(set_sink + start + stop) |
+| **OutputAdapter 抽象** | 同上 | ✅(push + 内部 try/except 兜底) |
+| **InMemoryInputAdapter** | `smartbutler/server/adapters/stub.py` | ✅(enqueue_reactive / publish_proactive / send_now) |
+| **InMemoryOutputAdapter** | 同上 | ✅(replies 列表 + clear + last) |
+| **PrintOutputAdapter** | 同上 | ✅(stdout 打印,dev_chat 用) |
+| **build_default_server** | `smartbutler/server/runtime.py` | ✅(默认 InMemoryEventBus) |
+
+**关键判断**:EventBus 链路**已经**端到端可跑——`dev_chat → enqueue_reactive → ButlerServer.submit_reactive → orchestrator.ainvoke → PrintOutputAdapter`。`submit_proactive → publish 到 EventBus → _on_bus_event → orchestrator.proactive_tick → OutputAdapter` 这条**也通**,只是**绕过了 EventNormalizer + EventTrigger**(见 §0.2)。
+
+### 0.2 真实缺口(本方案要补)
+
+| 缺口 | 现状 | 风险 |
+|------|------|------|
+| **EventNormalizer 0 实现** | `normalizer.py` 是纯 `@abstractmethod` | 烟雾报警器 1 秒推 60 事件 → 管家说 60 次"着火了" |
+| **EventTrigger 0 实现** | `trigger.py` 是纯 `@abstractmethod` | 缺限速 + 缺 source→loop 路由决策 |
+| **`_on_bus_event` 旁路** | `runtime.py:298-322` 直接 `proactive_tick`,**没走 Normalizer/Trigger** | EventBus producer 端(VoiceAdapter/CameraAdapter)接入后必然爆管 |
+| **EventBus 历史无去重** | `InMemoryEventBus.replay` 按 topic 返历史,但不 dedup | 单测 debug 重放时同一事件出现 N 次 |
+| **AnswerRouter 0 实现** | `routing/answer_router.py` 是纯接口 | ProactiveResult → 选哪个 OutputAdapter 推送没定 |
+| **PresenceService 0 实现** | `routing/presence.py` 是纯接口 | 多设备时答完推谁不可知(Phase 7.5 简化:走 default + 广播) |
+| **VoiceAdapter 0 实现** | `events/protocol/voice_event.py` 协议有,没 producer | USB 麦 / 智能音响无法接入 |
+| **CameraAdapter 0 实现** | `events/protocol/device_event.py` 协议有,没 producer | 摄像头无法接入 |
+| **TTS OutputAdapter 0 实现** | 只有 `PrintOutputAdapter` / `InMemoryOutputAdapter` | 管家不会"说话",只能"打印" |
+
+**已确认:Phase 7 协议层 + 抽象层 = 100% 落地,实现层 = ~10%(只 Server + Stub)。**
+
+---
+
+## 1. 整体架构
+
+### 1.1 模块依赖图
 
 ```
-                  ┌──────────────────────────────────────────┐
-                  │          InputAdapters (并发)            │
-                  │  - REPLAdapter                          │
-                  │  - HomeAssistant WebSocket Adapter      │
-                  │  - HTTP / WebSocket                     │
-                  └────────┬───────────────────┬────────────┘
-                           │                   │
-                     路径 A │            路径 B │
-                     直调  │            事件  │
-                           │                   │
-                           ▼                   ▼
-                   ┌───────────────┐    ┌──────────────────┐
-                   │TaskDispatcher │    │ InMemoryEventBus │
-                   │ (串行化网关)   │    │ topic=device.*   │
-                   │               │    │ topic=timer.*    │
-                   └───────┬───────┘    └────────┬─────────┘
-                           │                     │
-                           │                     ▼
-                           │          ┌──────────────────────┐
-                           │          │ EventBus._consumer() │
-                           │          │ (异步, 独立 task)    │
-                           │          └────────┬─────────────┘
-                           │                   │
-                           ▼                   ▼
-                  ┌─────────────────┐  ┌──────────────────────┐
-                  │  ReactiveLoop   │  │ ButlerServer.        │
-                  │  (有问必答)      │  │   _on_device_event() │
-                  │                 │  │   (注册到 bus 的     │
-                  │  调:             │  │    handler)          │
-                  │  orch.ainvoke() │  └────────┬─────────────┘
-                  │  返: str        │           │
-                  └────────┬────────┘           ▼
-                           │            ┌──────────────────────┐
-                           │            │  ProactiveLoop       │
-                           │            │  (有判必沉)           │
-                           │            │                      │
-                           │            │  调: reasoning +     │
-                           │            │   orch.ainvoke()     │
-                           │            │  返: ProactiveResult │
-                           │            └────────┬─────────────┘
-                           │                     │
-                           │   ┌─────────────────┘
-                           │   │
-                           ▼   ▼
-                    ┌────────────────────┐
-                    │ ButlerOrchestrator │
-                    │  (全局唯一)        │
-                    │                    │
-                    │  共用 graph._compiled │
-                    └──────────┬─────────┘
-                               │
-                               ▼
-                       ┌──────────────┐
-                       │ AnswerRouter │
-                       │ (输出路由)   │
-                       └──────┬───────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-       REPL/Terminal    TTS 音响        WebSocket App
-       (Reactive 返)   (Proactive 推)    (双向)
-
-【后台维护】(不参与对话回路，独立 task)
-  - TaskScheduler (1h 周期) ─► TaskSegmenter ─► AutoExtract
-  - ConsolidationScheduler (cron) ─► Consolidator
+┌──────────────────────────────────────────────────────────────────────┐
+│                       Phase 7 模块分层                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐          │
+│  │ VoiceAdapter   │  │ CameraAdapter  │  │ DeviceAdapter  │          │
+│  │ (7.6 新)        │  │ (7.8 新)        │  │ (8+ 新)        │          │
+│  │ USB 麦/智能音响  │  │ 摄像头/感知流水线│  │ 门锁/灯/空调  │          │
+│  └────────┬───────┘  └────────┬───────┘  └────────┬───────┘          │
+│           │ publish          │ publish          │ publish           │
+│           ▼                  ▼                  ▼                   │
+│  ┌──────────────────────────────────────────────────────────┐        │
+│  │              EventBus (7.3 已实现)                        │        │
+│  │         InMemoryEventBus / (Phase 8+: Redis Streams)     │        │
+│  └────────────────────────┬─────────────────────────────────┘        │
+│                           │ consumer                                │
+│                           ▼                                          │
+│  ┌──────────────────────────────────────────────────────────┐        │
+│  │         EventNormalizer (7.4 新 — 抽象已有)              │        │
+│  │   DedupNormalizer / DebounceNormalizer / FilterNormalizer│        │
+│  └────────────────────────┬─────────────────────────────────┘        │
+│                           │ 过滤后的事件                              │
+│                           ▼                                          │
+│  ┌──────────────────────────────────────────────────────────┐        │
+│  │         EventTrigger (7.4 新 — 抽象已有)                  │        │
+│  │         DefaultEventTrigger(route + 限速 + 兜底)          │        │
+│  │     ├─ source=user/interface → Reactive ainvoke          │        │
+│  │     └─ source=device/voice/timer/webhook → Proactive tick│        │
+│  └────────────────────────┬─────────────────────────────────┘        │
+│                           │ answer / ProactiveResult.message        │
+│                           ▼                                          │
+│  ┌──────────────────────────────────────────────────────────┐        │
+│  │  ┌─────────────────────┐  ┌─────────────────────────┐     │        │
+│  │  │ AnswerRouter (7.5)   │  │ PresenceService (7.5)    │     │        │
+│  │  │ ConsoleAnswerRouter │  │ SimplePresenceService   │     │        │
+│  │  └──────────┬──────────┘  └────────────┬────────────┘     │        │
+│  │             └──────────┬───────────────┘                  │        │
+│  │                        ▼                                  │        │
+│  │              选目标 OutputAdapter                          │        │
+│  └────────────────────────┬─────────────────────────────────┘        │
+│                           │ ButlerReply                              │
+│                           ▼                                          │
+│  ┌──────────────────────────────────────────────────────────┐        │
+│  │              OutputAdapter (7.5 / 7.7 新)                │        │
+│  │   ┌─────────────────┐  ┌─────────────────┐  ┌──────────┐ │        │
+│  │   │ PrintOutput      │  │ TTSOutput       │  │ PhonePush│ │        │
+│  │   │ (已实现)         │  │ (7.7 新)        │  │ (8+ 新)  │ │        │
+│  │   └─────────────────┘  └─────────────────┘  └──────────┘ │        │
+│  └──────────────────────────────────────────────────────────┘        │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────┐        │
+│  │  voice/ 子模块 (7.6 + 7.7 共享)                          │        │
+│  │   capture/ (mic_capture) + vad/ (silero)                │        │
+│  │   asr/ (funasr) + wakeword/ (porcupine)                 │        │
+│  │   tts/ (edge / offline piper)                           │        │
+│  └──────────────────────────────────────────────────────────┘        │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────┐        │
+│  │  perception/ 子模块 (7.8 新)                            │        │
+│  │   gate/ (帧差分) + identity/ (DeepSORT + ReID)          │        │
+│  │   omni/ (VLM caption 抽 facts) + buffer/ (音视频对齐)    │        │
+│  └──────────────────────────────────────────────────────────┘        │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────┐        │
+│  │  emotion/memory/ (Phase 6 已落地)                       │        │
+│  │   MemoryFacade.remember(text=caption)                    │        │
+│  │   ← 7.6/7.8 感知层输出统一转文本进记忆                   │        │
+│  │   ← QwenEmbedder(text-only) 足够 95% 家用场景            │        │
+│  │   ← 7.9 观察项:多模态 embedding(EmbeddingGemma 2)按需启动│        │
+│  └──────────────────────────────────────────────────────────┘        │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-**设计理由**：
+### 1.2 数据流(完整链路)
 
-- Memory 层（`MemoryFacade`）基于 `aiosqlite` + Qdrant，**天然非线程安全**，串行化避免竞态
-- 用户对话本质上是串行的（一个人说话，另一个人听），并发调用没有收益
-- 串行化让 `ButlerOrchestrator` 全局只持有一份，`LangGraph` checkpointer 不需要分布式锁
-- 并发输入 → 任务入队 → 依次执行 → 响应按顺序返回给各调用方（通过 `Future` / `asyncio.Event`）
+```
+完整 Reactive 链路(7.5+):
+  用户说话 → 智能音响/USB 麦
+  → voice/capture/mic_capture (sounddevice 采集)
+  → voice/vad/silero (VAD 门控)
+  → voice/asr/funasr (ASR 转写 → asr_text="杰贝兹,今天周几")
+  → events/adapters/voice_adapter.py 构造 VoiceEvent(asr_text=...)
+  → EventBus.publish(voice.command)
+  → InMemoryEventBus consumer
+  → DedupNormalizer.normalize(过滤重复)
+  → DefaultEventTrigger.should_handle(限速)
+  → DefaultEventTrigger.handle → route(source=voice → Reactive)
+  → orchestrator.ainvoke("杰贝兹,今天周几？", parent_agent="trigger:voice.command")
+  → answer text
+  → ConsoleAnswerRouter.route → PresenceService 选目标设备
+  → TTSOutputAdapter.push(answer)
+  → voice/tts/edge_impl.synthesize → mp3
+  → 本机扬声器 / 智能音响播放
 
-### 1.2 两条路径的并发隔离
+完整 Proactive 链路(7.6+):
+  烟雾报警器触发
+  → DeviceAdapter 构造 DeviceEvent(device_type=SMOKE_DETECTOR, priority=URGENT)
+  → EventBus.publish(device.smoke_detector.alarm)
+  → InMemoryEventBus consumer
+  → DedupNormalizer (短窗口内去重)
+  → DefaultEventTrigger.should_handle(限速)
+  → DefaultEventTrigger.handle → route(source=device → Proactive)
+  → orchestrator.proactive_tick(event)
+  → ProactiveResult.acted=True, message="检测到厨房烟雾,正在通知家人"
+  → ConsoleAnswerRouter.route(priority=URGENT → 推全屋)
+  → TTSOutputAdapter.push(message) 多次(每个 OutputAdapter 各一次)
+  → 全屋智能音响同时播放
 
-| 路径 | 入口 | 并发模型 | 是否串行化 |
-|---|---|---|---|
-| **路径 A (Reactive)** | `submit_reactive()` | 多个 InputAdapter 并发调入队 | ✅ **强串行**（TaskDispatcher） |
-| **路径 B (Proactive)** | EventBus 推送 | EventBus 内部按 topic 独立 consumer | ⚠️ **同 topic 串行**（同 topic 顺序消费，跨 topic 独立） |
+音视频感知 → 记忆(7.6 + 7.8 跑通,记忆层文本化):
+  ┌─ VoiceAdapter(7.6)──────────────────────────────────────────┐
+  │  ASR 转写后:asr_text="主人说蓝裙子比昨天那条好看"           │
+  │  → VoiceEvent(asr_text, priority=NORMAL)                    │
+  │  → EventBus.publish                                        │
+  │  → Trigger.handle → Reactive ainvoke → 管家答              │
+  │  → 【同时】MemoryFacade.remember(                            │
+  │      text=asr_text,  ← 直接文本进记忆(Qwen text embedding)  │
+  │      source="voice",                                        │
+  │      metadata={device_id, timestamp}                        │
+  │    )                                                        │
+  │  → 下次召回"女主人最近说过什么"→ 命中这条                    │
+  └─────────────────────────────────────────────────────────────┘
 
-**为什么 Reactive 强串行而 Proactive 仅同 topic 串行**：
+  ┌─ CameraAdapter(7.8)────────────────────────────────────────┐
+  │  摄像头帧 → MultimodalCollector(3-5s window)               │
+  │  → Gate(帧差分)→ Identity(DeepSORT + ReID)                 │
+  │  → Omni(VLM, 抽 caption + matched_rules + speeches)        │
+  │  → caption="女主人穿蓝色长款雪纺裙在玄关换鞋"                │
+  │  → DeviceEvent(perception, payload={caption, person_id,    │
+  │                       matched_rules, ...})                  │
+  │  → EventBus.publish                                        │
+  │  → 【同时】MemoryFacade.remember(                            │
+  │      text=caption,    ← Omni 输出是结构化文本,直接进记忆    │
+  │      source="perception",                                  │
+  │      metadata={                                          │
+  │        person_id, location, scene_tags=["蓝","长款","雪纺"],│
+  │        image_ref="/data/butler/images/2026/10/14/xxx.jpg"  │
+  │      }                                                     │
+  │    )                                                        │
+  │  → 下次召回"最近穿的蓝裙子" → 命中(因为 caption 含"蓝")     │
+  │                                                            │
+  │  【未来 7.9 观察项】若 caption 漏"蓝"导致召不回,             │
+  │    才考虑 EmbeddingGemma 2 直接以图召图(见 §12)             │
+  └─────────────────────────────────────────────────────────────┘
+```
 
-- Reactive 调 `ButlerOrchestrator.ainvoke()`，orchestrator 内部有可写状态（`_current_memory_block` 等），并发会污染
-- Proactive 走 EventBus 自己的 consumer，consumer handler 内部只调 `ProactiveLoop.tick()`，tick() 内部 try/except + silent 降级，并发不污染 orchestrator 状态
-- 但 Proactive 推送最终走 AnswerRouter → TTS，并发可能导致语音乱序，所以**同 topic 串行**是必要的
+### 1.3 关键不变量(本方案全程必须遵守)
 
-### 1.3 三类输入的并发隔离
-
-| 输入源 | 并发模型 | 路径 | 说明 |
-|---|---|---|---|
-| REPL（本地终端） | 主线程 input() | A | input() 本身阻塞，但入队后立即返回 |
-| HA WebSocket | 独立 asyncio Task | B | 持续监听，断线重连，事件入 EventBus |
-| HTTP API | 每个请求一个 Task | A | Web 框架（FastAPI/uvicorn）并发接请求，任务入队 |
-
-### 1.4 设备输出（推送）
-
-管家产生的输出分两类：
-
-| 类型 | 说明 | 路由 |
-|---|---|---|
-| **Reactive 响应** | 用户主动问的，响应给发起方 | 直接返回给 REPL/WebSocket caller |
-| **Proactive 推送** | 设备事件触发，管家主动开口 | 推送到所有在线设备（AnswerRouter） |
+1. **EventBus 抽象稳定**:`EventBus` 接口一旦敲定**不删不改**(沿用 ADR-008 §5 不变量 #1)。
+2. **Normalizer 不修改原事件**:`BaseEvent` 是 frozen,Normalizer 必须返回新事件或 None(沿用 `normalizer.py:32-34` 注释)。
+3. **Trigger 内部 try/except**:`EventTrigger.handle` **不抛异常**——否则 EventBus consumer 会反复重试同一条事件(沿用 `trigger.py:65-67` 注释)。
+4. **写操作工具不暴露给 trigger 模式**:`parent_agent="trigger:*"` 模式下管家 LLM 只能用只读工具,不能直接调设备写(沿用 ADR-008 §6 决策 6)。
+5. **proactive 沉默优先**:`ProactiveResult.acted=False` 不下发到 OutputAdapter(沿用 `runtime.py:317-318` 实现)。
+6. **OutputAdapter 内部 try/except**:`OutputAdapter.push` **不抛异常**——吞掉 + log(沿用 `adapters/__init__.py:148-150` 注释)。
+7. **PresenceService fallback 必做**:`get_active_device` 返 None → AnswerRouter 必须能 fallback 到默认 OutputAdapter,不能挂。
+8. **ButlerReply 形态不变**:`source` 字段(`"reactive"/"proactive"`)一旦敲定**不删改**(Phase 7.5+ 新增字段 OK,删改需 ADR)。
+9. **多 OutputAdapter 广播**:`ButlerServer._dispatch_reply` 用 `asyncio.gather(..., return_exceptions=True)` 并联广播,任一失败不影响其他(沿用 `runtime.py:331-337` 实现)。
+10. **ProactiveLoop tick 必须有结果**:`proactive_tick(event)` 返 `ProactiveResult`(不可变,`acted`/`message`/`urgency`/`silence_reason` 4 字段),不能返 None(沿用 `orchestrator.py:580-609` 契约)。
+11. **感知层多模态,记忆层单模态(文本)**:VoiceAdapter(7.6)/CameraAdapter(7.8)可以采集音频/视频原始流,**但进 MemoryFacade 时必须先转文本**——ASR 转写后的 `asr_text`、Omni VLM 输出的 `caption` 直接 `remember(text=...)` 走 Qwen text embedding。**当前不引入多模态 embedding**(7.9 观察项,见 §12)。
+12. **感知层原始数据不持久化**:`voice/capture/` 和 `perception/` 子模块只做流式处理,音频帧/视频帧**不写盘**(仅 `image_ref` 存盘,在 7.8 CameraAdapter 落地时评估是否需要短期存档)。**原始数据流式丢弃**,Miloco 思路沿用。
+13. **多模态扩展位预留**:`ReactiveSubmission.metadata: dict[str, Any]` 和 `ButlerReply.metadata: dict[str, Any]` 已经预留——7.9 若启动 EmbeddingGemma 2,新增字段直接走 metadata,不破坏现有协议。
 
 ---
 
-## 2. 目录结构
+## 2. 子阶段拆分(7.0 → 7.8)
+
+> 严格按依赖顺序——每阶段必须前一阶段跑通单测 + 端到端测试后才启动。
+> **理由**:链路一断,后面所有 adapter 都跑不通。
+
+### 2.1 Phase 7 状态总表
+
+| 子阶段 | 模块 | 自研量 | 状态 | 启动前置 |
+|--------|------|--------|------|----------|
+| **7.0** 协议 + 抽象 | `events/{core,protocol,routing}/` | ~600 行 | ✅ **已落地** | — |
+| **7.1** Server + InMemoryEventBus | `server/{runtime,bus,adapters/}` | ~700 行 | ✅ **已落地** | 7.0 |
+| **7.2** 结构化 reply | `ButlerReply` 数据类 | (7.1 内) | ✅ **已落地** | 7.1 |
+| **7.3** 内存总线 | `InMemoryEventBus` | (7.1 内) | ✅ **已落地**(Redis 升级 8+) | 7.1 |
+| **7.4** Normalizer + Trigger | `events/core/normalizer_dedup.py` + `trigger_default.py` + `server/runtime.py` 改 `_on_bus_event` | ~150 行 + ~150 测试 | 🆕 **下一站** | 7.1 |
+| **7.5** AnswerRouter + OutputAdapter | `events/routing/answer_router_console.py` + `presence_simple.py` + `server/adapters/console_output.py`(或扩 InMemoryOutputAdapter) | ~200 行 + ~80 测试 | 🆕 | 7.4 |
+| **7.6** VoiceAdapter(第一个真硬件,音频输入)| `events/adapters/voice_adapter.py` + `voice/{capture,vad,asr,wakeword}/` | ~500 行 + ~120 测试 | 🆕 | 7.5 |
+| **7.7** TTSOutputAdapter(第一个真输出)| `voice/tts/{edge,offline}.py` + `events/adapters/tts_output_adapter.py` | ~250 行 + ~80 测试 | 🆕 | 7.5 |
+| **7.8** CameraAdapter(视频输入,音视频流水线收口)| `events/adapters/camera_adapter.py` + `perception/{gate,identity,omni}.py` + `voice/capture/buffer.py` | ~800 行 + ~150 测试 | 🆕 | 7.7 |
+| **7.9** 多模态记忆 EmbeddingGemma 2(观察项,当前不启动)| `capabilities/embedding/gemma2.py` + `factory.py` 扩展 + `LongTermStore` 多模态索引 | ~380 行 + ~120 测试(不写) | ⏳ **观察项** | 7.8 + 3-6 个月真实使用反馈 |
+
+**Phase 7 实际自研量**(7.4-7.8):~1900 行 + ~580 测试,约 5-7 周(单人节奏)。
+**7.9 不计入**——只有触发条件满足(见 §12.3)才启动。
+
+### 2.2 节奏表(按"端到端可见"切片)
+
+| 里程碑 | 包含子阶段 | 端到端验证 | 预期周期 |
+|--------|------------|-----------|----------|
+| **M0** 当前已交付 | 7.0+7.1+7.2+7.3 | dev_chat 文本链路 ✅ | 0 |
+| **M1 事件链路补全** | +7.4 | 推 1 个 DeviceEvent → 1 次管家回答(不爆管) | 1 周 |
+| **M2 真硬件 PoC** | +7.5+7.6+7.7 | 说话 → 管家答 → 本机播放 | 4-5 周 |
+| **M3 视频通路** | +7.8 | 摄像头感知 → 命中规则 → 主动播报 | 2-3 周 |
+
+---
+
+## 3. Phase 7.4 详细设计 — Normalizer + Trigger 真实化
+
+> **当前最优先**——EventBus producer 端(VoiceAdapter / CameraAdapter)在它之前**不能接入**。
+
+### 3.1 DedupNormalizer
+
+**职责**:基于 `event_id` + `topic` 的去重——同 `event_id`(或同 topic + device_id + N 秒内)在窗口期内只保留第一个。
+
+**为什么必须**:
+- 烟雾报警器 1 秒内会推 60 个相同 `event_id` 事件
+- 门锁开启 5 秒内反复触发 5 次
+- 智能音响误唤醒推 3 个 `voice.wake_word`
+- 不归一化 = 事件风暴把管家打挂(沿用 `normalizer.py:14` 注释)
+
+**实现要点**:
+- `dict[event_id, first_seen_ts]` 内存表 + `window_sec` 窗口
+- 容量上限 `max_size=10000` 触发 LRU 淘汰(防内存泄漏)
+- `asyncio.Lock` 保护(单进程多 consumer 协程并发)
+- `normalize` 返 `None` = 丢弃,返原事件 = 放行(后续可返新事件支持 debounce/filter)
+
+**接口不变**:`class DedupNormalizer(EventNormalizer)` — 完全沿用 `normalizer.py:31-41` 抽象。
+
+**不做的事**(留给 Phase 7.4+ 后续):
+- ❌ Debounce(多次按门铃合成 1 次)—— 需要按 `(topic, device_id, payload 关键字段)` 算 fingerprint,Phase 7.4.1
+- ❌ Filter(用户已知不感兴趣 → 丢弃)—— 需要 PresenceService + 用户偏好,Phase 7.5
+- ❌ Augment(补全上下文)—— 需要历史事件关联,Phase 7.5+
+
+### 3.2 DefaultEventTrigger
+
+**职责**:拿到归一化后的事件,**决定走哪条循环** + **限速** + **调用** + **兜底**。
+
+**实现要点**:
+- 限速:`dict[user_id, list[float]]` 时间戳表,默认 `max_per_minute=20`,超出 → ack + WARN,不让管家被淹没
+- 路由(沿用 ADR-009 §5.9.3):
+  - `source in (DEVICE, TIMER, VOICE, WEBHOOK)` → `orchestrator.proactive_tick(event)` → 沉默优先
+  - `source in (USER, INTERFACE)` → `orchestrator.ainvoke(event.to_user_input(), parent_agent=event.parent_agent_tag)`
+- 兜底:`handle` 内部 try/except,失败 → 返 fallback 文本 `"[error] 管家暂时无法处理该事件"` + 记 ERROR 日志
+- ack:成功后 EventBus 调 `bus.ack(event)`(内存版 no-op,但接口调用保留)
+
+**接口不变**:`class DefaultEventTrigger(EventTrigger)` — 完全沿用 `trigger.py:42-83` 抽象。
+
+### 3.3 ButlerServer 改造
+
+**现状**(runtime.py:298-322):
+```python
+async def _on_bus_event(self, event: BaseEvent) -> None:
+    """EventBus consumer 默认 handler:转给 ProactiveLoop。"""
+    result = await self._orchestrator.proactive_tick(event, ...)
+    # 沉默 / 异常 / 空 message 都不下发
+    ...
+```
+
+**改造后**:
+```python
+async def _on_bus_event(self, event: BaseEvent) -> None:
+    """EventBus consumer 默认 handler:走 Normalizer + Trigger。"""
+    # 1. 归一化(dedup / debounce / filter / augment)
+    normalized = await self._normalizer.normalize(event)
+    if normalized is None:
+        return  # 丢弃
+    # 2. Trigger 限速判断
+    if not await self._trigger.should_handle(normalized):
+        return
+    # 3. Trigger 处理(route + 调循环 + 兜底)
+    answer = await self._trigger.handle(normalized)
+    if not answer or not answer.strip():
+        return
+    # 4. 包装成 reply,广播给 OutputAdapter
+    reply = ButlerReply(
+        content=answer, user_id=normalized.user_id,
+        session_id=f"proactive-{normalized.event_id}",
+        source="proactive", related_event_id=normalized.event_id,
+    )
+    await self._dispatch_reply(reply)
+```
+
+**ServerConfig 新增 2 字段**:
+- `normalizer: EventNormalizer | None`(默认 None 时 7.4 实现 `DedupNormalizer()` 自动注入)
+- `trigger: EventTrigger | None`(默认 None 时 7.4 实现 `DefaultEventTrigger(orchestrator=...)` 自动注入)
+
+**向后兼容**:`normalizer=None` / `trigger=None` 时 `_on_bus_event` 走老逻辑(直接 `proactive_tick`),保证 7.4 之前的 dev_chat 不破。
+
+### 3.4 端到端测试(7.4 验收)
+
+`tests/server/test_event_bus_e2e.py`:
+- **case 1**:publish 1 个 DeviceEvent → 1 次 OutputAdapter 收到
+- **case 2**:publish 60 个同 `event_id` DeviceEvent(window=5s) → 只 1 次 OutputAdapter 收到(剩余 59 次 dedup 丢弃)
+- **case 3**:publish 30 个不同 `event_id` DeviceEvent(同 user) → 限速 20/min,只 20 次 OutputAdapter 收到
+- **case 4**:Trigger 调 `proactive_tick` 抛异常 → OutputAdapter 收到 fallback 文本,EventBus 不死循环
+- **case 5**:VoiceEvent(source=VOICE) → Trigger 路由到 Reactive `ainvoke` 路径(走通 parent_agent="trigger:voice.command")
+
+### 3.5 7.4 工作量
+
+| 任务 | 行数 | 1 周节奏 |
+|------|------|----------|
+| `normalizer_dedup.py` | ~30 行 | Day 1 |
+| `trigger_default.py` | ~80 行 | Day 2-3 |
+| `runtime.py` 改 `_on_bus_event` + `ServerConfig` 加 2 字段 | ~25 行 | Day 3 |
+| `tests/server/test_event_bus_e2e.py` | ~200 行 5 case | Day 4-5 |
+| 调通 + 文档(本文件 §3 段同步) | — | Day 6-7 |
+
+**最坏情况 1 周**内跑通:**从 publish 烟雾事件 → 60 个事件去重为 1 个 → Trigger 路由到 ProactiveLoop → 推回 1 条告警文本 → OutputAdapter 收到。**
+
+---
+
+## 4. Phase 7.5 详细设计 — AnswerRouter + PresenceService + OutputAdapter 扩展
+
+> **承上启下**——7.4 让事件链路**不爆管**,7.5 让 ProactiveResult **正确选择 OutputAdapter**。
+
+### 4.1 ConsoleAnswerRouter(最小实现)
+
+**职责**:拿到 `BaseEvent + answer + priority`,选目标 OutputAdapter 列表。
+
+**实现要点**:
+- `priority=URGENT` → 推所有 OutputAdapter
+- `priority=NORMAL` → 推 PresenceService 选定的 1 个 OutputAdapter
+- `priority=SILENT` → 不推(打 DEBUG 日志)
+- PresenceService 返 None → fallback 到"全部 OutputAdapter 列表的第 1 个"(默认)
+
+**接口不变**:`class ConsoleAnswerRouter(AnswerRouter)` — 完全沿用 `answer_router.py:32-54` 抽象。
+
+### 4.2 SimplePresenceService(最小实现)
+
+**职责**:回答"用户当前最合适的输出设备是谁"。
+
+**实现要点**(沿用 `presence.py:11-15` 的 5 阶段简化到 7.5a):
+- **数据源**:`dict[user_id, PresenceInfo]`(用户显式调 `update()` 写入)
+- 7.5 不接蓝牙 / GPS / 摄像头(留给 Phase 8+)
+- `get_active_device(user_id)` 返最近写入的 PresenceInfo
+- `should_notify(priority)` 沿用 `presence.py:46-54` 实现(已在抽象里)
+
+**接口不变**:`class SimplePresenceService(PresenceService)` — 完全沿用 `presence.py:60-71` 抽象。
+
+### 4.3 多 OutputAdapter 选路
+
+**ButlerServer 改造**:
+- 现有 `_dispatch_reply`(runtime.py:331-337)是无脑广播到所有 OutputAdapter
+- 7.5 改造:从 `_dispatch_reply` 改成"先问 AnswerRouter 选目标,再 broadcast"
+- **向后兼容**:AnswerRouter 未注入时,走老逻辑(广播全部)— 保证 dev_chat 文本链路不破
+
+### 4.4 端到端测试(7.5 验收)
+
+`tests/server/test_answer_router_e2e.py`:
+- **case 1**:Reactive 链路(`submit_reactive`)→ 走默认 OutputAdapter(无 AnswerRouter)
+- **case 2**:Proactive 链路 + `priority=NORMAL` → 走 PresenceService 选定的 OutputAdapter
+- **case 3**:Proactive 链路 + `priority=URGENT` → 推所有 OutputAdapter
+- **case 4**:Proactive 链路 + `priority=SILENT` → 不推
+- **case 5**:PresenceService 返 None → fallback 到第 1 个 OutputAdapter(不挂)
+- **case 6**:Reactive 链路 + AnswerRouter 注入 → 仍然走 Reactive 默认 OutputAdapter(Reactive 不走 AnswerRouter,见 §1.2 注)
+
+> **注**:Reactive 链路**不**走 AnswerRouter——`submit_reactive` 同步等答复,输出通道由调用方决定(REPL 走 stdout,GUI 走屏显)。AnswerRouter 只服务 Proactive 链路。
+
+### 4.5 7.5 工作量
+
+| 任务 | 行数 | 1-2 周节奏 |
+|------|------|-----------|
+| `answer_router_console.py` | ~70 行 | Day 1-2 |
+| `presence_simple.py` | ~50 行 | Day 2-3 |
+| `runtime.py` 改 `_dispatch_reply` | ~15 行 | Day 3 |
+| `tests/server/test_answer_router_e2e.py` | ~150 行 6 case | Day 4-5 |
+| 调通 + 文档 | — | Day 6-7 |
+
+**最坏情况 1-2 周**——PoC 不需要 PresenceService 7.5b/c/d/e,可以先**只**实现 PresenceService 的 in-memory dict 简化版。
+
+---
+
+## 5. Phase 7.6 详细设计 — VoiceAdapter(第一个真硬件)
+
+> **本节是"音频输入"端到端实现**——USB 麦 / 笔记本内置麦 / 智能音响麦克风阵列 → VoiceEvent → EventBus。
+
+### 5.1 模块结构
 
 ```
 smartbutler/
-├── server/                        # 🆕 Phase 7 核心
+├── voice/                                # 🆕 独立子模块
 │   ├── __init__.py
-│   ├── bus.py                     # asyncio.EventBus 实现
-│   ├── dispatcher.py              # 任务分发器（串行化网关）
-│   ├── butler_server.py           # ButlerServer 核心：持有 orchestrator，驱动双 loop
-│   ├── app.py                     # 生产入口：FastAPI / uvicorn 启动
-│   ├── adapters/                  # 输入适配器
+│   ├── config.py                          # 采样率 / 通道数 / VAD 阈值配置
+│   ├── capture/
 │   │   ├── __init__.py
-│   │   ├── base.py                # InputAdapter 抽象基类
-│   │   ├── repl.py                # REPL 适配器（替换 dev_chat）
-│   │   ├── ha_websocket.py        # HomeAssistant WebSocket 适配器
-│   │   └── http_ws.py            # HTTP + WebSocket 适配器（未来扩展）
-│   └── output/                    # 输出路由
+│   │   ├── base.py                        # BaseAudioCapture 接口
+│   │   └── mic_capture.py                 # sounddevice InputStream
+│   ├── vad/
+│   │   ├── __init__.py
+│   │   └── silero.py                      # Silero VAD(单测可注入 mock)
+│   ├── asr/
+│   │   ├── __init__.py
+│   │   ├── base.py                        # BaseASR 接口
+│   │   ├── funasr_impl.py                 # FunASR Paraformer(中文 SOTA)
+│   │   └── streaming.py                   # 流式 ASR 封装 + 句子边界
+│   ├── wakeword/
+│   │   ├── __init__.py
+│   │   ├── base.py                        # BaseWakeWordDetector 接口
+│   │   └── porcupine_impl.py              # Picovoice Porcupine(可选,Phase 7.6.1)
+│   └── tts/                               # Phase 7.7 详
 │       ├── __init__.py
-│       ├── base.py                # OutputAdapter 抽象基类
-│       ├── answer_router.py       # AnswerRouter：响应 → 路由到发起方
-│       └── speaker.py             # TTS → 音响推送适配器
-│
-├── events/                        # Phase 7 骨架（现有）
-│   ├── core/
-│   │   ├── event_bus.py          # 🆕 实现（接口已定义）
-│   │   ├── normalizer.py         # 🆕 实现
-│   │   └── trigger.py            # 🆕 实现
-│   ├── adapters/                 # 设备适配器
-│   │   └── homeassistant.py      # 🆕 HA 设备适配器
-│   └── routing/
-│       ├── answer_router.py       # 🆕 实现（从 skeleton 填充）
-│       └── presence.py            # 🆕 实现
-│
-└── thinking/loop/
-    ├── orchestrator.py            # 现有，✅ 不改主体
-    ├── proactive_loop.py          # 现有，✅ 不改主体
-    └── reactive_loop.py          # 🆕 抽象：把 orchestrator.ainvoke() 包装成 loop
+│       ├── base.py
+│       ├── edge_impl.py
+│       └── offline_impl.py
+└── events/
+    └── adapters/
+        ├── __init__.py
+        ├── voice_adapter.py               # 🆕 mic → VoiceEvent
+        ├── camera_adapter.py              # Phase 7.8
+        ├── device_adapter.py              # Phase 8+
+        ├── timer_adapter.py               # Phase 8+
+        └── tts_output_adapter.py          # Phase 7.7
 ```
 
----
-
-## 3. 核心组件详解
-
-### 3.1 `ButlerServer`（核心调度器）
+### 5.2 BaseAudioCapture 接口
 
 ```python
-# smartbutler/server/butler_server.py
+# smartbutler/voice/capture/base.py
+class AudioChunk(BaseChunk):
+    audio: np.ndarray      # 16kHz mono float32
+    timestamp: float        # unix time
+    duration_ms: int
 
-class ButlerServer:
-    """
-    管家服务核心调度器。
+class BaseAudioCapture(ABC):
+    @abstractmethod
+    async def start(self) -> None: ...
 
-    职责：
-    1. 持有 ButlerOrchestrator（全局唯一，串行访问）
-    2. 驱动 ReactiveLoop + ProactiveLoop
-    3. 把任务分发器（Queue）的任务依次路由到对应 Loop
-    4. 把 Loop 产出路由到 AnswerRouter
+    @abstractmethod
+    async def stream(self) -> AsyncIterator[AudioChunk]: ...
 
-    不变量：
-    - ButlerServer 只持有一份 ButlerOrchestrator
-    - 所有 Loop 调用 orchestrator 都通过 ButlerServer 代理
-    - Loop 不直接持有 orchestrator，避免多实例竞态
-    """
+    @abstractmethod
+    async def stop(self) -> None: ...
+```
 
+### 5.3 MicAudioCapture 实现要点
+
+- `sounddevice.InputStream` 异步回调(callback 推到 `asyncio.Queue`)
+- 16kHz mono float32(与 FunASR Porcupine 一致)
+- `frame_duration_ms=30`(与 Silero VAD 输入要求一致)
+- 跨平台:Windows(WASAPI)/ macOS(CoreAudio)/ Linux(ALSA)— sounddevice 已封装
+
+### 5.4 SileroVAD 门控
+
+- `torch.hub.load("snakers4/silero-vad", "silero_vad")` 4MB 模型
+- `is_speech(audio: np.ndarray) -> bool` 单次调用 < 1ms
+- 阈值默认 0.5(可在 `voice/config.py` 调)
+
+### 5.5 FunASR ASR 集成
+
+- `funasr.AutoModel(model="paraformer-zh", vad_model="fa-zh-vad", punc_model="ct-punc", device="cpu")`
+- 喂入完整一句话音频(VAD + 静音超时判定句子结束)
+- 返 `{"text": "杰贝兹,今天周几"}`(含标点)
+
+### 5.6 VoiceAdapter 主流程
+
+```python
+# smartbutler/events/adapters/voice_adapter.py
+class VoiceAdapter:
+    """USB 麦 / 笔记本麦 → EventBus。"""
     def __init__(
         self,
-        orchestrator: ButlerOrchestrator,
-        proactive_loop: ProactiveLoop,
-        event_bus: EventBus,
-        output_router: AnswerRouter,
-        user_id: str = "default",
-    ):
-        self._orch = orchestrator
-        self._proactive = proactive_loop
-        self._bus = event_bus
-        self._router = output_router
-        self._user_id = user_id
-        self._dispatcher = TaskDispatcher()
-
-    async def start(self) -> None:
-        """启动服务：启动 bus + 注册事件处理 + 启动 dispatcher"""
-        await self._bus.start()
-        # 订阅事件到 ProactiveLoop
-        await self._bus.subscribe(
-            topic="device.#",          # 所有设备事件
-            handler=self._on_device_event,
-        )
-        await self._bus.subscribe(
-            topic="timer.#",            # 定时器事件
-            handler=self._on_timer_event,
-        )
-        # 启动分发器（开始处理队列中的任务）
-        await self._dispatcher.start()
-
-    async def stop(self) -> None:
-        """优雅关闭：等分发器清空队列 + 停止 bus"""
-        await self._dispatcher.stop()
-        await self._bus.stop()
-
-    # ---------- 外部入口（REPL / HTTP 调这里）----------
-
-    async def submit_reactive(
-        self,
-        user_input: str,
-        session_id: str,
-        source: str = "repl",         # 用于 AnswerRouter 路由回去
-        spoke_at: datetime | None = None,
-    ) -> str:
-        """
-        提交 Reactive 任务。
-        任务入队 → 串行等待 → 返回管家响应。
-        """
-        task = ReactiveTask(
-            user_input=user_input,
-            session_id=session_id,
-            user_id=self._user_id,
-            source=source,
-            spoke_at=spoke_at or datetime.now(UTC),
-        )
-        return await self._dispatcher.enqueue(task)
-
-    # ---------- 内部事件处理 ----------
-
-    async def _on_device_event(self, event: BaseEvent) -> None:
-        """设备事件 → 推 ProactiveLoop → 决定是否主动"""
-        result = await self._proactive.tick(event)
-        if result.acted:
-            # 主动推送 → AnswerRouter
-            await self._router.push_proactive(
-                message=result.message,
-                urgency=result.urgency,
-                source_event_id=event.event_id,
-            )
-        await self._bus.ack(event)
-
-    async def _on_timer_event(self, event: BaseEvent) -> None:
-        """定时器事件 → 同设备事件"""
-        await self._on_device_event(event)
-```
-
-### 3.2 `TaskDispatcher`（串行化网关）
-
-```python
-# smartbutler/server/dispatcher.py
-
-from dataclasses import dataclass, field
-import asyncio
-from datetime import datetime
-from typing import Any, Awaitable
-
-
-@dataclass
-class ReactiveTask:
-    """Reactive 任务单元。"""
-    user_input: str
-    session_id: str
-    user_id: str
-    source: str                    # "repl" | "http" | "websocket"
-    spoke_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    future: asyncio.Future[str] = field(default_factory=asyncio.Future)
-
-    @property
-    def task_id(self) -> str:
-        return f"{self.source}:{self.session_id}:{self.spoke_at.isoformat()}"
-
-
-class TaskDispatcher:
-    """
-    任务分发器：并发接收 → 串行执行 → 结果返回。
-
-    设计原理：
-    - 所有输入源并发调用 enqueue()，任务立即入 asyncio.Queue
-    - 内部一个 worker 协程从队列取任务，串行执行
-    - 任务完成时 resolve 对应的 Future，唤醒等待方
-
-    不变量：
-    - Queue 容量无上限（队列堆积代表输入超过处理能力）
-    - 单个任务失败不影响其他任务（每个任务 try/except）
-    - worker 崩溃后自动重启（with asyncio.timeout）
-    """
-
-    def __init__(self, on_task: Callable[[ReactiveTask], Awaitable[str]]):
-        """
-        Args:
-            on_task: 实际执行业务逻辑的回调。
-                     TaskDispatcher 不直接持有 ButlerServer，
-                     由外部传入（解耦）。
-        """
-        self._on_task = on_task
-        self._queue: asyncio.Queue[ReactiveTask] = asyncio.Queue()
-        self._worker_task: asyncio.Task | None = None
-        self._running = False
-
-    async def start(self) -> None:
-        self._running = True
-        self._worker_task = asyncio.create_task(self._worker_loop())
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._worker_task:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
-
-    async def enqueue(self, task: ReactiveTask) -> str:
-        """入队，返回管家响应（阻塞直到任务完成）。"""
-        await self._queue.put(task)
-        return await task.future  # 等待 worker resolve
-
-    async def _worker_loop(self) -> None:
-        """单协程串行处理队列中的任务。"""
-        while self._running:
-            try:
-                # 取任务（可超时，以便检查 _running）
-                task = await asyncio.wait_for(
-                    self._queue.get(),
-                    timeout=1.0,
-                )
-            except asyncio.TimeoutError:
-                continue
-            except Exception:
-                continue
-
-            try:
-                result = await self._on_task(task)
-                if not task.future.done():
-                    task.future.set_result(result)
-            except Exception as exc:
-                _logger.error(
-                    "dispatcher.task_failed",
-                    task_id=task.task_id,
-                    error=str(exc),
-                )
-                if not task.future.done():
-                    task.future.set_exception(exc)
-            finally:
-                self._queue.task_done()
-```
-
-### 3.3 `InMemoryEventBus`（asyncio 实现）
-
-```python
-# smartbutler/server/bus.py
-
-class InMemoryEventBus(EventBus):
-    """
-    asyncio 原生事件总线（Phase 7 初期实现）。
-    Phase 7 后期可替换为 Redis Streams / NATS。
-
-    与 EventBus 接口的关系：
-    - publish → asyncio.Queue.put（广播给所有订阅者）
-    - subscribe → 注册 handler 到内部 topic → handler map
-    - start/stop → 管理 consumer tasks 的生命周期
-    - ack → 内部 pending set 移除（at-least-once 语义）
-
-    不变量实现：
-    - publish 必须在 ack 之后才返回 ✅（同步返回，handler 是后台 task）
-    - handler 抛异常时打 ERROR 但不停止消费 ✅（worker task 捕获）
-    - 同一事件多次送达？通过 event_id dedup set 过滤 ✅
-    """
-
-    def __init__(self):
-        self._handlers: dict[str, list[tuple[str, EventHandler]]] = {}  # topic → [(consumer_group, handler)]
-        self._queues: dict[str, asyncio.Queue[BaseEvent]] = {}          # topic → queue
-        self._consumer_tasks: dict[str, list[asyncio.Task]] = {}
-        self._pending: set[str] = set()                                 # event_ids awaiting ack
-        self._dedup: dict[str, datetime] = {}                          # event_id → first_seen
-        self._running = False
-        self._lock = asyncio.Lock()
-
-    async def publish(self, event: BaseEvent, *, topic: str | None = None) -> None:
-        effective_topic = topic or event.topic
-
-        # Dedup（TTL 1 小时）
-        now = datetime.now(UTC)
-        if event.event_id in self._dedup:
-            seen_at = self._dedup[event.event_id]
-            if (now - seen_at).total_seconds() < 3600:
-                _logger.debug("bus.dedup_dropped", event_id=event.event_id)
-                return
-        self._dedup[event.event_id] = now
-
-        self._pending.add(event.event_id)
-
-        # 广播到所有匹配 topic 的队列
-        matching_queues = self._collect_matching_queues(effective_topic)
-        for q in matching_queues:
-            await q.put(event)
-
-    async def subscribe(
-        self,
-        topic: str,
-        handler: EventHandler,
         *,
-        consumer_group: str = "default",
-    ) -> None:
-        async with self._lock:
-            # 创建专属队列（同一 consumer_group 共享队列）
-            if topic not in self._queues:
-                self._queues[topic] = asyncio.Queue()
-            queue = self._queues[topic]
-
-            # 注册 handler
-            self._handlers.setdefault(topic, []).append((consumer_group, handler))
-
-    async def start(self) -> None:
-        self._running = True
-        # 为每个 topic 启动 consumer task
-        async with self._lock:
-            for topic, queue in self._queues.items():
-                self._consumer_tasks[topic] = [
-                    asyncio.create_task(self._consumer(topic, queue, handler))
-                    for _, handler in self._handlers.get(topic, [])
-                ]
-
-    async def stop(self) -> None:
-        self._running = False
-        # 取消所有 consumer tasks
-        for tasks in self._consumer_tasks.values():
-            for t in tasks:
-                t.cancel()
-        await asyncio.gather(*[t for ts in self._consumer_tasks.values() for t in ts],
-                             return_exceptions=True)
-        self._consumer_tasks.clear()
-
-    async def ack(self, event: BaseEvent) -> None:
-        self._pending.discard(event.event_id)
-
-    async def replay(self, topic: str, *, since: Any = None, limit: int = 100) -> AsyncIterator[BaseEvent]:
-        # 实现 replay 接口（从 dedup log 读）
+        bus: EventBus,
+        user_id: str,
+        device_id: str = "mic_laptop_builtin",
+        capture: BaseAudioCapture | None = None,    # 测试可注入 mock
+        vad: SileroVAD | None = None,
+        asr: FunASR | None = None,
+        wake_word_enabled: bool = False,
+    ):
+        self._bus = bus
+        self._user_id = user_id
+        self._device_id = device_id
+        self._capture = capture or MicAudioCapture(device_id=device_id)
+        self._vad = vad or SileroVAD()
+        self._asr = asr or FunASR()
         ...
 
-    async def _consumer(self, topic: str, queue: asyncio.Queue[BaseEvent], handler: EventHandler) -> None:
-        while self._running:
-            try:
-                event = await queue.get()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                continue
-
-            try:
-                await handler(event)
-                await self.ack(event)
-            except Exception:
-                _logger.error("bus.handler_error", topic=topic, event_id=event.event_id)
-                # 不 stop，继续处理下一个事件
-            finally:
-                queue.task_done()
-
-    def _collect_matching_queues(self, topic: str) -> list[asyncio.Queue[BaseEvent]]:
-        """支持 topic 通配符（device.# → device.*）。"""
-        queues = []
-        for pattern, q in self._queues.items():
-            if self._topic_matches(pattern, topic):
-                queues.append(q)
-        return queues
-
-    @staticmethod
-    def _topic_matches(pattern: str, topic: str) -> bool:
-        """简单前缀匹配 + # 通配符。"""
-        if pattern == "#":
-            return True
-        if pattern.endswith(".#"):
-            prefix = pattern[:-2]
-            return topic.startswith(prefix)
-        return pattern == topic
-```
-
-### 3.4 `ReactiveLoop`（封装 orchestrator）
-
-```python
-# smartbutler/server/reactive_loop.py
-
-class ReactiveLoop:
-    """
-    Reactive 循环：封装 ButlerOrchestrator.ainvoke()。
-
-    职责：
-    1. 接收 user_input，调用 orchestrator
-    2. 捕获 orchestrator 返回的 ProactiveResult（如果有）
-    3. 如果 enable_proactive_advice=True，把 proactive 建议追加到回复
-
-    与 ButlerServer 的关系：
-    - ButlerServer.submit_reactive() 调 ReactiveLoop.run()
-    - ReactiveLoop.run() 调 orchestrator.ainvoke()
-    """
-
-    def __init__(
-        self,
-        orchestrator: ButlerOrchestrator,
-        proactive_loop: ProactiveLoop,
-        enable_proactive_advice: bool = True,
-    ):
-        self._orch = orchestrator
-        self._proactive = proactive_loop
-        self._enable_proactive_advice = enable_proactive_advice
-
-    async def run(
-        self,
-        user_input: str,
-        session_id: str,
-        user_id: str,
-        spoken_at: datetime,
-    ) -> str:
-        # 1. Reactive 响应
-        reply = await self._orch.ainvoke(
-            user_input,
-            user_id=user_id,
-            session_id=session_id,
-            spoken_at=spoken_at,
-        )
-
-        # 2. Proactive 建议（Reactive 链尾追加）
-        proactive_message: str | None = None
-        if self._enable_proactive_advice:
-            proactive_message = await self._proactive.advise(
-                context=reply,
-                current_answer=reply,
-            )
-
-        # 3. 拼接响应
-        if proactive_message:
-            reply = f"{reply}\n\n[小建议] {proactive_message}"
-
-        return reply
-```
-
-### 3.5 `AnswerRouter`（输出路由）
-
-```python
-# smartbutler/server/output/answer_router.py
-
-class AnswerRouter:
-    """
-    响应路由器：根据 source 把输出推到对应设备。
-
-    设计：
-    - Reactive 响应 → 推回发起方（REPL / WebSocket / HTTP caller）
-    - Proactive 推送 → 推全屋（TTS → 音响 + WebSocket → app）
-
-    不变量：
-    - Reactive 和 Proactive 路由逻辑完全分离
-    - Proactive 推送走多渠道（TTS + WS）
-    - 每个在线连接维护一个 session_id → asyncio.Queue 映射
-    """
-
-    def __init__(
-        self,
-        tts_adapter: TTSAdapter | None = None,
-    ):
-        self._tts = tts_adapter
-        # session_id → asyncio.Queue[str]（响应排队）
-        self._reactive_queues: dict[str, asyncio.Queue[str]] = {}
-        # 在线 WebSocket connections
-        self._ws_connections: dict[str, asyncio.Queue] = {}
-        self._lock = asyncio.Lock()
-
-    # ---------- Reactive 路由 ----------
-
-    async def register_reactive_session(self, session_id: str) -> asyncio.Queue[str]:
-        """注册一个 Reactive session（REPL/WebSocket caller），返回响应队列。"""
-        async with self._lock:
-            if session_id not in self._reactive_queues:
-                self._reactive_queues[session_id] = asyncio.Queue()
-            return self._reactive_queues[session_id]
-
-    async def push_reactive(self, session_id: str, message: str) -> None:
-        """Reactive 响应推回给调用方。"""
-        queue = self._reactive_queues.get(session_id)
-        if queue is None:
-            _logger.warning("router.unknown_session", session_id=session_id)
-            return
-        await queue.put(message)
-
-    async def wait_reactive_response(self, session_id: str) -> str:
-        """等待 Reactive 响应（对应 TaskDispatcher 的 future.resolve）。"""
-        queue = self._reactive_queues.get(session_id)
-        if queue is None:
-            return "[无 session]"
-        return await queue.get()
-
-    # ---------- Proactive 推送 ----------
-
-    async def push_proactive(
-        self,
-        message: str,
-        urgency: ProactiveUrgency,
-        source_event_id: str | None = None,
-    ) -> None:
-        """
-        Proactive 推送：推全屋。
-
-        路由策略（由 urgency 决定）：
-        - LOW: 只推 TTS 音响（默认设备）
-        - MED: 推 TTS + WebSocket 在线 app
-        - HIGH: 推 TTS + 全量 WebSocket + 日志高亮
-        """
-        _logger.info(
-            "router.proactive_push",
-            urgency=urgency.value,
-            message_len=len(message),
-            source_event_id=source_event_id,
-        )
-
-        # TTS 推送（所有场景都有）
-        if self._tts is not None:
-            await self._tts.speak(message, urgency=urgency)
-
-        # WebSocket 广播（MED / HIGH）
-        if urgency in (ProactiveUrgency.MED, ProactiveUrgency.HIGH):
-            await self._broadcast_ws(message)
-
-    async def _broadcast_ws(self, message: str) -> None:
-        for conn_id, queue in self._ws_connections.items():
-            try:
-                await queue.put(message)
-            except Exception:
-                pass
-
-    # ---------- WebSocket 连接管理 ----------
-
-    async def register_ws(self, conn_id: str) -> asyncio.Queue[str]:
-        async with self._lock:
-            self._ws_connections[conn_id] = asyncio.Queue()
-            return self._ws_connections[conn_id]
-
-    async def unregister_ws(self, conn_id: str) -> None:
-        async with self._lock:
-            self._ws_connections.pop(conn_id, None)
-```
-
-### 3.6 HomeAssistant 适配器
-
-```python
-# smartbutler/server/adapters/ha_websocket.py
-
-class HomeAssistantAdapter(InputAdapter):
-    """
-    HomeAssistant WebSocket 适配器。
-
-    HA 通过 WebSocket 暴露两类事件：
-    1. state_changed：实体状态变化（device.* topic）
-    2. automation_triggered：自动化触发（timer.* / automation.* topic）
-
-    实现：
-    - 连接 HA WebSocket API（需要 HA_TOKEN）
-    - 接收事件 → 归一化 → EventBus.publish
-    - 断线自动重连（指数退避）
-    - 支持发送命令（调用 HA 服务）
-
-    HA WebSocket API 参考：
-    https://developers.home-assistant.io/docs/api/websocket/
-    """
-
-    def __init__(
-        self,
-        ha_url: str,
-        ha_token: str,
-        event_bus: EventBus,
-        normalizer: EventNormalizer,
-    ):
-        self._ha_url = ha_url
-        self._ha_token = ha_token
-        self._bus = event_bus
-        self._normalizer = normalizer
-        self._ws: websockets.WebSocketClientProtocol | None = None
-        self._running = False
-        self._reconnect_delay = 1.0
-        self._max_reconnect_delay = 60.0
-
-    async def start(self) -> None:
-        self._running = True
-        asyncio.create_task(self._connect_loop())
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._ws:
-            await self._ws.close()
-
-    async def _connect_loop(self) -> None:
-        """连接循环：连接 → 监听 → 断开 → 退避重连。"""
-        while self._running:
-            try:
-                await self._connect()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                _logger.error("ha.reconnect", error=str(e))
-
-            # 指数退避
-            await asyncio.sleep(self._reconnect_delay)
-            self._reconnect_delay = min(
-                self._reconnect_delay * 2,
-                self._max_reconnect_delay,
-            )
-
-    async def _connect(self) -> None:
-        import websockets
-        from homeassistant_api import HomeAssistantAPI
-
-        async with websockets.connect(self._ha_url) as ws:
-            self._ws = ws
-            self._reconnect_delay = 1.0  # 重置退避
-
-            # 订阅 state_changed 事件
-            await ws.send(json.dumps({
-                "type": "subscribe_events",
-                "event_type": "state_changed",
-            }))
-
-            async for raw in ws:
-                if not self._running:
-                    break
-                msg = json.loads(raw)
-                if msg.get("type") != "event":
+    async def run(self) -> None:
+        """主循环:监听 → VAD → ASR → 发事件。"""
+        await self._capture.start()
+        try:
+            async for chunk in self._capture.stream():
+                if not self._vad.is_speech(chunk.audio):
                     continue
+                self._asr.feed(chunk.audio)
+                if self._asr.is_sentence_end():
+                    text = self._asr.flush()
+                    if text:
+                        await self._emit_command_event(text)
+        finally:
+            await self._capture.stop()
 
-                event_data = msg.get("event", {}).get("data", {})
-                entity_id = event_data.get("entity_id", "")
-
-                # 归一化
-                normalized = self._normalizer.normalize_ha_state_changed(
-                    entity_id=entity_id,
-                    new_state=event_data.get("new_state", {}),
-                    old_state=event_data.get("old_state", {}),
-                    user_id="primary_user",
-                )
-                if normalized is None:
-                    continue
-
-                await self._bus.publish(normalized)
-
-    # ---------- 命令下发（给 HomeAgent Sub-Agent 调） ----------
-
-    async def call_service(
-        self,
-        domain: str,
-        service: str,
-        entity_id: str | None = None,
-        data: dict | None = None,
-    ) -> bool:
-        """调用 HA 服务（开关灯 / 调温度等）。"""
-        if not self._ws:
-            return False
-        import websockets
-
-        payload = {
-            "type": "call_service",
-            "domain": domain,
-            "service": service,
-            "data": {**(data or {}), **({"entity_id": entity_id} if entity_id else {})},
-        }
-        await self._ws.send(json.dumps(payload))
-        return True
+    async def _emit_command_event(self, asr_text: str) -> None:
+        event = VoiceEvent.make(
+            action=VoiceAction.COMMAND,
+            device_id=self._device_id,
+            user_id=self._user_id,
+            asr_text=asr_text,
+            language="zh-CN",
+            timestamp=datetime.now().astimezone(),
+            priority=EventPriority.NORMAL,
+        )
+        await self._bus.publish(event)
 ```
+
+### 5.7 依赖项
+
+新增 `pyproject.toml` 依赖:
+- `sounddevice`(跨平台音频 I/O)
+- `funasr`(阿里 Paraformer 中文 SOTA)
+- `torch`(Silero VAD 依赖)
+- 可选: `pvporcupine`(Porcupine 唤醒词,7.6.1)
+
+### 5.8 端到端测试(7.6 验收)
+
+`tests/voice/test_voice_adapter_e2e.py`:
+- **case 1**:`BaseAudioCapture` mock → `VoiceAdapter.run()` 收 3 帧 → 1 个 `VoiceEvent.COMMAND` 发布
+- **case 2**:VAD 全 False → 0 个 VoiceEvent 发布
+- **case 3**:ASR mock 返空字符串 → 0 个 VoiceEvent 发布
+- **case 4**:`asr_text` 字段正确填充(从 ASR mock 输入验证)
+- **case 5**:`user_id` / `device_id` / `timestamp` 字段正确
+
+### 5.9 7.6 工作量
+
+| 任务 | 行数 | 2-3 周节奏 |
+|------|------|-----------|
+| `voice/capture/{base,mic_capture}.py` | ~120 行 | Day 1-2 |
+| `voice/vad/silero.py` | ~50 行 | Day 2 |
+| `voice/asr/{base,funasr_impl,streaming}.py` | ~180 行 | Day 3-5 |
+| `voice/wakeword/{base,porcupine_impl}.py` | ~100 行 | Day 5-6(可选 7.6.1) |
+| `voice/config.py` | ~30 行 | Day 1 |
+| `events/adapters/voice_adapter.py` | ~120 行 | Day 7-9 |
+| `tests/voice/test_voice_adapter_e2e.py` | ~250 行 5 case | Day 10-12 |
+| 调通 + 文档 + 实际录音 demo 验证 | — | Day 13-15 |
+
+**最坏情况 2-3 周**——`BaseAudioCapture` mock 注入让单测不依赖物理麦克风,大幅降测试成本。
 
 ---
 
-## 4. 生产入口 `smartbutler/server/app.py`
+## 6. Phase 7.7 详细设计 — TTSOutputAdapter(第一个真输出)
+
+> **本节是"音频输出"端到端实现**——ButlerReply → TTS → 智能音响 / 笔记本扬声器播放。
+
+### 6.1 BaseTTS 接口
 
 ```python
-# smartbutler/server/app.py
-"""
-生产入口：替换 scripts/dev_chat.py。
+# smartbutler/voice/tts/base.py
+class BaseTTS(ABC):
+    @abstractmethod
+    async def synthesize(self, text: str) -> str:
+        """合成语音,返 mp3 文件路径。"""
+        ...
 
-启动方式::
+    @abstractmethod
+    async def speak(self, text: str) -> None:
+        """合成 + 播放一体化(用于本机扬声器场景)。"""
+        ...
+```
 
-    python -m smartbutler.server.app
+### 6.2 EdgeTTS 实现(默认)
 
-或 uvicorn::
+- `edge-tts` Python 包,微软 Azure 神经 TTS,**免费云端**
+- 中文音色 `zh-CN-XiaoxiaoNeural`(温柔女声)
+- `Communicate(text, voice).save(path)` 异步保存 mp3
 
-    uvicorn smartbutler.server.app:app --host 0.0.0.0 --port 8000
-"""
+### 6.3 PiperTTS 实现(7.7.1 离线)
 
-import asyncio
-import signal
-from contextlib import asynccontextmanager
-from pathlib import Path
+- `sherpa-onnx` 本地 TTS,完全离线
+- 中文模型 ~60MB,无网络依赖
+- 7.7.1 实现,**主推 EdgeTTS(7.7)**
 
-import structlog
-import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+### 6.4 TTSOutputAdapter
 
-from smartbutler.config import load_llm_settings, load_storage_settings, load_memory_settings
-from smartbutler.server import ButlerServer, InMemoryEventBus, TaskDispatcher
-from smartbutler.server.adapters import REPLAdapter, HomeAssistantAdapter
-from smartbutler.server.output import AnswerRouter, TTSAdapter
-from smartbutler.server.reactive_loop import ReactiveLoop
-from smartbutler.thinking.loop.orchestrator import ButlerOrchestrator
-from smartbutler.thinking.loop.proactive_loop import ProactiveLoop
-from smartbutler.emotion.memory.facade import MemoryFacade
-from smartbutler.emotion.personality.loader import load_personality
-from smartbutler.capabilities.llm import create_llm
+```python
+# smartbutler/events/adapters/tts_output_adapter.py
+class TTSOutputAdapter(OutputAdapter):
+    """ButlerReply → TTS → 播放。"""
+    def __init__(
+        self,
+        *,
+        tts: BaseTTS | None = None,
+        device: str = "laptop_local",     # "laptop_local" / "miot_speaker_01" / "phone_xxx"
+    ):
+        self._tts = tts or EdgeTTS()
+        self._device = device
 
-_logger = structlog.get_logger(__name__)
+    async def push(self, reply: ButlerReply) -> None:
+        try:
+            if self._device == "laptop_local":
+                await self._tts.speak(reply.content)
+            elif self._device.startswith("miot_"):
+                # TODO: Phase 8+ 接 MIoT.text_to_speech
+                raise NotImplementedError("MIoT TTS 待 Phase 8+")
+            else:
+                raise ValueError(f"未知 device: {self._device}")
+        except Exception as exc:
+            # 沿用不变量 #6:OutputAdapter 内部 try/except,只 log 不抛
+            _logger.warning("tts_output_adapter.push_failed", error=str(exc))
+```
 
+### 6.5 端到端测试(7.7 验收)
 
-# ---------- FastAPI App ----------
+`tests/voice/test_tts_output_e2e.py`:
+- **case 1**:`BaseTTS` mock → `TTSOutputAdapter.push()` 调 1 次 `speak()`
+- **case 2**:`TTSOutputAdapter.push()` 抛异常 → 内部吞掉,server 不挂
+- **case 3**:`device="laptop_local"` → 调 `_tts.speak()`
+- **case 4**:`device="miot_xxx"` → 抛 NotImplementedError,被内部 try/except 吞掉
+- **case 5**:ButlerReply.content 含多行文本 → 完整传给 TTS
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # ---- 启动阶段 ----
-    await server.start()
-    _logger.info("server.started")
+### 6.6 7.7 工作量
 
-    yield
+| 任务 | 行数 | 1 周节奏 |
+|------|------|----------|
+| `voice/tts/base.py` | ~30 行 | Day 1 |
+| `voice/tts/edge_impl.py` | ~70 行 | Day 1-2 |
+| `voice/tts/offline_impl.py` | ~80 行 | Day 3-4(可选 7.7.1) |
+| `events/adapters/tts_output_adapter.py` | ~70 行 | Day 3 |
+| `tests/voice/test_tts_output_e2e.py` | ~150 行 5 case | Day 4-5 |
+| 调通 + 文档 | — | Day 6-7 |
 
-    # ---- 关闭阶段 ----
-    await server.stop()
-    _logger.info("server.stopped")
+**最坏情况 1 周**——`BaseTTS` mock 注入让单测不依赖网络 / 扬声器。
 
+---
 
-app = FastAPI(title="SmartButler API", lifespan=lifespan)
+## 7. Phase 7.8 详细设计 — CameraAdapter(视频输入,音视频流水线收口)
 
-# 全局 server instance（lifespan 里初始化）
-server: ButlerServer | None = None
+> **本节是"视频输入"端到端实现**——摄像头 → 感知流水线(Gate/Identity/Omni)→ DeviceEvent(perception) → EventBus → **Omni caption 转文本进记忆**。
+> **核心决策**:**不引入多模态 embedding**——Omni VLM 输出的 `caption + matched_rules + speeches + suggestions` 本就是结构化文本,直接 `MemoryFacade.remember(text=caption)` 走 Qwen text embedding 即可。**家用 95% 场景召回精度足够**(详见 §12 多模态记忆决策)。
 
+### 7.1 模块结构
 
-# ---------- HTTP / WebSocket 端点 ----------
+```
+smartbutler/
+├── voice/capture/buffer.py               # 🆕 MultiTrackSyncBuffer(音视频帧对齐)
+├── perception/                           # 🆕 fork Miloco perception 子目录
+│   ├── __init__.py
+│   ├── gate/                             # 帧差分 + VAD 门控
+│   │   ├── __init__.py
+│   │   └── frame_diff.py                 # 帧差分(过滤静止窗口)
+│   ├── identity/                         # 人物识别(DeepSORT + ReID)
+│   │   ├── __init__.py
+│   │   └── deepsort.py                   # 跟踪 + tier_a/c/u 样本库
+│   ├── omni/                             # VLM 抽 caption
+│   │   ├── __init__.py
+│   │   └── vlm_caption.py                # 调用 Qwen2-VL / InternVL(本地或云)
+│   └── buffer/                           # 音视频同步缓冲
+│       ├── __init__.py
+│       └── sync_buffer.py
+└── events/
+    └── adapters/
+        └── camera_adapter.py             # 🆕 摄像头 → 感知 → DeviceEvent → 记忆
+```
 
-@app.post("/chat")
-async def chat_post(request: ChatRequest) -> ChatResponse:
-    """HTTP POST 聊天入口（curl / HTTP client 用）。"""
-    if server is None:
-        return ChatResponse(reply="[服务未启动]")
+### 7.2 CameraAdapter 主流程(参考 Miloco 感知流水线 + 文本化进记忆)
 
-    reply = await server.submit_reactive(
-        user_input=request.message,
-        session_id=request.session_id or "http-default",
-        source="http",
+```
+摄像头(RTSP / USB / 米家 SDK)
+  → MultimodalCollector(帧缓冲,3-5s window)
+  → Gate(帧差分,过滤静止窗口)
+  → Identity(DeepSORT 跟踪 + ReID → tier_a/c/u 样本库,熟人 / 半熟 / 陌生)
+  → Omni(VLM,接收 3-5s 视频片段 → 输出结构化文本)
+  → caption = "女主人穿蓝色长款雪纺裙在玄关换鞋出门"
+  → matched_rules = ["家规-晚10点后回家小声"]
+  → speeches = "主人这么晚还要出门吗?"
+  → suggestions = ["锁好门窗", "把灯调暗"]
+  → 构造 DeviceEvent(
+      device_type=CAMERA, action="perception",
+      payload={caption, person_id, matched_rules, speeches, suggestions,
+               scene_tags=["蓝","长款","雪纺"],      ← Omni 抽的结构化标签
+               image_ref="/data/butler/images/2026/10/14/xxx.jpg"  ← 7.8 评估是否存档
+              }
     )
-    return ChatResponse(reply=reply)
+  → publish 到 EventBus
 
+进 EventBus 后(双轨):
+  轨道 1(管家回答):
+    Trigger.handle → Proactive tick → 管家 LLM 看到 payload → 可能主动播报
 
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(ws: WebSocket, session_id: str):
-    """WebSocket 聊天入口（前端 app / 音响 app 用）。"""
-    await ws.accept()
-
-    if server is None:
-        await ws.close(reason="server not started")
-        return
-
-    router = server._router  # 内部访问（简化写法）
-    response_queue = await router.register_reactive_session(session_id)
-    ws_conn_queue = await router.register_ws(f"ws-{session_id}")
-
-    try:
-        # 并行：接收消息 + 发送响应
-        async def send_loop():
-            while True:
-                try:
-                    msg = await response_queue.get()  # Reactive 响应
-                    await ws.send_text(f"reactive:{msg}")
-                except asyncio.CancelledError:
-                    break
-
-        async def recv_loop():
-            while True:
-                try:
-                    text = await ws.receive_text()
-                    if text.startswith("proactive_ack:"):
-                        continue  # 忽略主动推送确认
-                    reply = await server.submit_reactive(
-                        user_input=text,
-                        session_id=session_id,
-                        source="websocket",
-                    )
-                    await ws.send_text(f"reactive:{reply}")
-                except WebSocketDisconnect:
-                    break
-
-        await asyncio.gather(send_loop(), recv_loop(), return_exceptions=True)
-    finally:
-        router.unregister_ws(f"ws-{session_id}")
-
-
-# ---------- REPL 入口 ----------
-
-@app.get("/", response_class=HTMLResponse)
-async def repl_root():
-    """本地 REPL 界面（浏览器访问 http://localhost:8000）。"""
-    return """
-    <html><body>
-    <h2>SmartButler REPL</h2>
-    <input id='msg' placeholder='输入消息...' size=60 />
-    <button onclick='send()'>发送</button>
-    <pre id='output'></pre>
-    <script>
-    const ws = new WebSocket(`ws://${location.host}/ws/repl-1`);
-    ws.onmessage = e => {
-        if (e.data.startsWith('reactive:')) {
-            document.getElementById('output').textContent += '管家> ' + e.data.slice(9) + '\\n';
+  轨道 2(进记忆,本节核心):  🆕 必须
+    MemoryFacade.remember(
+        text=caption,    ← Omni 输出是结构化文本,直接走 Qwen text embedding
+        source="perception",
+        metadata={
+          person_id, location, scene_tags, image_ref,
+          event_id, timestamp
         }
-    };
-    async function send() {
-        const msg = document.getElementById('msg').value;
-        document.getElementById('output').textContent += '用户> ' + msg + '\\n';
-        document.getElementById('msg').value = '';
-    }
-    </script>
-    </body></html>
-    """
+    )
+    → 下次 recall("女主人最近穿的蓝裙子") → 命中
+    → 下次 recall("领带扔哪了") → Identity 识别"领带" + spatial_tag → 命中
+```
 
+**实现策略**:
+- **直接 fork Miloco `perception/` 子目录**到 `smartbutler/perception/` 命名空间
+- 复用 Miloco 的 Gate / Identity / Omni 实现
+- 适配器层(原 Miloco 的 `CameraDeviceAdapter`)改成 `smartbutler.events.adapters.camera_adapter.CameraAdapter`
+- 重点:VoiceEvent 与 DeviceEvent 协议已对齐 Miloco → **几乎纯移植**
 
-# ---------- CLI 入口 ----------
+### 7.3 端到端测试(7.8 验收)
 
-async def _repl_main(user_id: str = "default") -> None:
-    """本地 REPL 模式（终端交互）。"""
-    print("SmartButler REPL | 输入 /quit 退出")
-    session_id = f"repl-{user_id}"
-    router = server._router
-    response_queue = await router.register_reactive_session(session_id)
+`tests/perception/test_camera_adapter_e2e.py`:
+- **case 1**:摄像头 mock → 感知流水线 mock → 1 个 `DeviceEvent(perception)` 发布
+- **case 2**:Gate 判定"静止" → 0 个 DeviceEvent 发布
+- **case 3**:Identity 匹配 tier_a 样本 → payload 含 `person_id`
+- **case 4**:Omni 命中规则 → payload 含 `matched_rules`
+- **case 5**:Omni 返空 suggestions → 管家沉默(沿用不变量 #5)
+- **case 6(🆕 感知层文本化进记忆)**:`MemoryFacade.remember` 被调用,参数 `text=caption`、`source="perception"`、`metadata={person_id, scene_tags, image_ref}` 正确——**这是 7.8 验收的硬条件**
+- **case 7(🆕 召回验证)**:模拟 1 周后"女主人问最近穿的蓝裙子" → `MemoryFacade.recall("蓝裙子")` 命中 7.8 写入的 perception fact
 
-    async def recv_and_print():
-        while True:
-            reply = await response_queue.get()
-            print(f"管家> {reply}")
+### 7.4 7.8 工作量
 
-    recv_task = asyncio.create_task(recv_and_print())
+| 任务 | 行数 | 4-6 周节奏 |
+|------|------|-----------|
+| `voice/capture/buffer.py` | ~150 行 | Day 1-3 |
+| Miloco `perception/` 移植 + 命名空间适配 | ~500 行 | Day 4-15 |
+| `events/adapters/camera_adapter.py`(含 `MemoryFacade.remember` 接入)| ~180 行 | Day 16-18 |
+| `tests/perception/test_camera_adapter_e2e.py`(7 case,含文本化进记忆)| ~280 行 | Day 19-22 |
+| 调通 + 文档 | — | Day 23-25 |
 
-    try:
-        while True:
-            try:
-                line = input("用户> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
+**最坏情况 4-6 周**——纯移植工作量 + 集成测试,**优先级低于 7.6+7.7**,在 PoC 跑通后择期启动。
 
-            if line in ("/quit", "/exit", "/q"):
-                break
+**注意**:7.8 **不上**多模态 embedding——若 3-6 个月后 case 7 类召回< 70%,启动 7.9 EmbeddingGemma 2 增强(见 §12)。
 
-            asyncio.create_task(server.submit_reactive(
-                user_input=line,
-                session_id=session_id,
-                source="repl",
-            ))
-    finally:
-        recv_task.cancel()
+---
 
-    await server.stop()
+## 8. 配置矩阵(Phase 7 全周期)
 
+### 8.1 `smartbutler/config/server.py`(7.4 新增)
 
-def main() -> None:
-    import argparse
-    parser = argparse.ArgumentParser(description="SmartButler Production Entry")
-    parser.add_argument("--mode", choices=["repl", "web"], default="repl")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--ha-url", default=None)
-    parser.add_argument("--ha-token", default=None)
-    args = parser.parse_args()
-
-    # 注册信号处理（优雅关闭）
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    async def _bootstrap():
-        global server
-        server = await _build_server(
-            ha_url=args.ha_url,
-            ha_token=args.ha_token,
-        )
-        await server.start()
-        return server
-
-    srv = loop.run_until_complete(_bootstrap())
-
-    if args.mode == "web":
-        uvicorn.run(app, host=args.host, port=args.port)
-    else:
-        loop.run_until_complete(_repl_main())
-
-    loop.run_until_complete(srv.stop())
-    loop.close()
-
-
-# ---------- Server 构造（复用 dev_chat.py 的装配逻辑）----------
-
-async def _build_server(
-    ha_url: str | None = None,
-    ha_token: str | None = None,
-) -> ButlerServer:
-    """完整装配 ButlerServer（复用 dev_chat.py 逻辑）。"""
-
-    # 1. LLM
-    llm_settings = load_llm_settings()
-    llm = create_llm(llm_settings)
-
-    # 2. MemoryFacade（复用 dev_chat.py 逻辑）
-    storage = load_storage_settings()
-    # ... 完整装配见 dev_chat.py _build_orchestrator
-    memory_facade: MemoryFacade | None = _build_memory_facade(storage)
-
-    # 3. Personality
-    personality = load_personality()
-
-    # 4. ButlerOrchestrator
-    orchestrator = ButlerOrchestrator(
-        llm=llm,
-        llm_settings=llm_settings,
-        memory_facade=memory_facade,
-        personality=personality,
-        enable_proactive_advice=True,
+```python
+class ServerConfigSettings(BaseSettings):
+    """Server 子模块配置(沿用 Pydantic Settings 子模块化)。"""
+    model_config = SettingsConfigDict(
+        env_prefix="SMARTBUTLER_SERVER_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
     )
 
-    # 5. ProactiveLoop（复用 orchestrator 的 graph）
-    proactive_loop = ProactiveLoop(
-        graph=None,  # 懒获取: orchestrator._compiled
-        user_id=memory_facade._user_id if memory_facade else "default",
+    enable_event_bus: bool = True
+    enable_normalizer: bool = True       # 7.4 新增
+    enable_trigger: bool = True          # 7.4 新增
+    enable_answer_router: bool = True    # 7.5 新增
+    trigger_max_per_minute: int = 20     # 7.4 新增
+    normalizer_window_sec: float = 5.0   # 7.4 新增
+    normalizer_max_size: int = 10000     # 7.4 新增
+```
+
+### 8.2 `smartbutler/config/voice.py`(7.6 新增)
+
+```python
+class VoiceConfigSettings(BaseSettings):
+    """voice 子模块配置(7.6 新增)。"""
+    model_config = SettingsConfigDict(
+        env_prefix="SMARTBUTLER_VOICE_",
+        env_file=".env",
+        extra="ignore",
     )
 
-    # 6. ReactiveLoop
-    reactive_loop = ReactiveLoop(
-        orchestrator=orchestrator,
-        proactive_loop=proactive_loop,
-        enable_proactive_advice=True,
+    sample_rate: int = 16000
+    channels: int = 1
+    frame_duration_ms: int = 30
+    vad_threshold: float = 0.5
+    asr_model: str = "paraformer-zh"
+    asr_device: str = "cpu"
+    wake_word_enabled: bool = False
+    wake_word: str = "杰贝兹"
+    default_mic_device: str = "laptop_builtin"
+    asr_silence_timeout_ms: int = 1500  # 1.5s 静音 → 句子结束
+```
+
+### 8.3 `smartbutler/config/tts.py`(7.7 新增)
+
+```python
+class TTSConfigSettings(BaseSettings):
+    """TTS 子模块配置(7.7 新增)。"""
+    model_config = SettingsConfigDict(
+        env_prefix="SMARTBUTLER_TTS_",
+        env_file=".env",
+        extra="ignore",
     )
 
-    # 7. TaskDispatcher（串行化网关）
-    dispatcher = TaskDispatcher(on_task=lambda task: reactive_loop.run(
-        user_input=task.user_input,
-        session_id=task.session_id,
-        user_id=task.user_id,
-        spoken_at=task.spoke_at,
-    ))
-
-    # 8. EventBus
-    bus = InMemoryEventBus()
-
-    # 9. OutputRouter + TTS
-    tts_adapter = TTSAdapter() if _tts_available() else None
-    router = AnswerRouter(tts_adapter=tts_adapter)
-
-    # 10. ButlerServer
-    server = ButlerServer(
-        orchestrator=orchestrator,
-        proactive_loop=proactive_loop,
-        event_bus=bus,
-        output_router=router,
-        dispatcher=dispatcher,
-    )
-
-    # 11. HA 适配器（如果配置了）
-    if ha_url and ha_token:
-        ha_adapter = HomeAssistantAdapter(
-            ha_url=ha_url,
-            ha_token=ha_token,
-            event_bus=bus,
-            normalizer=EventNormalizer(),
-        )
-        await ha_adapter.start()
-
-    return server
+    default_engine: str = "edge"          # "edge" / "piper"
+    edge_voice: str = "zh-CN-XiaoxiaoNeural"
+    piper_model_path: str = ""            # 7.7.1
+    piper_config_path: str = ""           # 7.7.1
 ```
 
 ---
 
-## 5. 与 dev_chat.py 的关系
+## 9. 依赖矩阵(Phase 7 全周期)
 
-| 维度 | `scripts/dev_chat.py` | `smartbutler/server/app.py` |
-|---|---|---|
-| **定位** | 开发 REPL（不入仓） | 生产入口 |
-| **Orchestrator** | 每个 session 一个 | 全局唯一，串行 |
-| **ProactiveLoop** | 不存在 | 集成 |
-| **EventBus** | 无 | InMemoryEventBus |
-| **HA 接入** | 无 | WebSocket 适配器 |
-| **输出** | 打印到终端 | TTS + WebSocket + HTTP |
-| **并发模型** | 单线程 REPL | 并发输入 → 串行任务 |
+| 子阶段 | 新增依赖 | pip 大小 | 测试依赖 |
+|--------|----------|----------|----------|
+| **7.4** | — | 0 | pytest-asyncio(已有) |
+| **7.5** | — | 0 | pytest-asyncio(已有) |
+| **7.6** | `sounddevice` + `funasr` + `torch` | ~1.2GB(含 torch) | pytest-asyncio + numpy mock |
+| **7.6.1** | `pvporcupine`(可选唤醒词) | ~30MB | — |
+| **7.7** | `edge-tts` + `pygame`(本机播放) | ~10MB | pytest-asyncio + BaseTTS mock |
+| **7.7.1** | `sherpa-onnx` + Piper 模型 | ~80MB | — |
+| **7.8** | `opencv-python` + `torch` + `transformers`(VLM) | ~3GB | pytest-asyncio + 各组件 mock |
 
-**迁移策略**：
-1. `server/` 模块稳定后，在 `scripts/dev_chat.py` 顶部加一行 `DeprecationWarning`
-2. 文档更新 README §2.7，指向 `server/app.py` 作为生产入口
-3. `dev_chat.py` 保留作为轻量诊断工具（不启动 bus，只跑 orchestrator）
+**注意**:7.6 引入 `torch` 是大依赖(~1GB),但**只在 `smartbutler.voice` 子模块导入**——`smartbutler.thinking` / `smartbutler.emotion` 仍保持轻量。**开发依赖**写在 `pyproject.toml [project.optional-dependencies.voice]`,**默认不装**。
 
 ---
 
-## 6. 实施计划
+## 10. 关键变更记录(本方案)
 
-> **整体节奏**：先打通路径 A（Reactive 串行回路，能对话），再接入路径 B（Proactive 事件驱动，能主动开口）。后台任务（TaskScheduler / ConsolidationScheduler）保持现状不重写。
+| 日期 | 变更 | 关联 |
+|------|------|------|
+| 2026-10-14 | 🆕 Phase 7 技术方案落地(本文档):盘点真实状态(7.0+7.1+7.2+7.3 已落库) + 拆 7.4-7.8 子阶段 + 7.4 详细设计(Normalizer+Trigger) + 7.5 详细设计(AnswerRouter+Presence) + 7.6 详细设计(VoiceAdapter) + 7.7 详细设计(TTS) + 7.8 详细设计(Camera 简版) | `docs/PHASE_7_TECHNICAL_DESIGN.md` |
+| 2026-10-14 | 🆕 **多模态记忆决策敲定**:**7.6/7.8 感知层采集音视频,记忆层统一转文本(Qwen text embedding)**,**不上**多模态 embedding;7.9 EmbeddingGemma 2 标为"未来观察项,不启动",触发条件见 §12.3;§1.1 架构图 + §1.2 数据流 + §1.3 不变量 #11-#13 + §7 7.8 详细设计同步加"感知层文本化进记忆"硬条件(case 6/7) + 7.8 验收门槛 + 新增 §12 多模态记忆决策全文 | `docs/PHASE_7_TECHNICAL_DESIGN.md §12` |
 
-### Phase 7.0：文档先对齐（已完成 ✅）
+---
 
-- [x] 修正 §1.1 架构图：明确"路径 A 直调 vs 路径 B 经 EventBus"
-- [x] 新加 §0：Reactive vs Proactive 的三个层次区分
-- [x] 新加 §0.3：TaskScheduler 不是第三个 loop
+## 11. 与其他文档的关系
 
-### Phase 7.1：路径 A 骨架贯通（1-2 天）
+| 文档 | 关系 |
+|------|------|
+| `smartbutler/events/ADR-008-event-driven.md` | Phase 7 顶层决策(事件驱动 / Redis Streams / parent_agent 协议)— 本方案**部分沿用**(协议稳定)+ **部分修正**(Redis 升级留 Phase 8+ 多节点) |
+| `smartbutler/thinking/ADR-009-proactive-reactive-dual-loop.md` | 双循环架构 — 本方案 Trigger 的路由规则完全沿用 ADR-009 §5.9.3 |
+| `README.md §2` 阶段状态表 | 7.0+7.1+7.2+7.3 状态从 🟡 改 ✅,7.4-7.8 状态填入,**新增 7.9 观察项** |
+| `README.md §2.7` 待办列表 | 7.4 替代原"Phase 7 真实实现"待办,7.5-7.8 追加,**7.9 不进待办**(观察项) |
+| `README.md §10` 关键变更记录 | 本方案落地后追加 v0.4.0 记录 + 多模态决策记录 |
+| `smartbutler/events/README.md` | 本方案落地后更新已实现模块清单 |
 
-> **目标**：能启动、能对话、能优雅退出。**只走路径 A，不接 EventBus，不写任何 Adapter**。
+---
 
-#### 7.1.1 范围（YAGNI 原则）
+## 12. 多模态记忆决策(本轮敲定,2026-10-14)
 
-**做**：
-- `TaskDispatcher`（串行化网关）
-- `ReactiveLoop`（封装 orchestrator，含 Reactive→Proactive advice 钩子）
-- `ButlerServer.submit_reactive()`（**高层 API 入口**，设备后续调它）
-- `AnswerRouter`（Reactive 路由 + WebSocket session 注册）
-- `smartbutler/server/app.py`（复用 dev_chat 装配逻辑）
-- CLI `--mode repl` / `--mode web` 两个入口
+> **本节是 7.6/7.8 记忆层"为什么不上多模态 embedding"的决策记录**——给未来 3-6 个月后的自己一份"当初为什么这么做"的依据。
 
-**不做**（等设备到位再单独 PR）：
-- ❌ `CameraInputAdapter` / `TTSOutputAdapter` / `HomeAssistantInputAdapter` 等任何 Adapter 基类/接口/Mock
-- ❌ 音响 / 摄像头 / 麦克风 / HA 任何占位代码
-- ❌ 任何"想象中的未来设备"接口
+### 12.1 决策结论
 
-**理由**：高层 API（`submit_reactive()` / `event_bus.publish()`）是**稳定契约**，Adapter 是**易变实现**。现在写 Adapter 基类是 YAGNI——3 个月后协议可能完全不一样。
+**7.6(VoiceAdapter)+ 7.8(CameraAdapter)感知层采集音视频,但记忆层统一先转文本进 MemoryFacade**——`text + QwenEmbedder`(1024 维)是默认。
 
-**未来接入示例**（不在 Phase 7.1 范围）：
-- 摄像头 → 写独立脚本：ASR 转文字 → 调 `server.submit_reactive()` → 拿返回 → TTS 播出去
-- HA 自动化 → 写独立脚本：监听 HA WS → 归一化 → 调 `event_bus.publish()` → EventBus 路由给 ProactiveLoop
-- 这些脚本**不属于 ButlerServer 核心代码**，完全解耦
+- **VoiceAdapter(7.6)**:`asr_text` 直接进 `MemoryFacade.remember(text=asr_text)`
+- **CameraAdapter(7.8)**:`Omni VLM 输出的 caption` 直接进 `MemoryFacade.remember(text=caption, metadata={scene_tags, image_ref, person_id, location})`
 
-#### 7.1.2 任务清单
+**当前不引入**多模态 embedding(CLIP / ImageBind / **EmbeddingGemma 2**)。**`ReactiveSubmission.metadata: dict[str, Any]` 和 `ButlerReply.metadata: dict[str, Any]` 预留扩展位**。
 
-- [ ] 实现 `TaskDispatcher`（串行化网关）
-- [ ] 实现 `ReactiveLoop`（封装 orchestrator，含 Reactive→Proactive advice 钩子）
-- [ ] 实现 `ButlerServer.submit_reactive()`（高层 API 入口）
-- [ ] 实现 `AnswerRouter`（Reactive 路由 + WebSocket session 注册）
-- [ ] 写 `smartbutler/server/app.py` 入口（复用 dev_chat 装配逻辑）
-- [ ] **路径检查点**：命令行 `--mode repl` 能对话；`--mode web` 浏览器访问能聊天
+### 12.2 决策依据
 
-**验收标准**：
-```bash
-python -m smartbutler.server.app --mode repl
-# 用户> 你好
-# 管家> [响应]（走真实 LLM）
-# Ctrl+C 优雅退出
+#### 12.2.1 家用 95% 召回需求文本 embedding 足够
+
+| 场景 | 文本 embedding 能召回? | 多模态 embedding 必要? | 触发频率 |
+|------|---------------------|---------------------|---------|
+| "今天周几"/"今天天气"| ✅ 完全够 | ❌ | 每日多次 |
+| "昨天那条蓝裙子比今天这条好看吗"| ✅ `caption` 含"蓝色"→ 召回 | ❌ | 月 1-3 次 |
+| "领带扔哪了"| ✅ `caption` 含"领带"+"玄关"→ 召回 | ❌ | 月 1-2 次 |
+| "上周来过的人"| ✅ `caption` 含"主人"+Identity 标签 → 召回 | ❌ | 周 1-2 次 |
+| **以图搜图**("找到我和闺蜜去年夏天的合影")| ❌ 需要图本身 | ✅ **必要** | **年 1-5 次** |
+| **图 vs 图**("这条裙子比那条好看吗")| ⚠️ 可用 caption 比对 | ✅ 更准 | 月 1-2 次 |
+
+**结论**:**"以图搜图 / 图 vs 图"家用年触发 1-5 次**——不值得为此引入 1GB+ 依赖。
+
+#### 12.2.2 Omni VLM 抽事实是高质量的语义压缩
+
+**Miloco 思路沿用**:Omni VLM 接收 3-5s 视频片段,输出**结构化文本**:
+```
+caption = "女主人穿蓝色长款雪纺裙在玄关换鞋出门"
+matched_rules = ["家规-晚10点后回家小声"]
+speeches = "主人这么晚还要出门吗?"
+suggestions = ["锁好门窗", "把灯调暗"]
 ```
 
-**端到端单测**（必加）：
-- test_reactive_serial.py：连发 3 条消息，验证响应顺序与发送顺序一致
-- test_reactive_concurrent.py：3 个 asyncio task 并发调 submit_reactive，验证 Memory 写入不串
-- test_high_level_api.py：直接调 `server.submit_reactive()`，验证不依赖任何 Adapter 也能工作
+**这套文本已经包含**:
+- **空间**("玄关")→ recall "玄关" 命中
+- **时间**("出门")→ recall "出门" 命中
+- **属性**("蓝色长款雪纺")→ recall "蓝色" / "长款" 命中
+- **人物**("女主人",Identity 标签)→ recall "女主人" 命中
+- **行为**("换鞋出门")→ recall "换鞋" 命中
 
-### Phase 7.2：路径 B 接入（2-3 天）
+**只要 Omni caption 抽到位(text embedding 走 Qwen,1024 维,精度高于 80%)**,**家用 95% 召回场景都能命中**。
 
-> **目标**：InMemoryEventBus 真实实现 + 演示脚本调 `event_bus.publish()` → ProactiveLoop → 主动开口。
-> **重要**：HA 接入是**独立脚本**，不属于 ButlerServer 核心代码（见 §7.1.1 YAGNI 原则）。
+#### 12.2.3 多模态 embedding 的成本
 
-- [ ] 实现 `InMemoryEventBus`（`smartbutler/server/bus.py`，含 topic 通配符 + dedup + ack）
-- [ ] `ButlerServer._on_device_event()` handler，**从 EventBus 内部注册**（不暴露给外部 Adapter）
-- [ ] 演示脚本：`scripts/demo_event_publish.py`（手动调 `event_bus.publish()` 模拟设备事件）
-- [ ] **不做**：HA 适配器、任何设备 Adapter、任何占位代码
+| 模型 | 内存(bf16)| 内存(int8)| MTEB 精度 | 适合家用? |
+|------|---------|---------|----------|---------|
+| **Qwen text-only**(默认)| 540MB | — | 61.36 | ✅ |
+| **EmbeddingGemma 2**(740M 全模态)| 1.1GB | 567MB | 61.36 text / 64.64 image | ⚠️ 占用高 |
+| **CLIP-ViT-L/14**(428M)| 856MB | 400MB | 66 image | ⚠️ 占用高 |
+| **SigLIP-SO400M**(400M)| 800MB | 400MB | 70 image | ⚠️ 占用高 |
 
-**验收标准**：
-```bash
-# 终端 1: 启动 server
-python -m smartbutler.server.app --mode repl
-# 管家> [等待输入...]
+**家用 16GB RAM 笔记本**:
+- 已有 torch(~1GB,Phase 7.6 VAD 引入)
+- 加 1.1GB EmbeddingGemma 2 = 2.1GB → 占总 RAM 13%
+- **可接受,但召回延迟 +50-200ms**(CPU 推理)
 
-# 终端 2: 模拟设备事件
-python -m scripts.demo_event_publish --event "主人回家了"
+**家用 8GB RAM 笔记本**:
+- 已有 torch 1GB
+- 加 1.1GB EmbeddingGemma 2 = 2.1GB → 占总 RAM **26%**
+- **勉强,但 CPU 推理慢**(50ms → 200ms 召回延迟,管家"想"完要等 1s)
 
-# 终端 1: 管家主动开口
-# 管家> 主人回来了，今天累不累？
-```
+**家用 4GB RAM**(老 Mac mini):
+- torch + EmbeddingGemma 2 = **2.1GB > 50% 内存**
+- **不可用**
 
-**端到端单测**（必加）：
-- test_event_bus_topic_match.py：`device.door.opened` 匹配 `device.#` 通配符
-- test_event_bus_dedup.py：同一 `event_id` publish 两次，handler 只调一次
-- test_event_bus_handler_error_isolated.py：handler 抛异常不停止 consumer
-- test_proactive_silent_default.py：默认 RuleBasedProactiveReasoning 70%+ silent
-- test_high_level_publish_api.py：直接调 `event_bus.publish()`，验证不依赖任何 Adapter 也能工作
+#### 12.2.4 "以图搜图"扩展位已经预留
 
-### Phase 7.3：ProactiveLoop 真实化（1-2 天）
+- `ReactiveSubmission.metadata: dict[str, Any]` 已有(沿用 `server/adapters/__init__.py:42-55`)
+- `ButlerReply.metadata: dict[str, Any]` 已有
+- **若未来 7.9 启动**,新增 `image_embedding: list[float] | None` 字段直接进 metadata,**不破坏现有协议**
+- `LongTermStore` 加 `image_embedding` 列(独立 collection `image_vectors`),**只加列不加表,零迁移成本**
 
-> **目标**：ProactiveLoop 走 LLM 推理（不再是 rule-based），能调用 Memory + Personality。
+### 12.3 7.9 启动条件(任一满足才考虑)
 
-- [ ] `ProactiveLoop` 接入 `MemoryFacade`（召回上下文，注入到 system prompt）
-- [ ] `ProactiveLoop` 接入 `Personality`（渲染语气 + 行为准则）
-- [ ] `ProactiveLoop.tick()` 改用 LLM 推理
-- [ ] `RuleBasedProactiveReasoning` 降级后备保持不变（ADR-009 不变量）
-- [ ] **路径检查点**：自定义 ProactiveLoop 能根据"主人情绪低落"历史产生"该吃早餐了"主动建议
+| 触发条件 | 阈值 | 监控方式 |
+|---------|------|---------|
+| **以图搜图场景频次** | 用户 3 个月内**主动要求"以图搜图"** ≥ 5 次 | `MemoryFacade.recall` 加 `query_type=image` 字段,统计 |
+| **Omni caption 召回命中率** | 7.8 跑通后 3 个月,`recall("蓝裙子")` 命中率 < 70% | `tests/perception/test_recall_hit_rate.py`(7.8.1 补) |
+| **本地多模态 LLM 成熟** | Qwen2-VL-7B / InternVL-2B **能稳定本地跑**(< 5s 推理) | LLM 资源占用监控 |
+| **Phase 8+ 多节点部署** | 中心化机器(32GB+ RAM)+ 4 张 GPU 卡 | Phase 8 启动信号 |
 
-### Phase 7.4：TTS 输出（1 天）
+**任一**满足 → 启动 7.9 EmbeddingGemma 2 评估,做小流量 A/B(默认走 Qwen text-only / 1% 流量走 EmbeddingGemma 2 召回),**确认召回率提升 ≥ 10% 才全量**。
 
-- [ ] 实现 `TTSAdapter`（Mock：打印到终端）
-- [ ] 接入真实 TTS API（可选：Edge TTS / Azure TTS）
-- [ ] **路径检查点**：Proactive 推送走 TTS，能听到音响播放
+### 12.4 7.9 工作量(预备,等启动再做)
 
-### Phase 7.5：Web 入口完善（1-2 天）
+| 任务 | 行数 | 备注 |
+|------|------|------|
+| `capabilities/embedding/gemma2.py` | ~150 行 | 封装 `SentenceTransformer("google/embeddinggemma-2")` + MRL 截断 + 懒加载 |
+| `factory.py` 加 gemma2 选项 | ~30 行 | 渐进加载(text-only 540MB / +vision 880MB / +audio 1.1GB) |
+| `LongTermStore` 多模态索引 | ~50 行 | 新增 `image_embedding: list[float] | None` 字段 |
+| `MemoryFacade.remember` 多模态参数 | ~30 行 | `remember(text=..., image=..., audio=...)` 同时存 text + image embedding |
+| `pyproject.toml` 依赖 | — | `sentence-transformers`(torch 已存在) |
+| `tests/unit/test_gemma2_embedder.py` | ~120 行 | MRL 截断 / 跨模态相似度 / 懒加载 |
+| **总计** | **~380 行 + ~120 测试** | 1 周节奏,3 个月内未必启动 |
 
-- [ ] FastAPI `/chat` 端点（HTTP POST）
-- [ ] FastAPI `/ws/{session_id}` 端点（WebSocket）
-- [ ] 浏览器 REPL 界面（HTML + JS）
-- [ ] **路径检查点**：浏览器和 REPL 同时在线，管家响应正确路由
+### 12.5 决策可逆性
 
-### Phase 7.6：收尾（1 天）
+**本决策完全可逆**——7.9 启动时:
+1. `LongTermStore` 加 `image_embedding` 列 → `ALTER TABLE` 一条 SQL,零数据迁移
+2. `MemoryFacade.remember()` 加 `image=` 参数 → **新参数不影响老调用**(默认 None 走原逻辑)
+3. `ReactiveSubmission.metadata` 加字段 → **现有调用零修改**
+4. 切换 provider:`SMARTBUTLER_EMBEDDING_PROVIDER=qwen → gemma2` 一行 env
+5. **业务层零修改**——`thinking/loop/orchestrator.py` 只看 `MemoryFacade` Protocol,不知道底下是哪个 embedder
 
-- [ ] `dev_chat.py` 加 DeprecationWarning
-- [ ] 更新 README §2.7 和 §6 启动说明
-- [ ] 全量单元测试通过（773 → ~850）
-- [ ] 文档落盘：本设计文档
-
----
-
-## 7. 关键设计权衡
-
-### 7.1 Reactive 强串行 vs Proactive 同 topic 串行
-
-> 详见 §0.1 和 §1.2，本节解释**为什么不同**。
-
-| 维度 | Reactive (路径 A) | Proactive (路径 B) |
-|---|---|---|
-| 串行化机制 | `TaskDispatcher` 单 worker | EventBus consumer 同 topic 串行 |
-| 串行化原因 | Orchestrator 内部有可写状态（`_current_memory_block` 等） | 避免 TTS/WebSocket 推送乱序 |
-| 串行化粒度 | 全局单 worker | 按 topic 分组（同 topic 串行，跨 topic 独立） |
-| 跨调用方影响 | 全部阻塞（用户 1 慢 → 用户 2 等） | 同 topic 阻塞（门锁事件不阻塞定时器） |
-
-**为什么 Proactive 不强串行**：
-- EventBus handler 内部只调 `ProactiveLoop.tick()`，tick() 本身 try/except + silent 降级
-- 多个 device topic 互不相关（门锁 / 灯 / 空调），不应相互阻塞
-- 但同 topic 串行是必要的：避免 TTS 语音乱序
-
-### 7.2 为什么选 InMemoryEventBus 而不是 Redis Streams
-
-| 维度 | InMemoryEventBus | Redis Streams |
-|---|---|---|
-| 依赖 | 零新增依赖 | 需要 Redis 进程 |
-| 进程数 | 单进程 | 多进程（未来扩展） |
-| 断线恢复 | 内存丢失 | 持久化 |
-| 部署复杂度 | 低 | 中 |
-| **适合场景** | Phase 7.1-7.3 | Phase 7.4+ 多实例部署 |
-
-**决策**：Phase 7.1-7.3 用 InMemory，Phase 7.4+ 支持切换 Redis Streams（接口不变，替换实现类）。
-
-### 7.2 为什么不用 FastAPI 本身做并发控制
-
-FastAPI/Uvicorn 每个请求会启动一个 asyncio task，这些 task 并发调用 `ButlerOrchestrator`。
-
-问题：`ButlerOrchestrator` 内部有状态（`_compiled` graph、`_current_memory_block` 等），并发调用虽然有 GIL 保护，但 LangGraph 的 checkpointer（SqliteSaver）在高并发下可能遇到 SQLite 锁。
-
-**决策**：用 `TaskDispatcher` 在 `ButlerServer` 层串行化，而不是依赖 FastAPI 的并发模型。FastAPI 只负责接收请求 → 入队 → 返回 Future。
-
-### 7.3 ProactiveLoop 为什么不需要串行化
-
-ProactiveLoop 是"触发后不管"的异步任务，理论上可以并发执行。但因为 `AnswerRouter.push_proactive()` 涉及 TTS 和 WebSocket 广播，并发调用可能导致语音乱序。
-
-**决策**：ProactiveLoop 的 `_on_device_event` handler 也走串行（通过 `EventBus` 内部的单 consumer 队列），避免语音乱序。
-
----
-
-## 8. 配置项
-
-```dotenv
-# Phase 7: EventBus + Production Server
-SMARTBUTLER_SERVER_MODE=repl|web                # 启动模式
-SMARTBUTLER_SERVER_HOST=0.0.0.0
-SMARTBUTLER_SERVER_PORT=8000
-
-# HomeAssistant（可选，Phase 7.2+）
-SMARTBUTLER_HA_URL=ws://192.168.1.x:8123/api/websocket
-SMARTBUTLER_HA_TOKEN=xxxxx
-
-# TTS（可选，Phase 7.4）
-SMARTBUTLER_TTS_PROVIDER=edge|azure|none       # none = mock（打印到终端）
-SMARTBUTLER_TTS_VOICE=zh-CN-XiaoxiaoNeural
-
-# EventBus 切换（Phase 7.4+）
-SMARTBUTLER_EVENTBUS_BACKEND=memory|redis|streams
-SMARTBUTLER_EVENTBUS_REDIS_URL=redis://localhost:6379
-```
-
----
-
-## 9. 不变量（Phase 7 全程必须遵守）
-
-> 本节是 §0.1 区分的**强约束版本**，每条都对应一个具体的反例。
-
-1. **Orchestrator 全局唯一**： ButlerServer 只持有一份 orchestrator，所有 Loop 串行访问
-   - ❌ 反例：开 2 个 `ButlerOrchestrator` 实例 → Memory 写入竞争
-2. **TaskDispatcher 串行化**：所有 Reactive 任务入同一 Queue，单 worker 串行执行
-   - ❌ 反例：多 worker 并发调 `orchestrator.ainvoke()` → `_current_memory_block` 被覆盖
-3. **Proactive 不阻塞 Reactive**：ProactiveLoop 事件处理不占 TaskDispatcher 资源
-   - ✅ 正确：Proactive 走 EventBus 自己的 consumer，独立 task
-   - ❌ 反例：把 Proactive 也塞进 TaskDispatcher → 设备事件阻塞用户输入
-4. **Proactive 同 topic 串行**：EventBus 同 topic 单 consumer，避免 TTS 乱序
-   - ❌ 反例：同 topic 多 consumer 并发推送 → 语音乱序
-5. **EventBus ack 必须在 handler 完成后**：at-least-once 语义，不丢事件
-   - ❌ 反例：handler 内 await 之前先 ack → 异常时事件丢失
-6. **Handler 异常不停止消费**：单个 handler 失败只打 ERROR log，继续处理下一个
-   - ❌ 反例：handler 异常导致 consumer 协程退出 → 后续事件全丢
-7. **Orchestrator 主体零修改**：不碰 `orchestrator.py` 主体，只扩展 `ReactiveLoop` 封装
-8. **TaskScheduler 不算 loop**：TaskScheduler 调 `segmenter.segment()`，不调 `orchestrator.ainvoke()`，与对话回路解耦
-   - ❌ 反例：把 TaskScheduler 接到 `submit_reactive()` 入口 → 后台任务混入对话回路
-9. **降级链闭合**：HA 断线 → 自动重连；TTS 不可用 → 打印到终端 → 管家不崩
+**总结**:**今天不上**多模态 embedding 是"延迟决策",**不是"不做决策"**——3-6 个月后看真实数据再决定。

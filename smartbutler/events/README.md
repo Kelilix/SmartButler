@@ -1,8 +1,8 @@
 # SmartButler 事件驱动模块（Phase 7）
 
-> **状态**：骨架阶段（Phase 4-6）— 只有协议 + 抽象接口 + ADR，**不写实现**。
->
-> **启动实现条件**：Phase 7 启动 + HomeAssistant 等设备接入环境就绪后。
+> **状态**:Phase 7 子阶段推进中(7.0+7.1+7.2+7.3 已落库 / 7.4 下一站)。
+> **详细方案**:`docs/PHASE_7_TECHNICAL_DESIGN.md`(本模块上下游,含子阶段拆分 + 工作量 + 端到端测试用例)。
+> **关联 ADR**:`ADR-008-event-driven.md`(事件驱动决策)+ `../../thinking/ADR-009-proactive-reactive-dual-loop.md`(双循环路由)
 
 ## 这是什么
 
@@ -32,9 +32,9 @@ events/                    ←  本模块（Phase 7）
     └──► interface/        HTTP/WebSocket 用户入口         ← 共存,事件走事件口
 ```
 
-**核心承诺**：本模块**一行不改 ButlerOrchestrator 主体**。**只改一处**：Phase 7 启动时把
-`ainvoke` 的返回类型从 `str` 升级到 `ButlerResponse`（带 `target_device` 字段），
-让 EventTrigger 能路由回设备。
+**核心承诺**:本模块**一行不改 ButlerOrchestrator 主体**。`ainvoke` 继续返 `str`,
+`ButlerResponse` 升级**不需要**——`ButlerReply` 已在 `server/adapters/__init__.py` 包装成 dataclass,
+含 `source="reactive"/"proactive"` 区分 + `related_event_id` 关联,完全够用。
 
 ## 目录结构
 
@@ -66,16 +66,39 @@ events/
     └── test_protocol_stub.py  协议字段纯数据结构测试
 ```
 
-## 给 Phase 4-6 维护者的话
+## 已落库 / 待补(按子阶段)
 
-- **不要 import 本模块** — Phase 4-6 阶段没有调用方
-- **不要在本模块写实现** — 等 Phase 7 启动时按接口填充
-- **不要改 ButlerOrchestrator 主体** — 等 Phase 7.2 改 return type
+### ✅ 7.0 协议 + 抽象(全部落库)
 
-## 启动 Phase 7 的检查清单
+- `core/event.py` — `BaseEvent` + `EventSource`(4 枚举)+ `EventPriority`(3 枚举)
+- `core/event_bus.py` — `EventBus` 抽象 + `EventBusError`
+- `core/normalizer.py` — `EventNormalizer` 抽象(0 行实现)
+- `core/trigger.py` — `EventTrigger` 抽象(0 行实现)
+- `protocol/device_event.py` — `DeviceEvent` + `DeviceType`(14 枚举)
+- `protocol/voice_event.py` — `VoiceEvent` + `VoiceAction`(4 枚举)
+- `protocol/timer_event.py` — `TimerEvent` + `TimerAction`
+- `routing/answer_router.py` — `AnswerRouter` 抽象(0 行实现)
+- `routing/presence.py` — `PresenceService` 抽象 + `PresenceInfo`(0 行实现)
+- `adapters/base.py` — `DeviceAdapter` 抽象
+- `tests/test_protocol_stub.py` — 协议字段纯数据结构测试
 
-- [ ] Phase 5（Skill loader）已完成
-- [ ] Phase 6（情感/记忆）已完成
-- [ ] HomeAssistant 测试环境就绪
-- [ ] 事件总线选型敲定（推荐 Redis Streams / NATS / Postgres LISTEN）
-- [ ] PresenceService 选型敲定（推荐先简化为"用户配置的固定设备"）
+### ✅ 7.1+7.2+7.3 Server + 内存总线(全部落库,在 `server/` 而非本目录)
+
+- `InMemoryEventBus`(`server/bus.py`)— 内存版 EventBus(通配符 + history + replay)
+- `ButlerServer`(`server/runtime.py`)— submit_reactive / submit_proactive / start / stop
+- `ServerConfig` — event_bus 注入 + enable_event_bus 开关
+- `ReactiveSubmission` / `ProactiveSubmission` / `ButlerReply` — 数据类
+- `InputAdapter` / `OutputAdapter` 抽象
+- `InMemoryInputAdapter` / `InMemoryOutputAdapter` / `PrintOutputAdapter` — Stub 实现
+- `build_default_server` — 默认 InMemoryEventBus 工厂
+
+### 🆕 下一站 7.4(中间环节真实化,~1 周)
+
+- `core/normalizer_dedup.py` — DedupNormalizer(基于 event_id + topic 去重,window 5s)
+- `core/trigger_default.py` — DefaultEventTrigger(route + 限速 20/min + 兜底)
+- `server/runtime.py:298-322` `_on_bus_event` 改造 — 走 Normalizer + Trigger(目前直接 proactive_tick,**旁路了抽象**)
+- `tests/server/test_event_bus_e2e.py` — 5 case:dedup / 限速 / 异常兜底 / source 路由
+
+### ⏳ 后续 7.5-7.8
+
+详见 `docs/PHASE_7_TECHNICAL_DESIGN.md` §2.1 子阶段总表。
