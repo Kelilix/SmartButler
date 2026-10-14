@@ -17,6 +17,7 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
+import structlog
 
 from smartbutler.capabilities.llm.base import (
     BaseLLM,
@@ -77,6 +78,14 @@ class OpenAICompatibleLLM(BaseLLM):
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             },
+        )
+
+        structlog.get_logger(__name__).info(
+            "llm.adapter.initialized",
+            impl="OpenAICompatibleLLM",
+            model=settings.model,
+            base_url=self._base_url,
+            timeout=timeout,
         )
 
     async def aclose(self) -> None:

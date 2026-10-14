@@ -19,6 +19,40 @@ dependencies = [
     "pydantic-settings>=2.2,<3.0",
     "structlog>=24.1,<25.0",
     "httpx>=0.27,<1.0",
+    # Phase 1.5: LangChain LLM 适配器依赖。
+    # langchain-core: BaseChatModel / 消息类型 / 工具绑定抽象。
+    # langchain-openai: ChatOpenAI 实现,DeepSeek / Qwen / OpenRouter 等
+    #                  OpenAI 兼容协议厂商均可复用该类（通过 base_url 切换）。
+    "langchain-core>=1.0,<2.0",
+    "langchain-openai>=1.0,<2.0",
+    "langgraph>=1.0,<2.0",
+    "langgraph-checkpoint>=4.1,<5.0",
+    "langgraph-prebuilt>=1.0,<2.0",
+    # Phase 6.1: SqliteSaver 让短期记忆(checkpointer 状态)跨进程持久化。
+    # 默认 InMemorySaver 重启即丢,Phase 6b Proactive 真实化时必须能查"最近一次对话",
+    # 故直接接 SqliteSaver,不复用 in-memory 占位。
+    "langgraph-checkpoint-sqlite>=3.1,<4.0",
+    # Phase 5: Skill loader 基于 deepagents 中间件。
+    # 0.7.0~0.7.6 早期版本只支持 langchain 0.3,跟我们现在 langchain 1.x 不兼容;
+    # 0.7.20+ 已升级依赖要求,实测 0.7.23 与 langchain 1.4.3 / langchain-core 1.6.8
+    # 共存正常。下界锁到 0.7.20 避免 pip 解图时去试早期版本,把 resolution-too-deep
+    # 触发面缩到最小。
+    "deepagents>=0.7.20,<0.8",
+    # Phase 6: 长期记忆层。qdrant-client 用嵌入式模式 (path=...) 不需要起
+    # 独立服务;langmem 提供 LangGraph 集成的记忆管理抽象。
+    "qdrant-client>=1.19,<2.0",
+    "langmem>=0.0.30,<0.1",
+    # Windows 上 zoneinfo 走 PEP 615 fallback,需要 tzdata 包提供 IANA 时区数据库。
+    # Linux/macOS 自带,装上无副作用;Windows 上无此包则 ZoneInfo("Asia/Shanghai") 直接抛
+    # ZoneInfoNotFoundError,get_current_time 会被迫回退 UTC,LLM 自己手动 +8 兜底。
+    "tzdata>=2024.1",
+    # Phase 6.3+: 长期记忆 consolidation 定时任务(daily/weekly/monthly)。
+    # AsyncIOScheduler 与现有 asyncio 循环共存,无须单独线程。
+    # 锁 3.x(3.10+ 才有的 asyncio scheduler 接口)。
+    "apscheduler>=3.10,<4.0",
+    # Phase 6.6: Personality 配置文件(personality.md)的 YAML frontmatter 解析。
+    # 跟 Skill loader 共用同一份 pyyaml(已存在于环境,但显式声明避免干净环境漏装)。
+    "pyyaml>=6.0,<7.0",
 ]
 
 [project.optional-dependencies]
@@ -69,6 +103,11 @@ addopts = "-ra -q --strict-markers"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["."]
+# TestTimeAgent 这个名字 (以 Test 开头) 是有意义的产品命名 —— "Test" 表示脚手架。
+# pytest 默认会把它当成 test class 收集,但它不是测试,抑制这条警告。
+filterwarnings = [
+    "ignore:cannot collect test class:pytest.PytestCollectionWarning",
+]
 markers = [
     "integration: end-to-end tests that hit external services (skipped by default; opt-in via -m integration)",
     "e2e: end-to-end streaming/connectivity tests against live LLM APIs (skipped by default; opt-in via -m e2e)",

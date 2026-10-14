@@ -15,8 +15,12 @@ import pytest
 import structlog
 
 from smartbutler.capabilities.llm import create_llm
+from smartbutler.capabilities.tools.common import (  # noqa: F401  触发 @register_tool
+    get_current_time,
+    web_fetch,
+)
+from smartbutler.capabilities.tools.registry import ToolRegistry
 from smartbutler.config import load_llm_settings
-
 
 # ---------------------------------------------------------------------------
 # structlog 控制台渲染配置（仅作用于 e2e 测试）
@@ -46,3 +50,18 @@ async def llm():
         yield llm
     finally:
         await llm.aclose()
+
+
+@pytest.fixture
+def common_tools():
+    """取出 common 目录下的 tool（get_current_time / web_fetch）的 OpenAI 协议描述。
+
+    供 tool-calling e2e 测试使用（test_ask_with_tools_and_log 等）。
+    返回 list[ToolSpec]，可直接喂给 ``llm.chat(tools=...)``。
+    """
+    wanted = {"get_current_time", "web_fetch"}
+    return [
+        tool.to_tool_spec()
+        for tool in ToolRegistry.get_default().get_global()
+        if tool.name in wanted
+    ]
