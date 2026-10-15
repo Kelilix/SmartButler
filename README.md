@@ -2,11 +2,12 @@
 
 > 有性格、有记忆、懂上下文的家用智能管家。
 >
-> **当前版本**:`v0.5.0`(`10` 个 commit;`851 unit + 5 integration + 24 e2e` 全部 ✅,原 821 → 851,+30 新测试)。
+> **当前版本**:`v0.5.2`(`10` 个 commit;`886 unit + 5 integration + 24 e2e` 全部 ✅,原 851 → 886,+35 新测试——29 声纹协议 + 6 orchestrator speakers 透传)。**无新功能破坏性改动**——单 user 设计,向后兼容,7.6 声纹模型留协议占位。
 > **下一站**:Phase 7.6(VoiceAdapter 第一个真硬件,silero VAD / funasr ASR / porcupine 唤醒词,见 `docs/PHASE_7_TECHNICAL_DESIGN.md` §5)。
 > **详细方案**:
 > - `docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md`(Memory 4 个子阶段设计)
 > - `docs/PHASE_7_TECHNICAL_DESIGN.md`(Phase 7 全周期 7.0-7.8 设计 + **§12 多模态记忆决策** + 7.9 观察项)
+> - `docs/PHASE_8_EMOTION_GOVERNANCE.md`(🆕 **Phase 8 重定位:情绪治理引擎**,替代原 Sub-Agent 主题,见 §10)
 > **架构总图**:`docs/TECHNICAL_DESIGN.md`(若不存在,见 git 历史 commit `828337e`)。
 > **关联 ADR**:`smartbutler/events/ADR-008-event-driven.md`(事件驱动)+ `smartbutler/thinking/ADR-009-proactive-reactive-dual-loop.md`(双循环)
 
@@ -36,46 +37,43 @@ SmartButler 是部署在家庭里、和主人长期相处的**单一智能体实
 |------|------|------|----------|
 | **Phase 1** | 基础设施 + LLM | ✅ | Pydantic Settings / structlog / `BaseStorage` / `BaseLLM`(**双后端** `http`+`langchain`) |
 | **Phase 2** | Tool 能力层 | ✅ | `BaseTool` + `ToolRegistry` + Decorator + LangChain Adapter + 2 个 common tool |
-| **Phase 3** | Sub-Agent 层(框架) | 🟡 **仅脚手架** | `BaseAgent` + `AgentManager` + `TestTimeAgent`(脚手架,集成测试用)。**领域 Sub-Agent(`HomeAgent` / `ScheduleAgent` / `SearchAgent`)属 Phase 8** |
+| **Phase 3** | Sub-Agent 层(框架) | 🟡 **仅脚手架** | `BaseAgent` + `AgentManager` + `TestTimeAgent`(脚手架,集成测试用)。**领域 Sub-Agent(`HomeAgent` / `ScheduleAgent` / `SearchAgent`)推 Phase 10+**(用户 2026-10-15 决策 F:整体往后) |
 | **Phase 4** | LangGraph Loop + Supervisor | ✅ | `StateGraph` + `ToolNode` + Checkpointer + `ButlerPromptBuilder` |
 | **Phase 4b** | ProactiveLoop 框架 | ✅ | 双循环架构 + `RuleBasedProactiveReasoning` 降级后备 + 沉默默认 |
 | **Phase 5** | Skill loader | ✅ | `SKILL.md` → 扫描解析 → 注入 system prompt + 6 个文件工具 + 3 类权限 |
 | **Phase 6.1** | Memory:长短期落地 | ✅ | `SQLiteStorage` + `QdrantStorage`(嵌入式默认) + `ShortTermMemory`(`SqliteSaver`) + `LongTermStore` |
 | **Phase 6.2 P0** | Memory:thinking 接入 + 高级 API | ✅ | `capabilities/embedding/`(Qwen + Stub)+ `capabilities/langmem/`(v0.0.30 + 正则 fallback)+ `MemoryFacade` + `MemoryHooks` + 注入 `memory_block` 到 system_prompt + **e2e 10 用例真打通** |
-| **Phase 6.3** | Memory:4 层分片 + 固化 + 遗忘 + vacuum | ⏳ **下一站** | `consolidation.py`(L1/L2/L3 升格管道 + LLM 评分)+ `forgetting.py`(5 类遗忘 + 软删除)+ `levels.py`(4 层 tag)+ `summarizer.py`(5W1H 提炼)+ `task_boundary.py` + `vacuum.py`(双时间窗 7+30 天) + `archive_store.py` + `scripts/memory_cli.py`(手动 CLI)。详见 `docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1(含 §2.5.1.16) |
-| **Phase 6.4** | Memory:episodic + 跨层 rollup | ⏳ | `summarizer.py`(5W1H 提炼,已在 6.3)+ `episodic.py`(情景记忆,SQLite JSON) |
-| **Phase 6.5** | Memory:habit + cross-thread | ⏳ | `habit.py` + `cross_thread.py`(为 Phase 6b 留 hook) |
+| **Phase 6.3** | Memory:4 层分片 + 固化 + 遗忘 + vacuum | ⏭ **往后推**(Phase 9+ 治理优化再做) | `consolidation.py`(L1/L2/L3 升格管道 + LLM 评分)+ `forgetting.py`(5 类遗忘 + 软删除)+ `levels.py`(4 层 tag)+ `summarizer.py`(5W1H 提炼)+ `task_boundary.py` + `vacuum.py`(双时间窗 7+30 天) + `archive_store.py` + `scripts/memory_cli.py`(手动 CLI)。详见 `docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1(含 §2.5.1.16)。**为什么往后(A 决策)**:vacuum/遗忘是"工程治理优化",不阻塞护城河;优先做情绪治理(Phase 8)+ 7.6/7.7/7.8。**触发条件**:Phase 8 跑通 + 用户产生"记太多/记错"反馈 |
+| **Phase 6.4** | Memory:episodic + 跨层 rollup | ⏭ **往后推**(Phase 9+) | `summarizer.py`(5W1H 提炼,已在 6.3)+ `episodic.py`(情景记忆,SQLite JSON)。**为什么往后(B 决策)**:情景记忆是辅助型,不是核心护城河 |
+| **Phase 6.5** | Memory:habit + cross-thread | ⏭ **往后推**(Phase 9+) | `habit.py` + `cross_thread.py`(为 Phase 6b 留 hook)。**为什么往后(E 决策)**:用户决策 2026-10-15——习惯/跨线程也是工程优化,优先做情绪治理。**注意**:Phase 8 情绪治理会复用"成功模式归档"(bp-emotion-recovery)——6.5 不阻塞 8.x |
 | **Phase 6.6** | Personality | ✅ | `emotion/personality/traits.py` + `loader.py`(YAML frontmatter md)+ `injector.py`(渲染 system prompt 片段);`ButlerPromptBuilder` 加 `personality_block` 参数;`ButlerOrchestrator.reload_personality()` 接 Learn 演化。详见 `README §2.7` 注释 |
-| **Phase 6.7** | Learn | ⏳ | 反馈事件流 + trait 映射 + 触发 `Personality.adjust_trait()` |
-| **Phase 6b** | ProactiveLoop 真实化 | ⏳(必须等 6 完成) | `LLMProactiveReasoning` 接 Memory + Persona + LLM 推理;`RuleBasedProactiveReasoning` **永不被删**(安全网) |
-| **Phase 7** | 事件驱动 + 路由 | 🟡 拆细(协议 + Server 已落库,中间环节待补) | **已落地**:7.0 协议 + 7.1 InMemoryEventBus/Server/Adapter + 7.2 ButlerReply 结构化 + 7.3 内存总线 + 7.4 Normalizer+Trigger + **7.5 AnswerRouter+PresenceService ✅**。**下一站 7.6**:VoiceAdapter 第一个真硬件。**后续**:7.7 TTS / 7.8 CameraAdapter / **7.9 多模态记忆(EmbeddingGemma 2,观察项,不启动)** |
-| **Phase 8** | 核心 Sub-Agent | ⏳ | `HomeAgent`(HomeAssistant)/ `ScheduleAgent` / `SearchAgent` |
-| **Phase 9** | 多模态感知 | ⏳ | ASR + TTS + Vision |
-| **Phase 10** | 主动服务 | ⏳ | 摄像头/麦克风监听/计划任务(与 Phase 7 联动) |
-| **Phase 11** | 性格演化 + 反馈学习 | ⏳ | 与 Phase 6.7 重叠,落地到管家级别 |
-| **Phase 12+** | self-evolving(候选) | ⏳ | skill 自动生成;当前**严格不做**——Learn 只管"反馈通道" |
+| **Phase 6.7** | Learn | ⏭ **往后推**(Phase 9+) | 反馈事件流 + trait 映射 + 触发 `Personality.adjust_trait()`。**为什么往后(C 决策)**:Learn 是"反馈通道",不阻塞情绪治理(Phase 8 不依赖 Learn) |
+| **Phase 6b** | ProactiveLoop 真实化 | ⏭ **往后推**(Phase 9+) | `LLMProactiveReasoning` 接 Memory + Persona + LLM 推理;`RuleBasedProactiveReasoning` **永不被删**(安全网)。**为什么往后**:Proactive 真实化是"主动智能"增强,Phase 8 情绪治理本身已包含主动干预(更聚焦,更受控) |
+| **Phase 7** | 事件驱动 + 路由 | 🟡 **当前在做(G)** | **已落地**:7.0 协议 + 7.1 InMemoryEventBus/Server/Adapter + 7.2 ButlerReply 结构化 + 7.3 内存总线 + 7.4 Normalizer+Trigger + **7.5 AnswerRouter+PresenceService ✅**。**D 决策 = 等于已做**:总线 + 输入输出适配器 7.4+7.5 已完整落库,7.6 之后才是真硬件对接。**下一站 7.6**:VoiceAdapter 第一个真硬件。**后续**:7.7 TTS / 7.8 CameraAdapter / **7.9 多模态记忆(EmbeddingGemma 2,观察项,不启动)** |
+| **Phase 8** | 🆕 **情绪治理引擎(Emotion Governance Engine)** | ⏳ 下一阶段(7.6/7.7/7.8 完工后启动) | 6 模块:`8.1 EmotionMonitor`(实时负面因子计算)/ `8.2 InterventionPlanner`(反向追溯根因 + LLM 设计干预方案)/ `8.3 InterventionExecutor`(调 7.5/7.7 链路执行 TTS/设备调整)/ `8.4 RecoveryTracker`(7 天观察 + 48h 正因子持续 → 判定恢复)/ `8.5 DataPruner`(ACTIVE → RESOLVED 状态机,不真删)/ `8.6 PatternArchive`(成功案例归档为可复用 pattern)。**核心范式**:看到事实 → 持久化为关系(带 sentiment)→ 派生行为模式 → **主动治理情绪** → 持续追踪 → 标记清除 → 学习闭环。**伦理护栏**:数据本地 / voice_tts 默认关 / 管家不是心理医生(toxic 情绪自动升级"建议专业帮助")/ 静默观察默认。**详细设计**:`docs/PHASE_8_EMOTION_GOVERNANCE.md`(6 周,~1350 行 + ~370 测试) |
+| **Phase 9** | 治理优化回填 + 多节点 Redis Streams | ⏳ | (1)回填**真空期优化的 5 块**:6.3 vacuum/遗忘(1060 行)+ 6.4 episodic(150 行)+ 6.5 habit(150 行)+ 6.7 Learn(200 行)+ 6b LLMProactiveReasoning(2-3 周)。(2)**多节点 Redis Streams 部署**(原 ADR-008 残留,顺延到 Phase 9+) |
+| **Phase 10+** | 原 Sub-Agent 主题 | ⏳ | F 决策整体往后:`HomeAgent`(HomeAssistant)/ `ScheduleAgent` / `SearchAgent` 等。**触发条件**:Phase 8 情绪治理 + 6.5 habit 跑通后,产生"管家需要专业子能力"反馈 |
+| **Phase 11+** | self-evolving(候选) | ⏳ | skill 自动生成;当前**严格不做**——Learn 只管"反馈通道" |
 
-### 2.2 Phase 6 子阶段拆分(Memory → Personality → Learn 严格串行)
+### 2.2 Phase 6 子阶段拆分(Memory → Personality → Learn)
 
-> 严格串行——每阶段必须前一阶段跑通单测 + 集成测试后才启动。
-> **理由**:Memory 是 Personality 的输入数据源,Learn 是 Personality 的演化器。
+> **2026-10-15 更新(用户决策 A-F-G)**:严格串行已**松绑**——6.3/6.4/6.5/6.7/6b 整体推 Phase 9+ 治理优化期;**Memory 6.1+6.2 P0 已落库**(继续夯实)→ **Personality 6.6 已落地** → **Learn 6.7 推 Phase 9+**。**Phase 8 情绪治理是当前核心**,依附于 6.1+6.2 P0 Memory,本身不依赖 6.3-6.7。
+> **新节奏**:**Memory(P0 已落库,P1 优化往后)** + **Personality(6.6 已落库)** + **Phase 8 情绪治理(下一阶段)** + **Phase 9 治理优化回填** + **Phase 10+ Sub-Agent 主题**。
 
-| 子阶段 | 模块 | 自研量 | 关键依赖 | 启动前置 |
-|--------|------|--------|----------|----------|
-| **6.1** Memory:长短期落地 | `storage/{sqlite,qdrant}.py` + `emotion/memory/{short_term,long_term}.py` | ~200 行 | `qdrant-client` + `langmem` | Phase 5 完工 ✅ |
-| **6.2 P0** Memory:thinking 接入 | `capabilities/embedding/` + `capabilities/langmem/` + `emotion/memory/{embedder,importance,retrieval,hooks,facade}.py` + `thinking/loop/` 注入 `memory_block` | ~630 行 + ~340 测试 | `qwen3.7-text-embedding-flash` + `langmem 0.0.30` | 6.1 ✅ |
-| **6.3 P1** Memory:4 层分片 + 固化 + 遗忘 + vacuum | `emotion/memory/{consolidation,forgetting,levels,summarizer,task_boundary,vacuum,archive_store}.py` + `scripts/memory_cli.py` | **~1060 行 + ~40 测试 + 2 e2e** | LLM 评分 + 5W1H 提炼 + 4 层 tag + 双时间窗 vacuum(7+30 天) | 6.2 ✅ + 用户产生"记太多/记错"反馈。**详细设计**:`docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1(含 §2.5.1.16 vacuum 治理) |
-| **6.4 P1** Memory:episodic + 跨层 rollup | `emotion/memory/{episodic,hierarchical_rollup}.py` | ~150 行 + ~10 测试 | 6.3 已有 4 层分片,6.4 只补对话轨迹 | 6.3 ✅ + 用户问"最近 3 个月偏好" |
-| **6.5 P1** Memory:能力补全 | `emotion/memory/{habit,cross_thread}.py` | ~150 行 | 6.4 的 summarizer | 6.4 ✅ + Phase 6b 启动 |
-| **6.6** Personality | `emotion/personality/{traits,loader,injector}.py` | **~350 行 + ~77 测试** | **不依赖 6.5**——空壳 personality 独立可测 | 6.5 ✅(实际 6.1 即可并行) |
-| **6.7** Learn | `emotion/learn/{feedback_log,signal,evolution_hook}.py` | ~200 行 | 6.6 `personality.adjust_trait()` | 6.6 ✅ |
-
-**Phase 6 总自研量**:~1250 行 + ~50 测试,约 3-4 周。
+| 子阶段 | 模块 | 自研量 | 关键依赖 | 启动前置 | 优先级 |
+|--------|------|--------|----------|----------|--------|
+| **6.1** Memory:长短期落地 | `storage/{sqlite,qdrant}.py` + `emotion/memory/{short_term,long_term}.py` | ~200 行 | `qdrant-client` + `langmem` | Phase 5 完工 ✅ | ✅ 完成 |
+| **6.2 P0** Memory:thinking 接入 | `capabilities/embedding/` + `capabilities/langmem/` + `emotion/memory/{embedder,importance,retrieval,hooks,facade}.py` + `thinking/loop/` 注入 `memory_block` | ~630 行 + ~340 测试 | `qwen3.7-text-embedding-flash` + `langmem 0.0.30` | 6.1 ✅ | ✅ 完成 |
+| **6.3 P1** Memory:4 层分片 + 固化 + 遗忘 + vacuum | `emotion/memory/{consolidation,forgetting,levels,summarizer,task_boundary,vacuum,archive_store}.py` + `scripts/memory_cli.py` | **~1060 行 + ~40 测试 + 2 e2e** | LLM 评分 + 5W1H 提炼 + 4 层 tag + 双时间窗 vacuum(7+30 天) | 6.2 ✅ | ⏭ **A 决策:Phase 9+ 治理优化** |
+| **6.4 P1** Memory:episodic + 跨层 rollup | `emotion/memory/{episodic,hierarchical_rollup}.py` | ~150 行 + ~10 测试 | 6.3 已有 4 层分片,6.4 只补对话轨迹 | 6.3 ✅ | ⏭ **B 决策:Phase 9+** |
+| **6.5 P1** Memory:能力补全 | `emotion/memory/{habit,cross_thread}.py` | ~150 行 | 6.4 的 summarizer | 6.4 ✅ | ⏭ **E 决策:Phase 9+** |
+| **6.6** Personality | `emotion/personality/{traits,loader,injector}.py` | **~350 行 + ~77 测试** | **不依赖 6.5**——空壳 personality 独立可测 | 6.5 ✅(实际 6.1 即可并行) | ✅ 完成 |
+| **6.7** Learn | `emotion/learn/{feedback_log,signal,evolution_hook}.py` | ~200 行 | 6.6 `personality.adjust_trait()` | 6.6 ✅ | ⏭ **C 决策:Phase 9+** |
 
 ### 2.3 关键不变量(Phase 6 全程必须遵守)
 
 1. **3 层存储严格分离**——短期 = `SqliteSaver`(checkpointer)/ 长期事实 = Qdrant / 长期情景 = SQLite JSON。**不允许把"短期"也存 Qdrant**。
-2. **Qdrant 默认嵌入式**(`path=data/qdrant`),**用户不感知**。Phase 8+ 切服务模式时只改 `StorageSettings.qdrant_url` 即可。
+2. **Qdrant 默认嵌入式**(`path=data/qdrant`),**用户不感知**。Phase 9+ 切服务模式时只改 `StorageSettings.qdrant_url` 即可(多节点 Redis Streams 部署时统一切)。
 3. **Personality 永远不直接调 LLM**——只接受显式 user 指令 + learn 触发的 trait 调整。**Personality 是数据,不是 Agent**。
 4. **Learn 严格不"自动生成 skill"**——skill 生成是 self-evolving agent 范畴,属 Phase 12+ 候选,Phase 6 只管"反馈通道"。
 
@@ -106,7 +104,7 @@ SmartButler 是部署在家庭里、和主人长期相处的**单一智能体实
 | Embedding 能力 | `smartbutler/capabilities/embedding/` | ✅ | `Embedder` Protocol + `QwenEmbedder`(`qwen3.7-text-embedding-flash` 1024 维)+ `StubEmbedder`(降级,无 API) + 工厂自动降级 |
 | langmem 抽象 | `smartbutler/capabilities/langmem/` | ✅ | `BaseLangmemAdapter` + `Langmem0030Adapter`(软依赖 try-import)+ `RegexFactExtractor`(装不上时降级)+ 工厂自动选 |
 | Tool 能力 | `smartbutler/capabilities/tools/` | ✅ | `BaseTool` + `ToolRegistry` + Decorator + LangChain Adapter + 2 个 common tool(`get_current_time` / `web_fetch`) + 6 个 skill 文件工具 |
-| Sub-Agent 框架 | `smartbutler/agents/` | 🟡 **仅脚手架** | `BaseAgent` + `AgentManager` + `to_langchain_tool()` + 最小 LLM 循环(决定 → 调 tool → 收集,最多 5 轮) + 失败回流 + 重试/超时。**`TestTimeAgent` 是脚手架 agent**(名字里的 "Test" 表示测试脚手架,见 `pyproject.toml` 注释),仅供集成测试验证 agent 协议,**不解决任何领域问题**。**真正的领域 Sub-Agent(`HomeAgent` / `ScheduleAgent` / `SearchAgent`)一个都还没做**——属 Phase 8 任务 |
+| Sub-Agent 框架 | `smartbutler/agents/` | 🟡 **仅脚手架** | `BaseAgent` + `AgentManager` + `to_langchain_tool()` + 最小 LLM 循环(决定 → 调 tool → 收集,最多 5 轮) + 失败回流 + 重试/超时。**`TestTimeAgent` 是脚手架 agent**(名字里的 "Test" 表示测试脚手架,见 `pyproject.toml` 注释),仅供集成测试验证 agent 协议,**不解决任何领域问题**。**真正的领域 Sub-Agent(`HomeAgent` / `ScheduleAgent` / `SearchAgent`)一个都还没做**——F 决策整体推 Phase 10+ |
 | Thinking(Reactive) | `smartbutler/thinking/loop/` | ✅ | `ButlerOrchestrator`(LangGraph `StateGraph` + 原生 `ToolNode` + 异步 `AsyncSqliteSaver` checkpointer)+ `decide_node`(唯一业务节点)+ `ButlerPromptBuilder`(系统 prompt + Skill 注入 + **memory_block 注入**)+ `ButlerChatModelAdapter` |
 | Thinking(Proactive) | `smartbutler/thinking/proactive/` + `thinking/loop/proactive_loop.py` | ✅ 框架 | `RuleBasedProactiveReasoning`(降级后备,URGENT 主动 / 5min dedup / 其他沉默)+ `ProactiveDecision/Result` + 双循环架构。**真实化见 Phase 6b** |
 | 事件总线骨架 | `smartbutler/events/` | 🟡 协议+抽象落库,Server/内存总线落库,中间环节(Normalizer/Trigger/Router/Adapter 实现)待补 | `EventBus` + 设备/语音/定时器事件协议 + `EventNormalizer`(接口)+ `EventTrigger`(接口)+ `AnswerRouter`(接口)+ `PresenceService`(接口)。**7.0 + 7.1 + 7.2 + 7.3 + 7.4 + 7.5 全部 ✅**——`InMemoryEventBus` / `ButlerServer` / `ReactiveSubmission` / `ProactiveSubmission` / `ButlerReply` / `InMemoryInputAdapter` / `InMemoryOutputAdapter` / `PrintOutputAdapter` / `build_default_server` / `DedupNormalizer` / `DefaultEventTrigger` / `ServerConfig(normalizer/trigger/answer_router 字段)` / **`RouteResult`(frozen dataclass)** / **`DeviceRegistry`** / **`ConsoleAnswerRouter`** / **`SimplePresenceService`** 全部实现。**0 行实现的**:VoiceAdapter / CameraAdapter / TTSOutputAdapter(7.5b PresenceService 智能门锁 / 7.5c 手机 GPS / 7.5d 摄像头人脸 后续阶段待 7.5+ 启动)。**详细拆分**: `docs/PHASE_7_TECHNICAL_DESIGN.md` §0.1/§0.2/§4 |
@@ -134,16 +132,18 @@ SmartButler 是部署在家庭里、和主人长期相处的**单一智能体实
 
 ### 2.7 下次开工的待办(按 phase 排序)
 
-- [ ] **Phase 6.3:Memory 4 层分片 + 固化 + 遗忘 + vacuum**(~1060 行,~2-3 周)—— `emotion/memory/levels.py`(4 层 tag 规则)+ `consolidation.py`(L1/L2/L3 升格管道 + LLM 评分)+ `forgetting.py`(5 类遗忘 + 软删除 + 恢复)+ `summarizer.py`(5W1H 提炼 + LLM 摘要)+ `task_boundary.py`(短期 task 切分)+ `vacuum.py`(双时间窗 7+30 天 vacuum + VacuumReport)+ `archive_store.py`(archived SQLite 备份表)+ `scripts/memory_cli.py`(手动 CLI 入口)+ facade 加 6 个新 API(`consolidate` / `forget` / `restore` / `list_deleted` / `purge_now` / `vacuum_stats`)。**核心交付**:① 管家说"上周你订了去北京的票"(L2 weekly 召回)② 30 天前的开灯琐事自动软删(TTL)③ `python -m smartbutler.scripts.memory_cli vacuum --dry-run` 手动清软删,容量稳态只多 400 条(3MB)。**详细设计**: `docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1(2026-10-10 敲定,含 §2.5.1.16 vacuum 治理)。**触发条件**:6.2 P0 跑通 ✅ + 用户产生"记太多/记错"反馈。
-- [ ] **Phase 6.7:Learn**(~200 行,~1 周)—— 显式/隐式反馈事件流 + 反馈→trait 映射规则 + 触发 `personality.adjust_trait()` + 调 `orchestrator.reload_personality()` 刷缓存。**严格不实现"自动生成 skill"**。**前置**:6.6 Personality ✅(已完成 traits / loader / injector,Learn 只调现成 API)。
-- [ ] **Phase 6b:ProactiveLoop 真实化**(~2-3 周,**必须等 Phase 6 完成后启动**)—— `LLMProactiveReasoning` 接 Memory + Persona + LLM 推理;`RuleBasedProactiveReasoning` **永不被删**(安全网,URGENT 事件 LLM 不可用时也要能主动开口)。
+> **2026-10-15 优先级重排(用户决策 A-F-G)**:A=6.3 vacuum / B=6.4 episodic / C=6.7 Learn / D=总线+适配器(= 已做,7.4+7.5 完整落库)/ E=6.5 habit / F=子 Agent 全部往后。**G=Phase 7 当前在做**(7.6/7.7/7.8 仍按 7.6 → 7.7 → 7.8 顺序推)。**重点 = 记忆**(情绪治理引擎依附于此)。具体见 §2.1 阶段表 + §10 变更记录。
+
+- [ ] **Phase 6.3 vacuum/遗忘(往后推,A 决策)**(~1060 行,~2-3 周)——`emotion/memory/levels.py`(4 层 tag 规则)+ `consolidation.py`(L1/L2/L3 升格管道 + LLM 评分)+ `forgetting.py`(5 类遗忘 + 软删除 + 恢复)+ `summarizer.py`(5W1H 提炼 + LLM 摘要)+ `task_boundary.py`(短期 task 切分)+ `vacuum.py`(双时间窗 7+30 天 vacuum + VacuumReport)+ `archive_store.py`(archived SQLite 备份表)+ `scripts/memory_cli.py`(手动 CLI 入口)+ facade 加 6 个新 API(`consolidate` / `forget` / `restore` / `list_deleted` / `purge_now` / `vacuum_stats`)。**核心交付**:① 管家说"上周你订了去北京的票"(L2 weekly 召回)② 30 天前的开灯琐事自动软删(TTL)③ `python -m smartbutler.scripts.memory_cli vacuum --dry-run` 手动清软删,容量稳态只多 400 条(3MB)。**详细设计**:`docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1。**为什么往后**:vacuum 是"工程治理优化",不阻塞护城河;优先做情绪治理(Phase 8)+ 7.6/7.7/7.8。**触发条件**:Phase 8 跑通 + 真实家庭使用 1-3 个月 + 用户产生"记太多/记错"反馈。**Phase 9+ 再启**
+- [ ] **Phase 6.7 Learn(往后推,C 决策)**(~200 行,~1 周)——显式/隐式反馈事件流 + 反馈→trait 映射规则 + 触发 `personality.adjust_trait()` + 调 `orchestrator.reload_personality()` 刷缓存。**严格不实现"自动生成 skill"**。**前置**:6.6 Personality ✅。**为什么不阻塞 Phase 8**:Phase 8 情绪治理的"成功案例归档"(8.6 PatternArchive)走的是 BehaviorPattern 持久化,跟 Learn 的 trait 演化是两条独立通路
+- [ ] **Phase 6b:ProactiveLoop 真实化(往后推)**(~2-3 周,**必须等 Phase 6 完成后启动**)——`LLMProactiveReasoning` 接 Memory + Persona + LLM 推理;`RuleBasedProactiveReasoning` **永不被删**(安全网,URGENT 事件 LLM 不可用时也要能主动开口)。**为什么不阻塞 Phase 8**:Phase 8.3 InterventionExecutor 自带"主动干预"逻辑,更聚焦(治理情绪)且更受控(voice_tts 默认关 + 过度干预防护)
 - [x] **Phase 7.4:Normalizer + Trigger 真实化**(2026-10-14 ✅ 实施完成,v0.4.2)— `events/core/normalizer_dedup.py`(基于 event_id + topic 去重,window 5s,LRU 10000)+ `events/core/trigger_default.py`(route + 限速 20/min + 兜底)+ `server/runtime.py` 改 `_on_bus_event` 走 Normalizer+Trigger + `server/adapters/stub.py` 加 `ServerConfig` 注入字段 + `tests/server/test_event_bus_e2e.py`(5 case:dedup/限速/异常兜底/source 路由)。**🆕 5 个钩子必加(7.9 多模态记忆预留,~40 行)**:① H1 `Embedder` Protocol 加 3 个多模态方法(默认 `NotImplementedError`)② H2 `LongTermStore` SQLite 加 4 列(`image_ref`/`audio_ref`/`image_embedding`/`embedding_model`,**Day 1 必做**)③ H3 `MemoryFacade.remember()` 加 2 个可选 kw-only(`image_ref`/`audio_ref`)④ H4 `BaseEvent.media_refs` 字段 ⑤ H5 `metadata["modality_tags"]` 协议注释。**详见 `docs/PHASE_7_TECHNICAL_DESIGN.md` §3 + §12.6**。**核心交付**:从 publish 烟雾事件 → 60 个事件去重为 1 个 → Trigger 路由到 ProactiveLoop → 推回 1 条告警文本 → OutputAdapter 收到。**不启动前置**:VoiceAdapter / CameraAdapter(它们 producer 端会爆管,必须先有 Normalizer)。
 - [x] **Phase 7.5:AnswerRouter + PresenceService 真实化**(2026-10-14 ✅ 实施完成,v0.5.0,851/851 测试全过,原 821 → 851,+30 新测试)— `events/routing/route_result.py`(`RouteResult` frozen dataclass 5 字段 + `success` property + `__str__`,D1)+ `events/routing/device_registry.py`(`DeviceRegistry` register/get/all/first + `_device_id` 约定,D2)+ `events/routing/answer_router_console.py`(`ConsoleAnswerRouter` SILENT 不推 / NORMAL 走 PresenceService / URGENT 推全屋,D1+D2+D4)+ `events/routing/presence_simple.py`(`SimplePresenceService` in-memory dict + 便利方法 set_sync/clear,D3)+ `events/routing/answer_router.py`(`AnswerRouter.route()` 返 `RouteResult` 而非 `bool`)+ `server/runtime.py`(`_answer_router` 字段 + `set_answer_router()` + `set_presence_service()` + `_on_bus_event` 拿 answer 后走 AnswerRouter 选路,Reactive 链路保持老逻辑不动)+ `scripts/dev_chat.py`(`/presence set/get/clear/list` REPL 命令 + `--no-answer-router` 开关)+ `server/adapters/stub.py`(`InMemoryOutputAdapter` 加 `device_id` 可选参数,backward-compat)+ `tests/unit/server/test_answer_router_e2e.py`(30 case:6 e2e + RouteResult 5 + DeviceRegistry 7 + SimplePresenceService 5 + ConsoleAnswerRouter 直测 6 + 1 全场景)。**核心交付**:从 publish 事件 → AnswerRouter 选路 → 推对/全屋/不推,可观测(RouteResult 5 字段)。**总工作量 ~1020 行(超 415 估,因测试 580 行 vs 180 估)+ 1 周**。**前置**:7.4 ✅
-- [ ] **Phase 7.6:VoiceAdapter 第一个真硬件**(~500 行 + ~250 测试,~2-3 周)— `voice/` 子模块(capture/silero VAD/funasr ASR/porcupine 唤醒词)+ `events/adapters/voice_adapter.py`(mic → VoiceEvent)+ 新增依赖 `sounddevice` + `funasr` + `torch`(~1.2GB,放 `[project.optional-dependencies.voice]`,默认不装)。**BaseAudioCapture / BaseASR / BaseWakeWordDetector 抽象**让单测用 mock,大幅降测试成本。**前置**:7.5 ✅
+- [ ] **Phase 7.6:VoiceAdapter 第一个真硬件**(~700 行 + ~300 测试,~3-4 周,**含声纹识别**)— `voice/` 子模块(capture/silero VAD/funasr ASR/porcupine 唤醒词)+ `events/adapters/voice_adapter.py`(mic → VoiceEvent)+ 新增依赖 `sounddevice` + `funasr` + `torch` + `resemblyzer`(放 `[project.optional-dependencies.voice]`,默认不装)。**BaseAudioCapture / BaseASR / BaseWakeWordDetector 抽象**让单测用 mock,大幅降测试成本。**🆕 声纹识别子模块(`voice/speaker/`,7.6 阶段必做,TOTHINK 1.1/1.2 场景刚需)**:① `SpeakerDiarizer`(VAD 切分 + 说话人聚类,输出多 segment)② `SpeakerEmbedder`(resemblyzer 256 维,中文友好模型)③ `SpeakerRegistry` 抽象 + 7.5 阶段 stub `SimpleSpeakerRegistry`(内存 dict,7.6 接 EmbeddingSpeakerRegistry 余弦相似度)④ `voice.speaker_registry` 集成到 VoiceAdapter(算 embedding → 查 Registry → 写 VoiceEvent.speakers)。**注意单 user 设计**:`ButlerOrchestrator.ainvoke()` 仍只接**单值 user_id**(每轮 ainvoke 一个 user 在说话);多 user 场景(TOTHINK 1.1:男女主人交替)通过**多轮 ainvoke** 切换 user_id,声纹结果落 `HumanMessage.additional_kwargs["speakers"]` 供后续 Sub-Agent / 记忆系统 / Phase 8 情绪治理消费。**前置**:7.5 ✅(7.5 已落 `SpeakerInfo` + `BaseEvent.speakers` + `SimpleSpeakerRegistry` 协议占位)
 - [ ] **Phase 7.7:TTSOutputAdapter 第一个真输出**(~250 行 + ~150 测试,~1 周)— `voice/tts/{edge,offline}.py`(`edge-tts` 云端 + `sherpa-onnx` Piper 离线 7.7.1)+ `events/adapters/tts_output_adapter.py`(ButlerReply → TTS → 播放)+ 端到端 PoC(说话→管家答→本机播放)。**前置**:7.5 ✅(可与 7.6 并行)
 - [ ] **Phase 7.8:CameraAdapter 视频输入,音视频流水线收口**(~800 行 + ~250 测试,~4-6 周,**优先级低于 7.6+7.7**)— `voice/capture/buffer.py`(MultiTrackSyncBuffer 音视频对齐)+ fork Miloco `perception/` 子目录(Gate / Identity / Omni 三件套)+ `events/adapters/camera_adapter.py`(摄像头 → 感知 → DeviceEvent → **MemoryFacade.remember(text=caption)**)。**核心硬条件(case 6/7 验收)**:① 感知层 Omni 输出的 caption 必须**强制**进 `MemoryFacade.remember`,不依赖 ProactiveLoop 触发;② 1 周后 recall "蓝裙子" 必须能命中(若 < 70% 启动 7.9 EmbeddingGemma 2)。**当前不引入多模态 embedding**——`ReactiveSubmission.metadata` / `ButlerReply.metadata` 留扩展位。**详细设计**:`docs/PHASE_7_TECHNICAL_DESIGN.md` §7 + §12。**前置**:7.7 ✅
-- [ ] **Phase 7.9:多模态记忆(EmbeddingGemma 2,观察项,不启动)**(~380 行 + ~120 测试,等触发)— `capabilities/embedding/gemma2.py`(740M 参数,Apache 2.0,768 维 unified space)+ `factory.py` 渐进加载(text-only 540MB / +vision 880MB / +audio 1.1GB)+ `LongTermStore` 多模态索引(`image_embedding: list[float] | None`)+ `MemoryFacade.remember(text=..., image=...)` 双路召回。**触发条件(任一满足才启动)**:① 用户 3 个月内主动要求"以图搜图" ≥ 5 次;② 7.8 case 7 类召回命中率 < 70%;③ Qwen2-VL-7B 本地稳定跑(< 5s 推理);④ Phase 8+ 多节点部署(32GB+ RAM)。**决策可逆**:LongTermStore 加列 / facade 加可选参数 / 业务层零修改,仅 1 行 env 切换 provider。**详细决策**:`docs/PHASE_7_TECHNICAL_DESIGN.md` §12。**不进本周期待办**——等真实使用数据再决定。
-- [ ] **Phase 8 预研**(不启动)—— `HomeAgent` 接入 HomeAssistant 的可行性,**仅在 Phase 7 + 真实 HA 环境就绪后**启动。
+- [ ] **Phase 7.9:多模态记忆(EmbeddingGemma 2,观察项,不启动)**(~380 行 + ~120 测试,等触发)— `capabilities/embedding/gemma2.py`(740M 参数,Apache 2.0,768 维 unified space)+ `factory.py` 渐进加载(text-only 540MB / +vision 880MB / +audio 1.1GB)+ `LongTermStore` 多模态索引(`image_embedding: list[float] | None`)+ `MemoryFacade.remember(text=..., image=...)` 双路召回。**触发条件(任一满足才启动)**:① 用户 3 个月内主动要求"以图搜图" ≥ 5 次;② 7.8 case 7 类召回命中率 < 70%;③ Qwen2-VL-7B 本地稳定跑(< 5s 推理);④ Phase 9+ 多节点部署(32GB+ RAM,用户 2026-10-15 决策顺延)。**决策可逆**:LongTermStore 加列 / facade 加可选参数 / 业务层零修改,仅 1 行 env 切换 provider。**详细决策**:`docs/PHASE_7_TECHNICAL_DESIGN.md` §12。**不进本周期待办**——等真实使用数据再决定。
+- [ ] **Phase 8:情绪治理引擎(下一阶段,核心护城河)**(~1350 行 + ~370 测试,~6 周)—— 6 模块:**8.1 EmotionMonitor**(实时负面因子计算,纯规则 Σ 公式,P95 < 100ms)/ **8.2 InterventionPlanner**(反向追溯根因 + 历史成功 pattern 检索 + LLM 设计 2-3 方案,选最优,P95 < 2s)/ **8.3 InterventionExecutor**(调 7.5 AnswerRouter + 7.7 TTS 执行干预,带降级链,P95 < 1s)/ **8.4 RecoveryTracker**(每日检查情绪因子,7 天观察期 + 48h 正因子持续 → 判定恢复,失败升级回 8.2)/ **8.5 DataPruner**(恢复成功 → 标记 ACTIVE → RESOLVED,不真删,保留复盘)/ **8.6 PatternArchive**(成功案例归档为 `bp-emotion-recovery-xxx` BehaviorPattern,跨 session 可复用)。**核心范式**:看到事实 → 持久化为关系(带 sentiment)→ 派生行为模式 → **主动治理情绪** → 持续追踪 → 标记清除 → 学习闭环。**伦理护栏**:数据本地化(`data/emotion.db`)/ voice_tts 默认关闭 / 同 1 周最多 3 次干预,超限降级为只观察 / toxic 关键词(自伤/想死/不想活)自动升级"建议联系专业心理咨询"通知 / 管家不是心理医生,只做"识别异常→推专业帮助"桥梁。**PoC 简化**:情绪维度只做 2 维(negative_factor + positive_factor),完整 4 维 PAD 模型留 Phase 10+。**核心 Schema 扩展**:`relation` 加 `sentiment` / `sentiment_score` / `status`(ACTIVE/RESOLVED)字段;新增 `emotion_state` 表(因子缓存) + `intervention` 表(干预日志)。**详细设计**:`docs/PHASE_8_EMOTION_GOVERNANCE.md`(6 个子阶段 + 6 个测试 case + 验收标准 + 风险缓解)。**前置**:7.6 VoiceAdapter ✅(7.3 干预执行器要调 TTS/设备) + 7.7 TTS ✅(TTS 是干预主要出口) + 6.6 Personality ✅(可选,作为个性化基线)。**不依赖**:6.3/6.4/6.5/6.7/6b(已 A-E 决策往后推)
 
 ---
 
@@ -248,9 +248,9 @@ SMARTBUTLER_LLM_BACKEND=langchain
 用户消息 → LangGraph Loop (管家 LLM 推理)
               ↓ 工具集
               ├─ delegate_to_test_time_agent → TestTimeAgent (Phase 3)
-              ├─ delegate_to_home_agent       → HomeAgent (Phase 8, Haiku)
-              ├─ delegate_to_schedule_agent   → ScheduleAgent (Phase 8, Haiku)
-              ├─ delegate_to_search_agent     → SearchAgent (Phase 8, Haiku)
+              ├─ delegate_to_home_agent       → HomeAgent (Phase 10+, Haiku)
+              ├─ delegate_to_schedule_agent   → ScheduleAgent (Phase 10+, Haiku)
+              ├─ delegate_to_search_agent     → SearchAgent (Phase 10+, Haiku)
               ├─ pdf_extract                  (Skill 工具,管家直接调)
               ├─ get_today_digest             (管家元工具)
               └─ ... (其他 Skill 工具,管家直接调)
@@ -330,7 +330,7 @@ SMARTBUTLER_LLM_BACKEND=langchain    # 可选;默认 http
 
 SMARTBUTLER_STORAGE_SQLITE_PATH=./data/smartbutler.db
 # 不设 SMARTBUTLER_STORAGE_QDRANT_URL → 嵌入式 path=./data/qdrant
-# 设了则切服务模式(Phase 8+ 部署到中心化机器时用)
+# 设了则切服务模式(Phase 9+ 多节点部署到中心化机器时用)
 
 SMARTBUTLER_LOGGING_LEVEL=INFO
 SMARTBUTLER_LOGGING_JSON_OUTPUT=false
@@ -378,6 +378,8 @@ SMARTBUTLER_EMBEDDING_DIMENSION=1024   # 必须与 SMARTBUTLER_STORAGE_QDRANT_VE
 
 | 日期 | 版本 | 变更 | 关联 |
 |------|------|------|------|
+| 2026-10-15 | v0.5.1 | **🆕 阶段表 + 优先级重排(用户决策 A-F-G) + Phase 8 重定位为情绪治理引擎**:A=`Phase 6.3` vacuum/遗忘 1060 行推 Phase 9+ / B=`Phase 6.4` episodic 推 Phase 9+ / C=`Phase 6.7` Learn 推 Phase 9+ / D=总线+输入输出适配器**等于已做**(7.4 Normalizer+Trigger ✅ + 7.5 AnswerRouter+PresenceService ✅) / E=`Phase 6.5` habit/cross_thread 推 Phase 9+ / F=各子 agent(Home/Schedule/Search)整体推 Phase 10+ / G=`Phase 7` 当前在做(7.6/7.7/7.8 维持 7.6→7.7→7.8 顺序)。**Phase 8 重定位**:从"核心 Sub-Agent"改为"**情绪治理引擎(Emotion Governance Engine)**"——6 模块(8.1-8.6,1350 行 + 370 测试,6 周),核心范式:看到事实→持久化为关系(带 sentiment)→派生行为模式→**主动治理情绪**→持续追踪→标记清除→学习闭环。**伦理护栏**:数据本地 / voice_tts 默认关 / toxic 关键词自动升级"建议联系专业心理咨询" / 管家不是心理医生,只做桥梁。**新设计文档**:`docs/PHASE_8_EMOTION_GOVERNANCE.md`(2026-10-15 落地,1234 行,10 章 + 3 附录)。**新节奏**:**Phase 7.6/7.7/7.8 真硬件对接** → **Phase 8 情绪治理(核心护城河)** → **Phase 9 治理优化回填 + 多节点 Redis Streams** → **Phase 10+ 原 Sub-Agent 主题**。**重点强调**:记忆(Memory)是 SmartButler 的核心,情绪治理引擎依附于此 | `docs/PHASE_8_EMOTION_GOVERNANCE.md`(本轮新建) |
+| 2026-10-15 | v0.5.2 | **🆕 7.6 声纹识别协议占位**(TOTHINK 1.1/1.2 场景):`SpeakerInfo` frozen BaseModel(`user_id`/`confidence`/`is_known`/`embedding`/`voice_segment_id`/`language`)+ `BaseEvent.speakers: list[SpeakerInfo]` 默认空 list(向后兼容,frozen 透传)+ `VoiceEvent.make(speakers=...)` + `to_user_input` 拼 "[会话参与者:dad(95%)+mom(72%)]"(LLM 看到在跟谁对话)+ `SpeakerRegistry` Protocol 抽象 + `SpeakerProfile`/`SpeakerMatch` dataclass + `SimpleSpeakerRegistry` 内存版(7.5 stub,7.6 接 resemblyzer 余弦相似度)+ `ButlerOrchestrator.ainvoke/astream(speakers=...)` 接本轮声纹结果,落 `HumanMessage.additional_kwargs["speakers"]` 供 SqliteSaver 落盘透传(Sub-Agent/记忆/Phase 8 消费)+ 6 个 SpeakerInfo 字段 + 9 个 VoiceEvent 行为 + 5 个 SimpleSpeakerRegistry 操作 + 4 个 TOTHINK 1.1/1.2 场景 fixture = **29 个新单测**。**关键设计原则**:每轮 ainvoke 一个 user 在说话,单值 `user_id` 足够(不引入 `user_ids` 多值);多 user 场景通过**多轮 ainvoke 切换 user_id** + 声纹结果透传到 message metadata 表达。**工作量**:~470 行代码 + ~400 行测试。**前置**:7.5 ✅ | `smartbutler/events/core/event.py` + `events/protocol/voice_event.py` + `events/routing/speaker_registry*.py` + `thinking/loop/orchestrator.py`(speakers kw-only)+ `tests/unit/events/test_speaker_registry.py` + `tests/unit/thinking/test_orchestrator_speakers.py` |
 | 2026-10-14 | v0.5.0 | **🆕 Phase 7.5 实施 — AnswerRouter + PresenceService 完整落地**:D1 `RouteResult` frozen dataclass(5 字段 + `success` property + `__str__`)+ D2 `DeviceRegistry`(register/get/all/first + `_device_id` 约定)+ D1+D2+D4 `ConsoleAnswerRouter`(SILENT 不推 / NORMAL 走 PresenceService / URGENT 推全屋,内部 `asyncio.gather` 并联)+ D3 `SimplePresenceService`(in-memory dict + 便利方法 set_sync/clear)+ `AnswerRouter.route()` 返 `RouteResult` 替代 `bool` + `ButlerServer._answer_router` 字段 + `set_answer_router()` + `set_presence_service()` + `_on_bus_event` 6 步流程(归一化→限速→处理→老逻辑→答案空校验→AnswerRouter 选路,Reactive 链路保持老逻辑不动)+ `dev_chat.py` `/presence set/get/clear/list` REPL 命令 + `--no-answer-router` 开关 + `InMemoryOutputAdapter` 加 `device_id` 可选参数(backward-compat)+ `tests/unit/server/test_answer_router_e2e.py` 30 case(6 e2e + RouteResult 5 + DeviceRegistry 7 + SimplePresenceService 5 + ConsoleAnswerRouter 直测 6 + 1 全场景);**851/851 测试全过(原 821 → 851,+30 新测试)**;**总工作量 ~1020 行(超 415 估 1.5x,因测试 580 行 vs 180 估)**,1 周节奏不变;`events/routing/__init__.py` 导出 6 个新类型 | `docs/PHASE_7_TECHNICAL_DESIGN.md §4` |
 | 2026-10-14 | v0.4.3 | **🆕 7.5 详细设计敲定 D1-D4**:AnswerRouter 返 `RouteResult` 而非 `bool`(D1);新增 `DeviceRegistry` 抽象集中管 OutputAdapter 池(D2);`SimplePresenceService` 7.5 阶段只接 dev_chat + 测试(D3);`route()` 内部 `await` 所有 push(D4);§4 重写(从 30 行 → 200 行);README §2.7 下一站从 7.4 → 7.5;**7.5 实施总工作量 415 行 + 180 测试,1-1.5 周** | `docs/PHASE_7_TECHNICAL_DESIGN.md §4` |
 | 2026-10-14 | v0.4.2 | **🆕 Phase 7.4 实施 — 5 钩子 + Normalizer+Trigger + ServerConfig**:5 钩子落地(H1/H2/H3/H4/H5,7.9 多模态记忆预留);`DedupNormalizer`(event_id+window 去重,LRU 10000);`DefaultEventTrigger`(限速 20/min,route → Proactive,内部 try/except);`ServerConfig` 加 normalizer/trigger 字段 + start() 自动构造;`_on_bus_event` 走 Normalizer → Trigger → ButlerReply;5 case 端到端测试(test_event_bus_e2e.py);**821/821 测试全过(原 773 → 821,+48 新测试)** | `docs/PHASE_7_TECHNICAL_DESIGN.md §3 + §12.6` |

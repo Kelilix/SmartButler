@@ -440,12 +440,15 @@ class ButlerOrchestrator:
         parent_agent: str = "user",
         enable_advice: bool | None = None,
         spoken_at: datetime | None = None,
+        speakers: list[Any] | None = None,
     ) -> str:
         """同步阻塞调用,返回最终回复的 content 字符串。
 
         Args:
             user_input: 用户消息文本。
             user_id: 用户 ID(透传到 state)。
+                7.6 声纹扩展:每轮 ainvoke 一个 user 在说话(单值 user_id),
+                多 user 场景(TOTHINK 1.1)通过多轮 ainvoke 切换 user_id。
             session_id: 会话 ID(checkpointer 用)。
             parent_agent: 父调用方标识(默认 ``"user"``)。
             enable_advice: 🆕 本次调用是否允许追加 Proactive 建议。
@@ -455,6 +458,10 @@ class ButlerOrchestrator:
                 None → 用当下 UTC(默认行为)。传进来的目的是让"管家事后回灌
                 历史消息"也能正确标时间。**写入 ``HumanMessage.additional_kwargs['spoken_at']``**,
                 TaskSegmenter / 抽取器据此拼"who/when"。
+            speakers: 🆕 7.6 声纹扩展(2026-10-15),本轮的声纹识别结果
+                (VoiceEvent.speakers 的 list[SpeakerInfo])。落 ``additional_kwargs["speakers"]``,
+                SqliteSaver 持久化,Sub-Agent / 记忆系统 / Phase 8 情绪治理消费。
+                7.5 阶段:不传 = None(协议占位,7.6 真正声纹模型启动时由 VoiceAdapter 注入)。
 
         Returns:
             最终回复文本(可能包含 Proactive 追加的建议)。
@@ -492,10 +499,20 @@ class ButlerOrchestrator:
         # 🆕 Phase 6.4 P1: per-message metadata — 写进 additional_kwargs
         # SqliteSaver 落盘时透传,TaskSegmenter / 抽取器据此拼"who/when"
         effective_spoken_at = spoken_at or datetime.now(UTC)
+        # 🆕 7.6 声纹扩展:speakers 转 dict 存 HumanMessage.additional_kwargs
+        # Pydantic BaseModel 需 .model_dump() 转可序列化 dict
+        speakers_dicts: list[dict[str, Any]] | None = None
+        if speakers:
+            speakers_dicts = [
+                sp.model_dump() if hasattr(sp, "model_dump") else dict(sp)
+                for sp in speakers
+            ]
         human_kwargs: dict[str, Any] = {
             "user_id": user_id,
             "spoken_at": effective_spoken_at.isoformat(),
         }
+        if speakers_dicts is not None:
+            human_kwargs["speakers"] = speakers_dicts
         initial_state: ButlerState = {
             "messages": [HumanMessage(content=user_input.strip(), additional_kwargs=human_kwargs)],
             "user_id": user_id,
@@ -532,6 +549,7 @@ class ButlerOrchestrator:
         session_id: str = "default",
         parent_agent: str = "user",
         spoken_at: datetime | None = None,
+        speakers: list[Any] | None = None,
     ) -> AsyncIterator[BaseMessage]:
         """流式:每个 token chunk 走 ``BaseMessage``。"""
         if not user_input or not user_input.strip():
@@ -560,10 +578,19 @@ class ButlerOrchestrator:
         compiled = await self._ensure_graph_async()
         # 🆕 Phase 6.4 P1: per-message metadata(同 ainvoke)
         effective_spoken_at = spoken_at or datetime.now(UTC)
+        # 🆕 7.6 声纹扩展(同 ainvoke):speakers 落 HumanMessage.additional_kwargs
+        speakers_dicts: list[dict[str, Any]] | None = None
+        if speakers:
+            speakers_dicts = [
+                sp.model_dump() if hasattr(sp, "model_dump") else dict(sp)
+                for sp in speakers
+            ]
         human_kwargs_a: dict[str, Any] = {
             "user_id": user_id,
             "spoken_at": effective_spoken_at.isoformat(),
         }
+        if speakers_dicts is not None:
+            human_kwargs_a["speakers"] = speakers_dicts
         initial_state: ButlerState = {
             "messages": [HumanMessage(content=user_input.strip(), additional_kwargs=human_kwargs_a)],
             "user_id": user_id,
@@ -597,6 +624,7 @@ class ButlerOrchestrator:
         Args:
             event: 归一化后的事件(来自 EventNormalizer)。
             user_id: 覆盖默认 user_id(默认从 event.user_id 拿)。
+                🆕 7.6:event.speakers 非空时,可显式传 speakers 里 confidence 最高的 user_id。
 
         Returns:
             ProactiveResult(不可变,带 acted / message / urgency / silence_reason)。

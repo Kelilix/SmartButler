@@ -1,57 +1,102 @@
-"""ConsoleAnswerRouter — AnswerRouter 最小实现(Phase 7.5)。
+"""StrategyChainAnswerRouter — 策略链式 AnswerRouter(Phase 7.5 重构)。
 
-职责:拿到 ``BaseEvent + answer + priority``,选目标 OutputAdapter 列表,然后 ``await`` push 完成。
+## 核心思想
 
-改造点(D1/D2/D4):
-- route() 返 RouteResult 而非 bool
-- 注入 DeviceRegistry
-- 注入 PresenceService
-- route() 内部 await 所有 push 完成再返
+**路由策略可插拔**,每级策略独立负责"选下一个候选 device",失败 fallback 到下一级。
 
-路由策略矩阵(§4.1):
+## 当前(7.5)默认策略链
 
-| priority | 正常情况 | 紧急情况 (URGENT) |
-|----------|----------|------------------|
-| NORMAL   | 推 PresenceService 选定的设备 | 推 PresenceService 选定的设备 |
-| URGENT   | —                    | 推全屋设备,加大音量 |
-| SILENT   | 不推(打 DEBUG 日志)  | — |
+```
+1. EchoInputStrategy        — event.device_id(声学同址,麦克风=音响)
+2. PresenceStrategy         — PresenceService 查活跃设备
+3. FirstRegisteredStrategy  — 第一个注册的 adapter
+4. 策略链全失败 → RouteResult(acted=False, silence_reason="all_strategies_failed")
+```
 
-决策记录:2026-10-14 D1/D2/D4。
+## 演进路径(7.6 / 7.8)
+
+- **7.6(VoiceAdapter + 声纹)**:策略链不变,event.device_id 现在能稳定填(speaker.living_room)
+- **7.8(CameraAdapter)**:策略链升级为 [VisualNearestStrategy, EchoInputStrategy, ...],visual 优先
+- 策略的添加/删除/顺序调整,**不影响 AnswerRouter 调用方** — 这是策略模式的核心收益
+
+## SILENT / URGENT 优先级处理
+
+SILENT/URGENT 走 fast-path,**不经过策略链**:
+- SILENT:不推,只打 DEBUG 日志
+- URGENT:asyncio.gather 推所有 adapter(烟雾报警类)
+
+## 决策记录
+
+2026-10-15:ConsoleAnswerRouter 重构为 StrategyChainAnswerRouter。
+原因:原实现硬编码 echo/presence/first 顺序,7.8 加 visual 策略要改核心逻辑。
+改为策略模式后,新策略只追加,不破坏现有行为。
 """
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 
 import structlog
 
 from smartbutler.events.core.event import BaseEvent, EventPriority
-from smartbutler.events.routing.answer_router import AnswerRouter
+from smartbutler.events.routing.answer_router import (
+    AnswerRouter,
+    EchoInputStrategy,
+    FirstRegisteredStrategy,
+    PresenceStrategy,
+    RoutingContext,
+    RoutingReject,
+    RoutingStrategy,
+)
 from smartbutler.events.routing.device_registry import DeviceRegistry
-from smartbutler.events.routing.presence import PresenceService
 from smartbutler.events.routing.route_result import RouteResult
 from smartbutler.server.adapters import ButlerReply, OutputAdapter
 
 _logger = structlog.get_logger(__name__)
 
 
-class ConsoleAnswerRouter(AnswerRouter):
-    """AnswerRouter 最小实现:in-memory dict PresenceService + DeviceRegistry。
+@dataclass
+class _StrategyResult:
+    """单个策略执行的中间结果。"""
+
+    strategy_name: str
+    adapter: OutputAdapter | None
+    skipped_reason: str | None = None  # None=选了 / 字符串=为啥没选
+
+
+class StrategyChainAnswerRouter(AnswerRouter):
+    """策略链式 AnswerRouter。
 
     用法::
 
+        from smartbutler.events.routing import (
+            DeviceRegistry, SimplePresenceService,
+            EchoInputStrategy, PresenceStrategy, FirstRegisteredStrategy,
+        )
+        from smartbutler.events.routing.answer_router_strategy import StrategyChainAnswerRouter
+
         presence = SimplePresenceService()
-        registry = DeviceRegistry([speaker1, phone])
-        router = ConsoleAnswerRouter(registry=registry, presence_service=presence)
+        registry = DeviceRegistry([speaker, phone])
+        chain = [
+            EchoInputStrategy(),
+            PresenceStrategy(presence),
+            FirstRegisteredStrategy(),
+        ]
+        router = StrategyChainAnswerRouter(registry=registry, strategies=chain)
         result = await router.route(event, "欢迎回家", priority=EventPriority.URGENT)
+
+    7.8 扩展:在 chain 最前面插 VisualNearestStrategy 即可。
     """
 
     def __init__(
         self,
         registry: DeviceRegistry,
-        presence_service: PresenceService,
+        strategies: list[RoutingStrategy],
     ) -> None:
+        if not strategies:
+            raise ValueError("策略链不能为空,至少需要一个 fallback 策略(FirstRegisteredStrategy)")
         self._registry = registry
-        self._presence = presence_service
+        self._strategies = strategies
 
     async def route(
         self,
@@ -60,13 +105,9 @@ class ConsoleAnswerRouter(AnswerRouter):
         *,
         priority: EventPriority | None = None,
     ) -> RouteResult:
-        """路由 answer 到目标设备。
-
-        内部 await 所有 push 完成再返(D4)。
-        """
         effective_priority = priority or event.priority
 
-        # SILENT:不推
+        # SILENT fast-path:不推
         if effective_priority == EventPriority.SILENT:
             _logger.debug(
                 "answer_router.silent",
@@ -75,79 +116,114 @@ class ConsoleAnswerRouter(AnswerRouter):
             )
             return RouteResult(acted=False, silence_reason="SILENT")
 
-        # URGENT:推所有
+        # URGENT fast-path:推所有
         if effective_priority == EventPriority.URGENT:
             return await self._push_all(answer, event)
 
-        # NORMAL:按 PresenceService 选
-        return await self._push_normal(answer, event)
+        # NORMAL:走策略链
+        return await self._route_via_chain(event, answer, effective_priority)
 
-    async def _push_normal(self, answer: str, event: BaseEvent) -> RouteResult:
-        """NORMAL:按 PresenceService 选设备推送。"""
-        presence = await self._presence.get_active_device(event.user_id)
+    async def _route_via_chain(
+        self,
+        event: BaseEvent,
+        answer: str,
+        priority: EventPriority,
+    ) -> RouteResult:
+        """NORMAL 优先级:按策略链顺序选目标 adapter。"""
+        ctx = RoutingContext(
+            event=event,
+            answer=answer,
+            priority=priority,
+            # 7.8 启动时由 CameraAdapter 注入
+            nearest_visual_device_id=None,
+        )
 
-        # PresenceService 返 None → fallback
-        if presence is None:
-            first = self._registry.first()
-            if first is None:
-                _logger.warning(
-                    "answer_router.no_adapter_for_normal",
-                    user_id=event.user_id,
+        # 记录每个策略的执行结果(日志可观测)
+        strategy_log: list[_StrategyResult] = []
+
+        for idx, strategy in enumerate(self._strategies):
+            try:
+                adapter = await strategy.select(ctx, self._registry)
+            except RoutingReject as reject:
+                # 策略主动拒绝(例:DND / 睡觉 / 设备找不到)— 不再 fallback,silence 退出
+                # 7.5 老测试要求:走了 PresenceStrategy 但失败 → fallback_used=True
+                is_fallback = idx > 0
+                _logger.info(
+                    "answer_router.rejected_by_strategy",
+                    event_id=event.event_id,
+                    strategy=strategy.name,
+                    reason=str(reject),
+                    fallback_used=is_fallback,
                 )
                 return RouteResult(
                     acted=False,
-                    silence_reason="no_output_adapter",
+                    fallback_used=is_fallback,
+                    silence_reason=f"rejected_by:{strategy.name}:{reject}",
                 )
-            _logger.info(
-                "answer_router.presence_fallback",
-                user_id=event.user_id,
-                device_id=self._registry._device_id(first),
-            )
-            result = await self._push_one(first, answer)
-            return RouteResult(
+            except Exception as exc:  # noqa: BLE001
+                # 策略自身异常 → 记日志 + 继续下一级
+                _logger.warning(
+                    "answer_router.strategy_error",
+                    strategy=strategy.name,
+                    error=str(exc),
+                )
+                strategy_log.append(
+                    _StrategyResult(strategy.name, None, skipped_reason=f"error:{exc}")
+                )
+                continue
+
+            if adapter is None:
+                # 策略不适用或失败 → 下一级
+                strategy_log.append(
+                    _StrategyResult(strategy.name, None, skipped_reason="not_applicable")
+                )
+                continue
+
+            # 策略选中了 adapter → 推
+            result = await self._push_one(adapter, answer, event)
+            # 当命中非首位策略(走 fallback 路径)时,标记 fallback_used=True
+            # 保留 7.5 老实现的语义(老测试 test_normal_fallback_* 依赖此)
+            is_fallback = idx > 0
+            result = RouteResult(
                 acted=result.acted,
                 pushed_device_ids=result.pushed_device_ids,
-                fallback_used=True,
+                fallback_used=is_fallback or result.fallback_used,
                 silence_reason=result.silence_reason,
                 error_device_ids=result.error_device_ids,
             )
+            _logger.info(
+                "answer_router.routed",
+                event_id=event.event_id,
+                strategy=strategy.name,
+                target_device=result.pushed_device_ids[0] if result.pushed_device_ids else None,
+                acted=result.acted,
+                fallback_used=result.fallback_used,
+            )
+            return result
 
-        # 检查 DND / sleeping
-        if not presence.should_notify("normal"):
-            _logger.debug(
-                "answer_router.dnd_or_sleeping",
-                user_id=event.user_id,
-                device_id=presence.device_id,
-            )
-            return RouteResult(
-                acted=False,
-                silence_reason=f"dnd={presence.is_dnd} sleeping={presence.is_sleeping}",
-            )
-
-        # 找对应 adapter
-        adapter = self._registry.get(presence.device_id)
-        if adapter is None:
-            _logger.warning(
-                "answer_router.device_not_found",
-                user_id=event.user_id,
-                device_id=presence.device_id,
-            )
-            return RouteResult(
-                acted=False,
-                fallback_used=True,
-                silence_reason=f"device_not_found:{presence.device_id}",
-            )
-
-        return await self._push_one(adapter, answer)
+        # 策略链全失败 → 静默
+        _logger.warning(
+            "answer_router.all_strategies_failed",
+            event_id=event.event_id,
+            chain=[s.name for s in self._strategies],
+            strategy_results=[
+                {"strategy": r.strategy_name, "skipped": r.skipped_reason}
+                for r in strategy_log
+            ],
+        )
+        return RouteResult(
+            acted=False,
+            silence_reason="all_strategies_failed",
+        )
 
     async def _push_one(
-        self, adapter: OutputAdapter, answer: str
+        self, adapter: OutputAdapter, answer: str, event: BaseEvent
     ) -> RouteResult:
         """推一个 adapter。"""
         try:
             reply = ButlerReply(
                 content=answer,
-                user_id="default",
+                user_id=event.user_id,
                 source="proactive",
             )
             await adapter.push(reply)
@@ -225,4 +301,55 @@ class ConsoleAnswerRouter(AnswerRouter):
         )
 
 
-__all__ = ["ConsoleAnswerRouter"]
+# === 7.5 默认工厂 ===
+
+def build_default_chain_answer_router(
+    registry: DeviceRegistry,
+    presence_service,
+) -> "StrategyChainAnswerRouter":
+    """7.5 默认策略链:
+
+    1. EchoInputStrategy(event.device_id 同址)
+    2. PresenceStrategy(active_device)
+    3. FirstRegisteredStrategy(fallback)
+    """
+    return StrategyChainAnswerRouter(
+        registry=registry,
+        strategies=[
+            EchoInputStrategy(),
+            PresenceStrategy(presence_service),
+            FirstRegisteredStrategy(),
+        ],
+    )
+
+
+__all__ = [
+    "StrategyChainAnswerRouter",
+    "build_default_chain_answer_router",
+]
+
+
+# === 兼容老构造签名 ===
+# 老调用方写 ``ConsoleAnswerRouter(registry=..., presence_service=...)``。
+# 新版参数是 ``strategies=...``,为了 30+ 个老测试零修改升级,
+# 用一个薄子类保留老签名,内部走默认 7.5 策略链工厂。
+class ConsoleAnswerRouter(StrategyChainAnswerRouter):
+    """ConsoleAnswerRouter — 7.5 默认策略链(向后兼容老构造签名)。
+
+    内部用 ``[EchoInputStrategy, PresenceStrategy, FirstRegisteredStrategy]`` 策略链。
+    7.6 启动后:event.device_id 由 VoiceAdapter 稳定填充,EchoInputStrategy 自然命中。
+    7.8 扩展:在策略链前插入 VisualNearestStrategy,行为平滑升级。
+    """
+
+    def __init__(
+        self,
+        registry: DeviceRegistry,
+        presence_service,
+    ) -> None:
+        super().__init__(
+            registry=registry,
+            strategies=build_default_chain_answer_router(registry, presence_service)._strategies,
+        )
+
+
+__all__.append("ConsoleAnswerRouter")
