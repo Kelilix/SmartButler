@@ -76,7 +76,10 @@ class _FakeProactiveLoop:
 
 
 def _make_orchestrator_with_loop(loop: _FakeProactiveLoop) -> ButlerOrchestrator:
-    """构造 ButlerOrchestrator,proactive_tick 走可控的 _FakeProactiveLoop。"""
+    """构造 ButlerOrchestrator,proactive_tick 走可控的 _FakeProactiveLoop。
+
+    Phase 8 新增:同步 mock ainvoke(),用于 case 5 (voice.command → Reactive)。
+    """
     orch = ButlerOrchestrator(
         llm=_FakeBaseLLM(),  # type: ignore[arg-type]
         llm_settings=_FakeSettings(),
@@ -85,6 +88,19 @@ def _make_orchestrator_with_loop(loop: _FakeProactiveLoop) -> ButlerOrchestrator
     async def fake_proactive_tick(event: BaseEvent, **kwargs: Any) -> ProactiveResult:  # noqa: ARG002
         return await loop.tick(event)
     orch.proactive_tick = fake_proactive_tick  # type: ignore[method-assign]
+    # 🆕 Phase 8:拦截 ainvoke(voice.command → Reactive 路径会调它)
+    async def fake_ainvoke(
+        user_input: str,  # noqa: ARG001
+        *,
+        user_id: str = "user",  # noqa: ARG001
+        session_id: str = "default",  # noqa: ARG001
+        parent_agent: str = "user",  # noqa: ARG001
+        enable_advice: bool | None = None,  # noqa: ARG001
+        spoken_at: datetime | None = None,  # noqa: ARG001
+        speakers: list[Any] | None = None,  # noqa: ARG001
+    ) -> str:
+        return "管家回复:好的,已收到你的指令"
+    orch.ainvoke = fake_ainvoke  # type: ignore[method-assign]
     return orch
 
 
@@ -277,18 +293,21 @@ async def test_case4_proactive_tick_exception_does_not_crash_eventbus() -> None:
 
 
 @pytest.mark.asyncio
-async def test_case5_voice_event_routes_to_proactive(
+async def test_case5_voice_event_routes_to_reactive(
     server_with_loop: tuple[ButlerServer, _FakeProactiveLoop, InMemoryOutputAdapter, InMemoryEventBus],
 ) -> None:
-    """case 5:VoiceEvent(source=VOICE) → Trigger 路由到 Proactive(不是 Reactive)。
+    """case 5:VoiceEvent(source=VOICE) → Trigger 路由到 Reactive(不是 Proactive)。
 
-    ADR-009 §5.9.3:EventBus 推送的所有事件 → Proactive。
-    Reactive 入口是 submit_reactive,不经 EventBus。
+    Phase 8 路由规则(参考 ADR-009 §5.9.3 修订):
+    - VOICE 源 → Reactive(用户语音,管家必须回应)
+    - DEVICE/TIMER/WEBHOOK 源 → Proactive(管家主动观察)
+    也就是说,EventBus 上推 voice.command 时,Trigger 内部直接调 ainvoke,
+    不再走 ProactiveLoop 默认 silent 静默。
     """
     server, loop, output, bus = server_with_loop
     await server.start()
     try:
-        # VoiceEvent 走 EventBus(通过 publish) → 应被 dedup+trigger → 1 次答复
+        # VoiceEvent 走 EventBus(通过 publish) → 应被 trigger → 调 ainvoke → 1 次答复
         voice_event = BaseEvent(
             event_id="evt_voice_001",
             source=EventSource.VOICE,
@@ -301,14 +320,17 @@ async def test_case5_voice_event_routes_to_proactive(
         await bus.publish(voice_event)
         import asyncio
         await asyncio.sleep(0.05)
-        # output 收到 1 次(走 Proactive,不是 Reactive)
+        # output 收到 1 次(走 Reactive,不是 Proactive)
         assert len(output.replies) == 1
-        # ProactiveLoop 被调
-        assert len(loop.tick_calls) == 1
-        # Trigger 统计:1 proactive,0 reactive
+        # ProactiveLoop 不应被调(VOICE 走 Reactive)
+        assert len(loop.tick_calls) == 0
+        # reply source 标 "reactive"(因为 voice.command → ainvoke)
+        assert output.replies[0].source == "reactive"
+        assert output.replies[0].content == "管家回复:好的,已收到你的指令"
+        # Trigger 统计:1 reactive,0 proactive
         snap = server._trigger.snapshot()  # type: ignore[attr-defined]
-        assert snap["stats"]["proactive_called"] == 1
-        assert snap["stats"]["reactive_called"] == 0
+        assert snap["stats"]["reactive_called"] == 1
+        assert snap["stats"]["proactive_called"] == 0
     finally:
         await server.stop()
 

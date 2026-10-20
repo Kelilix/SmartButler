@@ -52,6 +52,7 @@ from smartbutler.events.routing.speaker_registry import (
 )
 from smartbutler.events.routing.speaker_registry_simple import SimpleSpeakerRegistry
 from smartbutler.events.routing.speaker_registry_embedding import EmbeddingSpeakerRegistry
+from smartbutler.events.routing.speaker_registry_sqlite import SQLiteSpeakerRegistry
 
 
 __all__ = [
@@ -76,6 +77,7 @@ __all__ = [
     "SpeakerRegistry",
     "SimpleSpeakerRegistry",
     "EmbeddingSpeakerRegistry",
+    "SQLiteSpeakerRegistry",
     "SpeakerProfile",
     "SpeakerMatch",
 ]

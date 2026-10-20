@@ -20,13 +20,20 @@ def _make_event(source: EventSource, topic: str = "test.topic") -> BaseEvent:
 
 
 class TestRoute:
+    """Phase 8 路由规则:VOICE → Reactive,其他源 → Proactive。"""
+
     @pytest.mark.parametrize(
         "source",
-        [EventSource.DEVICE, EventSource.VOICE, EventSource.TIMER, EventSource.WEBHOOK],
+        [EventSource.DEVICE, EventSource.TIMER, EventSource.WEBHOOK],
     )
     def test_proactive_sources(self, source: EventSource) -> None:
         e = _make_event(source)
         assert route(e) == LoopType.PROACTIVE
+
+    def test_voice_source_routes_to_reactive(self) -> None:
+        """Phase 8:voice.command 走 Reactive(用户语音 → 管家必须回应)。"""
+        e = _make_event(EventSource.VOICE, topic="voice.command")
+        assert route(e) == LoopType.REACTIVE
 
     def test_unknown_source_defaults_to_proactive(self) -> None:
         # 防御:未识别的 source 一律走 Proactive(宁可沉默不可骚扰)

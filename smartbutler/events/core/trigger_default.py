@@ -117,6 +117,10 @@ class DefaultEventTrigger(EventTrigger):
             - ``None`` — silent(沉默优先,不下发)
 
         不变量:本方法**不抛异常**(沿用 trigger.py 不变量)。
+
+        Phase 8 路由规则:
+            - VOICE 源 → Reactive(用户语音,管家必须回应)
+            - DEVICE/TIMER/WEBHOOK 源 → Proactive(管家主动观察)
         """
         try:
             loop_type = route_loop(event)
@@ -148,13 +152,22 @@ class DefaultEventTrigger(EventTrigger):
                     return None
                 return message
             else:
-                # 兜底:reactive 路由(理论上 EventBus 不会进这里)
+                # 🆕 Phase 8:Reactive 路由(VOICE 源)
+                # 用户语音 → 直接调 ainvoke(管家必须回应,不静默)
                 self.stats["reactive_called"] += 1
-                logger.warning(
-                    "event_trigger.reactive_route_unexpected topic=%s",
-                    event.topic,
+                # 提取 ASR 文本作为 user_input(VoiceEvent 已重写 to_user_input)
+                user_input = event.to_user_input()
+                # 🆕 7.6 声纹:透传 speakers(VoiceAdapter 已填充)
+                reply = await self._orchestrator.ainvoke(
+                    user_input,
+                    user_id=event.user_id,
+                    parent_agent=event.parent_agent_tag,
+                    speakers=list(event.speakers) if event.speakers else None,
                 )
-                return None
+                if not reply or not reply.strip():
+                    self.stats["silent"] += 1
+                    return None
+                return reply
         except Exception as exc:  # noqa: BLE001
             self.stats["errors"] += 1
             logger.error(

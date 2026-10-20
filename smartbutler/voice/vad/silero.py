@@ -44,11 +44,18 @@ class SileroVAD(BaseVAD):
         self._model: Any = None
         self._get_speech_timestamps: Any = None
         self._loaded = False
+        self._load_error: Exception | None = None
 
     def _ensure_model(self) -> None:
-        """懒加载 Silero VAD 模型(首次调用时加载)。"""
+        """懒加载 Silero VAD 模型(首次调用时加载)。
+
+        🐛 必须在后台线程调用!同步 torch.hub.load() 会卡住 asyncio 事件循环。
+        应该用 await self.ensure_ready() 预加载。
+        """
         if self._loaded:
             return
+        if self._load_error is not None:
+            raise self._load_error
         try:
             import torch
 
@@ -62,12 +69,31 @@ class SileroVAD(BaseVAD):
             self._get_speech_timestamps = utils[0]
             self._loaded = True
         except ImportError as e:
-            raise VADError("torch not installed: pip install torch") from e
+            err = VADError("torch not installed: pip install torch")
+            err.__cause__ = e
+            self._load_error = err
+            raise self._load_error
         except Exception as e:
-            raise VADError(f"Failed to load Silero VAD model: {e}") from e
+            err = VADError(f"Failed to load Silero VAD model: {e}")
+            err.__cause__ = e
+            self._load_error = err
+            raise self._load_error
+
+    async def ensure_ready(self) -> None:
+        """异步预加载模型(在后台线程跑,避免阻塞事件循环)。"""
+        if self._loaded or self._load_error is not None:
+            if self._load_error is not None:
+                raise self._load_error
+            return
+        import asyncio
+        await asyncio.to_thread(self._ensure_model)
 
     def is_speech(self, audio: np.ndarray) -> bool:
-        """Silero VAD 判断是否有人说话。"""
+        """Silero VAD 判断是否有人说话。
+
+        🐛 Silero 模型只接受 512 样本(16kHz) = 32ms 的窗口。
+        我们 capture 的是 100ms = 1600 样本,所以需要**切窗**多次调 VAD,取**任一窗口判定为语音**即视为语音。
+        """
         self._ensure_model()
 
         # 确保 float32 16kHz
@@ -76,15 +102,32 @@ class SileroVAD(BaseVAD):
 
         import torch
 
-        with torch.no_grad():
-            # Silero 期望 torch.Tensor (1, samples)
-            tensor = torch.from_numpy(audio).float()
-            if tensor.dim() == 1:
-                tensor = tensor.unsqueeze(0)
+        # Silero 16kHz: 每次处理 512 样本(32ms)
+        window_size = 512
+        n = len(audio)
+        if n < window_size:
+            # 不足一个窗口:补零到 512
+            padded = np.zeros(window_size, dtype=np.float32)
+            padded[:n] = audio
+            audio = padded
+            n = window_size
 
-            # get_speech_probs 返回每帧概率
-            prob = self._model(tensor, 16000).item()
-            return prob > self._threshold
+        with torch.no_grad():
+            max_prob = 0.0
+            # 切窗:每 512 样本调一次 VAD,取最大概率
+            for start in range(0, n, window_size):
+                end = min(start + window_size, n)
+                if end - start < window_size:
+                    # 末尾不足一个窗口:补零
+                    chunk = np.zeros(window_size, dtype=np.float32)
+                    chunk[: end - start] = audio[start:end]
+                else:
+                    chunk = audio[start:end]
+                tensor = torch.from_numpy(chunk).float().unsqueeze(0)
+                prob = self._model(tensor, 16000).item()
+                if prob > max_prob:
+                    max_prob = prob
+            return max_prob > self._threshold
 
     def reset(self) -> None:
         """Silero 无状态,reset 为空操作。"""

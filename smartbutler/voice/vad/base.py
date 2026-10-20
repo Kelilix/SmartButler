@@ -42,6 +42,13 @@ class BaseVAD(ABC):
         """重置 VAD 状态(用于一段话结束后)。"""
         ...
 
+    async def ensure_ready(self) -> None:
+        """异步预加载模型/资源(在后台线程跑,避免阻塞事件循环)。
+
+        默认实现为空操作,子类(如 SileroVAD)需要下载/加载模型时应重写。
+        """
+        return None
+
 
 class VADError(Exception):
     """VAD 异常。"""

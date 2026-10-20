@@ -517,11 +517,14 @@ class ButlerServer:
             return
 
         # 6) 老逻辑:无 AnswerRouter → 走 _dispatch_reply broadcast 全部
+        # 🆕 Phase 8:source 按事件源动态选(VOICE → "reactive",其他 → "proactive"),
+        #    下游 AnswerRouter / 客户端可据此区分。
+        reply_source = "reactive" if event.source == EventSource.VOICE else "proactive"
         reply = ButlerReply(
             content=answer,
             user_id=event.user_id,
-            session_id=f"proactive-{event.event_id}",
-            source="proactive",
+            session_id=f"{reply_source}-{event.event_id}",
+            source=reply_source,
             related_event_id=event.event_id,
         )
         await self._dispatch_reply(reply)

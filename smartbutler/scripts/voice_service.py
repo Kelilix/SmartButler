@@ -54,7 +54,12 @@ import logging
 import signal
 import sys
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+from smartbutler.config.voice import load_voice_settings
+
+if TYPE_CHECKING:
+    pass
 
 # 配置日志
 logging.basicConfig(
@@ -66,7 +71,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class VoiceServiceConfig:
-    """语音服务配置。"""
+    """语音服务配置。
+
+    所有阈值字段的默认值都从 ``.env`` / 环境变量读取(前缀 ``SMARTBUTLER_VOICE_``),
+    命令行参数会覆盖 env 值(优先级: CLI > env > dataclass 默认)。
+
+    例如 ``.env`` 里写::
+
+        SMARTBUTLER_VOICE_VAD_THRESHOLD=0.005
+        SMARTBUTLER_VOICE_SILENCE_TIMEOUT_MS=2000
+        SMARTBUTLER_VOICE_MAX_SEGMENT_DURATION_MS=15000
+
+    启动时直接生效, 不需要改代码。
+    """
 
     # 设备信息
     device_id: str = "speaker_01"
@@ -86,10 +103,28 @@ class VoiceServiceConfig:
     wake_word: str = "hey_butler"
     wake_energy_threshold: float = 0.0  # 0=任何声音都触发
 
-    # 音频参数
+    # 音频参数(默认值由 env 注入, 见 __post_init__)
     sample_rate: int = 16000
     silence_timeout_ms: int = 3000
     max_segment_duration_ms: int = 30000
+    vad_threshold: float = 0.3
+
+    def __post_init__(self) -> None:
+        """从 .env / 环境变量读取默认值(只在 dataclass 默认值时生效)。
+
+        命令行参数解析后会显式覆盖这些字段, 所以 CLI 优先级最高。
+        """
+        settings = load_voice_settings()
+        # 只在 dataclass 默认值时填入, 避免覆盖 CLI/显式传入的值
+        _DEFAULT_VAD = 0.3
+        _DEFAULT_SILENCE = 3000
+        _DEFAULT_MAX_SEGMENT = 30000
+        if self.vad_threshold == _DEFAULT_VAD:
+            self.vad_threshold = settings.vad_threshold
+        if self.silence_timeout_ms == _DEFAULT_SILENCE:
+            self.silence_timeout_ms = settings.silence_timeout_ms
+        if self.max_segment_duration_ms == _DEFAULT_MAX_SEGMENT:
+            self.max_segment_duration_ms = settings.max_segment_duration_ms
 
 
 async def create_voice_service(config: VoiceServiceConfig):
@@ -152,11 +187,50 @@ async def create_voice_service(config: VoiceServiceConfig):
 
     # 5. 创建 VoiceAdapter
     logger.info("[3/5] 初始化 VoiceAdapter...")
+
+    # 🆕 Phase 7.6: 初始化 SQLite 声纹注册表（持久化）
+    from pathlib import Path
+
+    from smartbutler.events.routing.speaker_registry_sqlite import (
+        SQLiteSpeakerRegistry,
+    )
+
+    speaker_registry: SQLiteSpeakerRegistry | None = None
+    if embedder is not None:
+        try:
+            speaker_registry = SQLiteSpeakerRegistry(
+                embedder=embedder,
+                db_path=Path("data/speakers.db"),
+            )
+            await speaker_registry.start()
+            registered_count = len(await speaker_registry.list_members())
+            logger.info(
+                "  ✓ SQLiteSpeakerRegistry (已加载 %d 个家庭成员声纹)", registered_count
+            )
+        except Exception as e:
+            logger.error("  ✗ SQLiteSpeakerRegistry 初始化失败: %s", e)
+            speaker_registry = None
+
     voice_adapter = VoiceAdapter(
         config=voice_config,
         event_bus=event_bus,
-        speaker_registry=None,  # 7.6 阶段暂不启用声纹
+        speaker_registry=speaker_registry,  # 🆕 Phase 7.6: 接入声纹识别
     )
+
+    # 🆕 Phase 7.6: 把 voice_adapter 和 speaker_registry 注入到 enroll_speaker Tool
+    # 让 LLM 调 Tool 时能触发现实麦克风采集和声纹持久化
+    try:
+        from smartbutler.capabilities.tools.voice import (
+            set_speaker_registry,
+            set_voice_adapter,
+        )
+
+        set_voice_adapter(voice_adapter)
+        if speaker_registry is not None:
+            set_speaker_registry(speaker_registry)
+        logger.info("  ✓ enroll_speaker Tool 已就绪")
+    except Exception as e:
+        logger.warning("  ⚠ enroll_speaker Tool 注入失败: %s", e)
 
     # 6. 创建 TTSOutputAdapter (实现 OutputAdapter 接口)
     logger.info("[4/5] 初始化 TTS 输出适配器...")
@@ -192,12 +266,22 @@ async def create_voice_service(config: VoiceServiceConfig):
         orchestrator = _create_mock_orchestrator()
 
     # 9. 创建 ButlerServer
+    # 🐛 修复:必须把同一个 event_bus 传给 server,否则 voice_adapter 发布的事件
+    #    server 收不到(各自有不同的 InMemoryEventBus 实例)
+    from smartbutler.server.runtime import ServerConfig
+
+    server_config = ServerConfig(
+        event_bus=event_bus,  # 关键:用上面 voice_adapter 用的同一个 bus
+        enable_event_bus=True,
+        auto_subscribe_proactive=True,
+    )
     server = ButlerServer(
         orchestrator=orchestrator,
+        config=server_config,
     )
     server.set_answer_router(answer_router)
 
-    return voice_adapter, server, event_bus
+    return voice_adapter, server, event_bus, speaker_registry
 
 
 def _create_voice_components(config: VoiceServiceConfig):
@@ -252,16 +336,23 @@ def _create_real_components(config: VoiceServiceConfig):
 
     # 音频采集
     try:
-        capture = MicCapture()
-        logger.info("  ✓ MicCapture (sounddevice)")
+        # 透传 --device 参数(让用户能指定 KPods SE 等)
+        mic_device = getattr(config, "mic_device", None)
+        # 默认开启自动增益(对耳机麦克风/小音量麦克风很有用)
+        capture = MicCapture(device_index=mic_device, auto_gain=True, gain_target_rms=0.1)
+        if mic_device is not None:
+            logger.info("  ✓ MicCapture (sounddevice, device=%d, auto_gain=ON)", mic_device)
+        else:
+            logger.info("  ✓ MicCapture (sounddevice, default, auto_gain=ON)")
     except Exception as e:
         logger.error("  ✗ MicCapture 失败: %s", e)
         capture = None
 
-    # VAD
+    # VAD(用 --vad-threshold 调灵敏度;默认 0.3 对增益后的音频更友好)
     try:
-        vad = SileroVAD()
-        logger.info("  ✓ SileroVAD (torch)")
+        vad_threshold = getattr(config, "vad_threshold", 0.3)
+        vad = SileroVAD(threshold=vad_threshold)
+        logger.info("  ✓ SileroVAD (torch, threshold=%.2f)", vad_threshold)
     except Exception as e:
         logger.error("  ✗ SileroVAD 失败: %s", e)
         vad = None
@@ -362,7 +453,7 @@ def _create_mock_orchestrator():
 
 async def run_voice_service(config: VoiceServiceConfig):
     """运行语音服务。"""
-    voice_adapter, server, event_bus = await create_voice_service(config)
+    voice_adapter, server, event_bus, speaker_registry = await create_voice_service(config)
 
     # 启动 Server
     await server.start()
@@ -418,6 +509,14 @@ async def run_voice_service(config: VoiceServiceConfig):
 
         await voice_adapter.stop()
 
+        # 🆕 Phase 7.6: 关闭 SQLite 声纹注册表
+        if speaker_registry is not None:
+            try:
+                await speaker_registry.stop()
+                logger.info("  ✓ SQLiteSpeakerRegistry 已关闭")
+            except Exception as e:
+                logger.warning("  ⚠ SQLiteSpeakerRegistry 关闭失败: %s", e)
+
         # 停止 Server
         await server.stop()
 
@@ -455,8 +554,52 @@ def main():
         default=0.0,
         help="唤醒能量阈值(0-1, 0=任何声音都触发)",
     )
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=None,  # None → 用 .env / dataclass 默认值
+        help=(
+            "VAD 语音概率阈值(0-1, 默认从 .env SMARTBUTLER_VOICE_VAD_THRESHOLD 读取, "
+            "越低越敏感。麦克风音量小时调到 0.005-0.1)"
+        ),
+    )
+    parser.add_argument(
+        "--silence-timeout-ms",
+        type=int,
+        default=None,
+        help=(
+            "静音超时(毫秒)。连续静音超过此时长 → flush buffer 送 ASR。"
+            "默认从 .env SMARTBUTLER_VOICE_SILENCE_TIMEOUT_MS 读取(3000)。"
+        ),
+    )
+    parser.add_argument(
+        "--max-segment-ms",
+        type=int,
+        default=None,
+        help=(
+            "单段最大时长(毫秒)。即使用户不停说话, 超过此时长也强制 flush。"
+            "默认从 .env SMARTBUTLER_VOICE_MAX_SEGMENT_DURATION_MS 读取(30000, 生产建议 15000)。"
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="音频输入设备 ID(默认=系统默认。用 --list-devices 查看可用设备)",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="列出所有音频输入/输出设备后退出",
+    )
 
     args = parser.parse_args()
+
+    # 列出设备后退出
+    if args.list_devices:
+        from smartbutler.scripts.mic_test import list_devices as _list_devices
+        asyncio.run(_list_devices())
+        return
 
     config = VoiceServiceConfig(
         device_id=args.device_id,
@@ -466,6 +609,30 @@ def main():
         embedder_impl=args.embedder,
         wake_word=args.wake_word,
         wake_energy_threshold=args.energy_threshold,
+    )
+
+    # CLI 参数优先级最高: 用 None 判断"用户没传"才覆盖
+    if args.vad_threshold is not None:
+        config.vad_threshold = args.vad_threshold  # type: ignore[attr-defined]
+    if args.silence_timeout_ms is not None:
+        config.silence_timeout_ms = args.silence_timeout_ms  # type: ignore[attr-defined]
+    if args.max_segment_ms is not None:
+        config.max_segment_duration_ms = args.max_segment_ms  # type: ignore[attr-defined]
+
+    config.mic_device = args.device  # type: ignore[attr-defined]
+
+    # 打印生效配置(让用户看到 .env 是否真的起作用了)
+    logger.info(
+        "  VAD threshold:    %s",
+        f"{config.vad_threshold:.4f} (env=SMARTBUTLER_VOICE_VAD_THRESHOLD)",
+    )
+    logger.info(
+        "  Silence timeout:  %sms (env=SMARTBUTLER_VOICE_SILENCE_TIMEOUT_MS)",
+        config.silence_timeout_ms,
+    )
+    logger.info(
+        "  Max segment:      %sms (env=SMARTBUTLER_VOICE_MAX_SEGMENT_DURATION_MS)",
+        config.max_segment_duration_ms,
     )
 
     asyncio.run(run_voice_service(config))

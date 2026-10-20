@@ -118,6 +118,11 @@ class VoiceAdapter:
         # 播放锁
         self._speaking_lock = asyncio.Lock()
 
+        # 🆕 Phase 7.6: 声纹采集模式
+        self._enrollment_mode = False
+        self._enrollment_audio: list[np.ndarray] = []  # 采集的音频片段
+        self._enrollment_complete = asyncio.Event()
+
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
@@ -128,6 +133,22 @@ class VoiceAdapter:
         启动音频采集和唤醒词检测。
         """
         logger.info("VoiceAdapter starting", extra={"device_id": self._cfg.device_id})
+        # 🆕 预加载 VAD 模型(在后台线程,避免阻塞事件循环)
+        if self._vad is not None:
+            try:
+                logger.info("VoiceAdapter 预加载 VAD 模型...")
+                await self._vad.ensure_ready()
+                logger.info("VAD 模型预加载完成")
+            except Exception as e:
+                logger.warning("VAD 模型预加载失败,将在第一次 is_speech() 时重试: %s", e)
+        # 🆕 预加载 ASR 模型(在后台线程,避免阻塞事件循环)
+        if self._asr is not None:
+            try:
+                logger.info("VoiceAdapter 预加载 ASR 模型...")
+                await self._asr.ensure_ready()
+                logger.info("ASR 模型预加载完成")
+            except Exception as e:
+                logger.warning("ASR 模型预加载失败,将在第一次 transcribe() 时重试: %s", e)
         if self._capture:
             await self._capture.start()
         logger.info("VoiceAdapter started")
@@ -190,8 +211,9 @@ class VoiceAdapter:
 
     async def _wait_for_wake_word(self) -> None:
         """等待唤醒词触发。"""
-        logger.debug("Waiting for wake word...")
+        logger.info("👂 进入 _wait_for_wake_word, 调用 self._capture.stream()...")
         if not self._capture:
+            logger.error("_capture 为空,无法等待唤醒词")
             return
 
         async for chunk in self._capture.stream():
@@ -211,44 +233,84 @@ class VoiceAdapter:
                             wake_word=result.keyword,
                         )
                     )
-                    # 唤醒后进入聆听
+                    # 唤醒后退出外层 stream,让主循环下次调 _listen_and_respond
                     self._state = self.State.LISTENING
-                    await self._listen_and_respond()
-                    break
+                    return  # ← 关键:不要 break,避免嵌套 stream() 抢 queue
 
     async def _listen_and_respond(self) -> None:
-        """LISTENING 状态:聆听用户说话,处理命令。"""
-        logger.debug("Listening for command...")
+        """LISTENING 状态:聆听用户说话,处理命令。
+
+        🆕 Phase 7.6:若处于声纹采集模式(_enrollment_mode=True)，
+        则静默收集音频片段，不走 ASR，不发布 VoiceEvent。
+        """
+        # 🆕 声纹采集模式:静默收集音频
+        if self._enrollment_mode:
+            await self._enrollment_listen()
+            return
+
+        logger.info("🎙️  LISTENING: 开始监听用户说话... (说点什么,3 秒静音后自动结束)")
         self._buffer.clear()
         self._buffer_ms = 0
         self._vad.reset()
+        self._buffer.clear()
+        self._buffer_ms = 0
+        self._vad.reset()
+        # 🆕 累计静默时长(用于判定"用户说完了")
+        self._silence_ms = 0
 
         if not self._capture:
             return
 
+        chunk_count = 0
+        speech_chunks = 0
+        last_status_log = 0
+        logger.info("🎙️ LISTENING 准备 async for chunk in self._capture.stream()...")
         async for chunk in self._capture.stream():
             if not self._running:
                 break
 
             is_speech = self._vad.is_speech(chunk.audio)
+            chunk_count += 1
+            if is_speech:
+                speech_chunks += 1
+
+            if chunk_count <= 3 or chunk_count % 50 == 0:
+                rms = float(np.sqrt(np.mean(chunk.audio**2)))
+                logger.info(
+                    f"🎙️ LISTENING 收到第 {chunk_count} 块, is_speech={is_speech}, RMS={rms:.4f}"
+                )
+
+            # 每 50 块(~5秒)打一次状态,确认 loop 在跑
+            if chunk_count - last_status_log >= 50:
+                rms = float(np.sqrt(np.mean(chunk.audio**2)))
+                logger.info(
+                    f"📊 状态: 收 {chunk_count} 块, VAD 命中 {speech_chunks}/{chunk_count}, "
+                    f"本块 RMS={rms:.4f}, buffer={self._buffer_ms:.0f}ms"
+                )
+                last_status_log = chunk_count
 
             if is_speech:
                 self._buffer.append(chunk.audio)
                 self._buffer_ms += len(chunk.audio) / self._cfg.sample_rate * 1000
-
+                self._silence_ms = 0  # 🆕 重置静默计时
                 # 超时强制送 ASR
                 if self._buffer_ms >= self._cfg.max_segment_duration_ms:
                     logger.debug("Max segment duration reached, flushing")
                     await self._flush_buffer()
             else:
-                # 静音:buffer 有内容则等待说完
+                # 静音:buffer 有内容则累计静默时长
                 if self._buffer:
-                    # 等待继续说话或超时
-                    await asyncio.sleep(0.1)
+                    # 累加静默时长(chunk 时长 = 100ms)
+                    chunk_ms = len(chunk.audio) / self._cfg.sample_rate * 1000
+                    self._silence_ms += chunk_ms
                     # 检查是否超时
-                    if self._buffer_ms >= self._cfg.silence_timeout_ms:
-                        logger.debug("Silence timeout, flushing")
+                    if self._silence_ms >= self._cfg.silence_timeout_ms:
+                        logger.info(
+                            f"🤫 静默 {self._silence_ms:.0f}ms 超过阈值, flush buffer "
+                            f"(buffer={self._buffer_ms:.0f}ms)"
+                        )
                         await self._flush_buffer()
+                        self._silence_ms = 0
 
             # 退出条件
             if chunk.is_final:
@@ -309,6 +371,83 @@ class VoiceAdapter:
         # 清空 buffer
         self._buffer.clear()
         self._buffer_ms = 0
+
+    # -------------------------------------------------------------------------
+    # 🆕 Phase 7.6: 声纹采集模式实现
+    # -------------------------------------------------------------------------
+
+    async def _enrollment_listen(self) -> None:
+        """声纹采集模式:静默收集音频片段，每句话独立存储。
+
+        - VAD 检测到语音 → 放入 buffer
+        - 静默超时(3秒) → 把当前 buffer 存为一个片段，清空 buffer
+        - 采集到 3+ 片段后自动结束（stop_voice_enrollment 被调用时立即结束）
+        """
+        if not self._capture:
+            return
+
+        self._buffer.clear()
+        self._buffer_ms = 0
+        self._vad.reset()
+        self._silence_ms = 0
+        self._enrollment_audio.clear()
+        chunk_count = 0
+
+        MIN_SAMPLES_FOR_VALID_SEGMENT = 10  # 至少收到 10 个 chunk 才算有效片段
+
+        async for chunk in self._capture.stream():
+            if not self._enrollment_mode:
+                # 被外部 stop_voice_enrollment() 中断，丢弃未完成的 buffer
+                break
+
+            chunk_count += 1
+            is_speech = self._vad.is_speech(chunk.audio)
+
+            if is_speech:
+                self._buffer.append(chunk.audio)
+                self._buffer_ms += len(chunk.audio) / self._cfg.sample_rate * 1000
+                self._silence_ms = 0  # 重置静默计时
+            else:
+                # 静音
+                if self._buffer:
+                    chunk_ms = len(chunk.audio) / self._cfg.sample_rate * 1000
+                    self._silence_ms += chunk_ms
+                    # 3秒静默 → 保存当前片段
+                    if self._silence_ms >= self._cfg.silence_timeout_ms:
+                        if len(self._buffer) >= MIN_SAMPLES_FOR_VALID_SEGMENT:
+                            segment_audio = np.concatenate(self._buffer)
+                            self._enrollment_audio.append(segment_audio)
+                            logger.info(
+                                "声纹采集:保存第 %d 个片段,时长 %.1fs",
+                                len(self._enrollment_audio),
+                                self._buffer_ms / 1000,
+                            )
+                        self._buffer.clear()
+                        self._buffer_ms = 0
+                        self._silence_ms = 0
+                        # 采集到足够片段自动退出（3句）
+                        if len(self._enrollment_audio) >= 3:
+                            logger.info("声纹采集:已采集 3 个片段，退出采集模式")
+                            self._enrollment_mode = False
+                            break
+
+            # chunk.is_final 退出条件
+            if chunk.is_final:
+                # 保存未完成的 buffer（如果有）
+                if self._buffer and len(self._buffer) >= MIN_SAMPLES_FOR_VALID_SEGMENT:
+                    segment_audio = np.concatenate(self._buffer)
+                    self._enrollment_audio.append(segment_audio)
+                break
+
+        # 退出时把剩余 buffer 也保存
+        if self._buffer and len(self._buffer) >= MIN_SAMPLES_FOR_VALID_SEGMENT:
+            segment_audio = np.concatenate(self._buffer)
+            self._enrollment_audio.append(segment_audio)
+
+        logger.info(
+            "声纹采集完成:共采集 %d 个有效片段",
+            len(self._enrollment_audio),
+        )
 
     # -------------------------------------------------------------------------
     # TTS Speak (由外部调用,如 AnswerRouter 响应时)
@@ -383,6 +522,38 @@ class VoiceAdapter:
         # 短暂等待播放停止
         await asyncio.sleep(0.1)
         self._interrupt_event.clear()
+
+    # -------------------------------------------------------------------------
+    # 🆕 Phase 7.6: 声纹采集模式
+    # -------------------------------------------------------------------------
+
+    async def start_voice_enrollment(self) -> None:
+        """进入声纹采集模式。
+
+        暂停正常监听，进入专注采集状态。
+        采集过程中音频会缓存到 _enrollment_audio，不会发布 VoiceEvent。
+        """
+        logger.info("VoiceAdapter 进入声纹采集模式")
+        self._enrollment_mode = True
+        self._enrollment_audio.clear()
+        self._enrollment_complete.clear()
+        self._running = False  # 停止主循环
+
+    async def stop_voice_enrollment(self) -> list[tuple[np.ndarray, int]]:
+        """退出声纹采集模式，返回采集到的音频片段。
+
+        Returns:
+            list of (audio, sample_rate) tuples。每句独立采集为一个片段。
+        """
+        logger.info(
+            "VoiceAdapter 退出声纹采集模式，采集到 %d 个音频片段",
+            len(self._enrollment_audio),
+        )
+        self._enrollment_mode = False
+        # 返回 (audio_array, sample_rate) 元组列表
+        result = [(audio, self._cfg.sample_rate) for audio in self._enrollment_audio]
+        self._enrollment_audio.clear()
+        return result
 
     def __repr__(self) -> str:
         return f"VoiceAdapter(device_id={self._cfg.device_id}, state={self._state})"

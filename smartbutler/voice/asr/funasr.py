@@ -38,11 +38,18 @@ class FunASR(BaseASR):
         self._model = None
         self._punc_model = None
         self._loaded = False
+        self._load_error: Exception | None = None
 
     def _ensure_model(self) -> None:
-        """懒加载 FunASR 模型(首次调用时加载)。"""
+        """懒加载 FunASR 模型(首次调用时加载)。
+
+        🐛 必须在后台线程调用!FunASR AutoModel 同步加载会卡住 asyncio 事件循环。
+        应该用 await self.ensure_ready() 预加载。
+        """
         if self._loaded:
             return
+        if self._load_error is not None:
+            raise self._load_error
         try:
             from funasr import AutoModel
 
@@ -53,9 +60,24 @@ class FunASR(BaseASR):
             )
             self._loaded = True
         except ImportError as e:
-            raise ASRError("funasr not installed: pip install funasr") from e
+            err = ASRError("funasr not installed: pip install funasr")
+            err.__cause__ = e
+            self._load_error = err
+            raise self._load_error
         except Exception as e:
-            raise ASRError(f"Failed to load FunASR model: {e}") from e
+            err = ASRError(f"Failed to load FunASR model: {e}")
+            err.__cause__ = e
+            self._load_error = err
+            raise self._load_error
+
+    async def ensure_ready(self) -> None:
+        """异步预加载模型(在后台线程跑,避免阻塞事件循环)。"""
+        if self._loaded or self._load_error is not None:
+            if self._load_error is not None:
+                raise self._load_error
+            return
+        import asyncio
+        await asyncio.to_thread(self._ensure_model)
 
     async def transcribe(self, audio: AudioSegment) -> ASRResult:
         """FunASR 语音转文字。"""
