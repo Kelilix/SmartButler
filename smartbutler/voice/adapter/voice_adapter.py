@@ -99,6 +99,9 @@ class VoiceAdapter:
         self._running = False
         self._buffer: list[np.ndarray] = []
         self._buffer_ms = 0
+        # 🐛 单段是否已超上限(软切标记):超限时等下一个自然停顿再切,
+        # 不在说话中途硬切。见 _listen_and_respond。
+        self._segment_overflow = False
 
         # 依赖(从 config 注入)
         self._capture = config.capture
@@ -248,7 +251,7 @@ class VoiceAdapter:
             await self._enrollment_listen()
             return
 
-        logger.info("🎙️  LISTENING: 开始监听用户说话... (说点什么,3 秒静音后自动结束)")
+        logger.info("🎙️  LISTENING: 开始监听用户说话... (说点什么,1.5 秒静音后自动结束)")
         self._buffer.clear()
         self._buffer_ms = 0
         self._vad.reset()
@@ -257,6 +260,8 @@ class VoiceAdapter:
         self._vad.reset()
         # 🆕 累计静默时长(用于判定"用户说完了")
         self._silence_ms = 0
+        # 🐛 重置软切标记(新一轮监听从零开始)
+        self._segment_overflow = False
 
         if not self._capture:
             return
@@ -293,10 +298,25 @@ class VoiceAdapter:
                 self._buffer.append(chunk.audio)
                 self._buffer_ms += len(chunk.audio) / self._cfg.sample_rate * 1000
                 self._silence_ms = 0  # 🆕 重置静默计时
-                # 超时强制送 ASR
+                # 🐛 2026-10-26 软上限:超过 max_segment 不再**立刻**硬切。
+                #
+                # 原来的逻辑是"buffer 超时就 flush",无条件切 —— 即使用户还在
+                # 滔滔不绝地说,也会在阈值处把一句话劈成两半,产生两个碎片事件,
+                # LLM 对每片各回一次 → 用户听到"同一句话被拆成两段分别回答"。
+                #
+                # 现在改成:超限时打个标记,等到**真正出现静默**时再在自然
+                # 停顿处切一刀。这样长句会被完整保留,切点落在句末。
+                #
+                # 只有在"用户完全不再说话"(静默计时也走完)时才会落到
+                # 下面的 else 分支正常 flush,不会无限增长。
                 if self._buffer_ms >= self._cfg.max_segment_duration_ms:
-                    logger.debug("Max segment duration reached, flushing")
-                    await self._flush_buffer()
+                    if not self._segment_overflow:
+                        logger.info(
+                            "⏱️  达到单段上限 %.0fms, 将在下一个自然停顿处切分 "
+                            "(不再硬切,避免把长句劈成两半)",
+                            self._cfg.max_segment_duration_ms,
+                        )
+                    self._segment_overflow = True
             else:
                 # 静音:buffer 有内容则累计静默时长
                 if self._buffer:
@@ -305,10 +325,18 @@ class VoiceAdapter:
                     self._silence_ms += chunk_ms
                     # 检查是否超时
                     if self._silence_ms >= self._cfg.silence_timeout_ms:
-                        logger.info(
-                            f"🤫 静默 {self._silence_ms:.0f}ms 超过阈值, flush buffer "
-                            f"(buffer={self._buffer_ms:.0f}ms)"
-                        )
+                        # 🐛 超长段:用户说太久还没停 → 在这里硬切(极端保护)
+                        if self._segment_overflow:
+                            logger.info(
+                                "⏱️  超长段 %.0fms 且持续静音, 强制 flush (极端保护)",
+                                self._buffer_ms,
+                            )
+                        else:
+                            logger.info(
+                                "🤫 静默 %.0fms 超过阈值, flush buffer (buffer=%.0fms)",
+                                self._silence_ms,
+                                self._buffer_ms,
+                            )
                         await self._flush_buffer()
                         self._silence_ms = 0
 
@@ -371,6 +399,8 @@ class VoiceAdapter:
         # 清空 buffer
         self._buffer.clear()
         self._buffer_ms = 0
+        # 🐛 重置软切标记:下一次超限重新计
+        self._segment_overflow = False
 
     # -------------------------------------------------------------------------
     # 🆕 Phase 7.6: 声纹采集模式实现

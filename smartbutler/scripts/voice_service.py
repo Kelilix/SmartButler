@@ -106,9 +106,9 @@ class VoiceServiceConfig:
 
     # 音频参数(默认值由 env 注入, 见 __post_init__)
     sample_rate: int = 16000
-    silence_timeout_ms: int = 3000
+    silence_timeout_ms: int = 1500
     max_segment_duration_ms: int = 30000
-    vad_threshold: float = 0.3
+    vad_threshold: float = 0.02
 
     def __post_init__(self) -> None:
         """从 .env / 环境变量读取默认值(只在 dataclass 默认值时生效)。
@@ -116,9 +116,11 @@ class VoiceServiceConfig:
         命令行参数解析后会显式覆盖这些字段, 所以 CLI 优先级最高。
         """
         settings = load_voice_settings()
-        # 只在 dataclass 默认值时填入, 避免覆盖 CLI/显式传入的值
-        _DEFAULT_VAD = 0.3
-        _DEFAULT_SILENCE = 3000
+        # 只在 dataclass 默认值时填入, 避免覆盖 CLI/显式传入的值。
+        # ⚠️ 这几个哨兵值必须和上面 dataclass 字段默认值严格一致,
+        # 否则会出现"显式传了值却被 env 覆盖"的诡异行为。
+        _DEFAULT_VAD = 0.02
+        _DEFAULT_SILENCE = 1500
         _DEFAULT_MAX_SEGMENT = 30000
         if self.vad_threshold == _DEFAULT_VAD:
             self.vad_threshold = settings.vad_threshold
@@ -349,11 +351,13 @@ def _create_real_components(config: VoiceServiceConfig):
         logger.error("  ✗ MicCapture 失败: %s", e)
         capture = None
 
-    # VAD(用 --vad-threshold 调灵敏度;默认 0.3 对增益后的音频更友好)
+    # VAD(用 --vad-threshold 调灵敏度;默认 0.02,实测兼顾检出率与静默判定)
     try:
-        vad_threshold = getattr(config, "vad_threshold", 0.3)
+        vad_threshold = getattr(config, "vad_threshold", 0.02)
         vad = SileroVAD(threshold=vad_threshold)
-        logger.info("  ✓ SileroVAD (torch, threshold=%.2f)", vad_threshold)
+        # ⚠️ 必须用 %.4f:%.2f 会把 0.005 四舍五入成 "0.01",
+        # 与顶部 "VAD threshold: 0.0050" 自相矛盾,导致误判实际生效值。
+        logger.info("  ✓ SileroVAD (torch, threshold=%.4f)", vad_threshold)
     except Exception as e:
         logger.error("  ✗ SileroVAD 失败: %s", e)
         vad = None
@@ -578,7 +582,8 @@ def main():
         default=None,  # None → 用 .env / dataclass 默认值
         help=(
             "VAD 语音概率阈值(0-1, 默认从 .env SMARTBUTLER_VOICE_VAD_THRESHOLD 读取, "
-            "越低越敏感。麦克风音量小时调到 0.005-0.1)"
+            "默认 0.02)。越低越敏感。"
+            "⚠️ 不要低于 0.01:会把静音误判成语音,导致永远等不到静默、碎片回复。"
         ),
     )
     parser.add_argument(
@@ -587,7 +592,7 @@ def main():
         default=None,
         help=(
             "静音超时(毫秒)。连续静音超过此时长 → flush buffer 送 ASR。"
-            "默认从 .env SMARTBUTLER_VOICE_SILENCE_TIMEOUT_MS 读取(3000)。"
+            "默认从 .env SMARTBUTLER_VOICE_SILENCE_TIMEOUT_MS 读取(1500)。"
         ),
     )
     parser.add_argument(
@@ -596,7 +601,8 @@ def main():
         default=None,
         help=(
             "单段最大时长(毫秒)。即使用户不停说话, 超过此时长也强制 flush。"
-            "默认从 .env SMARTBUTLER_VOICE_MAX_SEGMENT_DURATION_MS 读取(30000, 生产建议 15000)。"
+            "默认从 .env SMARTBUTLER_VOICE_MAX_SEGMENT_DURATION_MS 读取(30000)。"
+            "⚠️ 这是硬切:调小会把长句拆成两半,产生碎片回复。"
         ),
     )
     parser.add_argument(
