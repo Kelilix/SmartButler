@@ -15,9 +15,9 @@ Date: 2026-10-15
 from __future__ import annotations
 
 import struct
-from typing import AsyncIterator
+from collections.abc import AsyncGenerator
 
-from smartbutler.voice.tts.base import BaseTTS, TTSError, TTSVoice, ZH_DEFAULT_VOICE
+from smartbutler.voice.tts.base import BaseTTS, TTSError, TTSVoice
 
 
 class PiperTTSImpl(BaseTTS):
@@ -57,7 +57,7 @@ class PiperTTSImpl(BaseTTS):
         self,
         text: str,
         voice: TTSVoice | None = None,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes, None]:
         """Piper TTS 文本转语音流。"""
         self._ensure_model()
 

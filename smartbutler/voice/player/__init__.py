@@ -4,6 +4,6 @@ Author: SmartButler Team
 Date: 2026-10-15
 """
 
-from smartbutler.voice.player.base import BaseAudioPlayer, AudioPlayerError
+from smartbutler.voice.player.base import AudioPlayerError, BaseAudioPlayer
 
-__all__ = ["BaseAudioPlayer", "AudioPlayerError"]
+__all__ = ["AudioPlayerError", "BaseAudioPlayer"]

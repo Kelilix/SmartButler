@@ -11,13 +11,13 @@ Date: 2026-10-15
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+from collections.abc import AsyncGenerator
 
 from smartbutler.voice.tts.base import (
+    ZH_DEFAULT_VOICE,
     BaseTTS,
     TTSError,
     TTSVoice,
-    ZH_DEFAULT_VOICE,
 )
 
 
@@ -40,7 +40,7 @@ class EdgeTTSImpl(BaseTTS):
         self,
         text: str,
         voice: TTSVoice | None = None,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes, None]:
         """Edge TTS 文本转语音流。
 
         Yields:
@@ -105,7 +105,7 @@ class FakeTTS(BaseTTS):
         self,
         text: str,
         voice: TTSVoice | None = None,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes, None]:
         yield self._chunk
 
     async def list_voices(self, lang: str | None = None) -> list[TTSVoice]:

@@ -16,7 +16,8 @@ Date: 2026-10-15
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+from collections.abc import AsyncGenerator
+from typing import Any
 
 import numpy as np
 
@@ -80,8 +81,15 @@ class PvPorcupineImpl(BaseWakeWordDetector):
         except Exception as e:
             raise WakeWordError(f"Failed to load Porcupine: {e}") from e
 
-    async def listen(self) -> AsyncIterator[WakeWordResult | np.ndarray]:
-        """持续监听唤醒词。"""
+    async def listen(self) -> AsyncGenerator[WakeWordResult | np.ndarray, None]:
+        """持续监听唤醒词。
+
+        注意:这是个**真正的异步生成器**(方法体含 yield)。
+        若写成 ``async def ... -> AsyncIterator[...]`` 但方法体里没有 yield,
+        Python 会把它当成普通协程函数 —— 调用方 ``async for event in
+        detector.listen()`` 会直接抛
+        ``TypeError: 'async for' requires an object with __aiter__ method``。
+        """
         self._ensure_model()
 
         porcupine = self._porcupine
@@ -93,6 +101,7 @@ class PvPorcupineImpl(BaseWakeWordDetector):
                 "PvPorcupineImpl.listen() 是抽象方法,"
                 "实际使用中由 VoiceAdapter 注入音频流"
             )
+            yield  # pragma: no cover - 让本函数成为真正的异步生成器
 
     async def process_audio(self, audio: np.ndarray) -> WakeWordResult | None:
         """处理单个音频块,检测唤醒词。
@@ -165,8 +174,9 @@ class FakeWakeWordDetector(BaseWakeWordDetector):
         self._count = 0
         self._awake = False
 
-    async def listen(self) -> AsyncIterator[WakeWordResult | np.ndarray]:
+    async def listen(self) -> AsyncGenerator[WakeWordResult | np.ndarray, None]:
         raise NotImplementedError("FakeWakeWordDetector.listen() not implemented")
+        yield  # pragma: no cover - 让本函数成为真正的异步生成器
 
     def is_awake(self) -> bool:
         return self._awake

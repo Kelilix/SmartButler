@@ -47,17 +47,16 @@ Date: 2026-10-15
 from __future__ import annotations
 
 import asyncio
-import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from smartbutler.events.core.event import EventPriority
 from smartbutler.server.adapters import ButlerReply, OutputAdapter
+from smartbutler.utils import get_logger
 from smartbutler.voice.tts.base import BaseTTS, TTSVoice
 
 if TYPE_CHECKING:
     from smartbutler.voice.player.base import BaseAudioPlayer
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class TTSOutputAdapter(OutputAdapter):
@@ -163,10 +162,14 @@ class TTSOutputAdapter(OutputAdapter):
 
                 logger.debug("TTSOutputAdapter finished speaking")
             except Exception as e:
+                # 注意:这里必须用 structlog 的 kwargs 写法。
+                # 若用 stdlib logging.getLogger,`error=` 会被当成 Logger._log() 的
+                # 非法参数抛 TypeError,反而把下面这行真正的原始异常给掩盖掉。
                 logger.error(
                     "TTSOutputAdapter error",
                     error=str(e),
                     content=reply.content[:50],
+                    exc_info=True,
                 )
                 raise TTSOutputError(f"TTS output failed: {e}") from e
             finally:

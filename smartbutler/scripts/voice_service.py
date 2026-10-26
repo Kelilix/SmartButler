@@ -56,16 +56,17 @@ import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from smartbutler.config.logging import load_logging_settings
 from smartbutler.config.voice import load_voice_settings
+from smartbutler.utils import configure_logging
 
 if TYPE_CHECKING:
     pass
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-)
+# 配置日志。
+# 用 configure_logging() 而非 logging.basicConfig():前者会把 structlog 与 stdlib
+# 两条管线接到同一个 ProcessorFormatter 上,避免同一次运行出现两种日志格式。
+configure_logging(load_logging_settings())
 logger = logging.getLogger(__name__)
 
 
@@ -407,18 +408,14 @@ def _create_real_components(config: VoiceServiceConfig):
 
 
 def _create_player():
-    """智能创建播放器:pygame → winsound → 失败提示。"""
-    # 1) 优先 pygame
-    try:
-        from smartbutler.voice.player.pygame_player import PygameAudioPlayer
+    """智能创建播放器:Windows → winsound 优先,非 Windows → pygame。
 
-        player = PygameAudioPlayer()
-        logger.info("  ✓ PygameAudioPlayer (pygame)")
-        return player
-    except Exception as e:
-        logger.warning("  ⚠ PygameAudioPlayer 不可用: %s", e)
-
-    # 2) 降级:Windows winsound(零依赖)
+    选型依据:
+    - Windows: winsound 是标准库(零依赖),且能把 Edge TTS 的 MP3 转码成 WAV 播放,
+      不需要额外装包。pygame 在 Python 3.14 上没有预编译 wheel,装不上。
+    - 非 Windows: 没有 winsound,只能用 pygame。
+    """
+    # 1) Windows:优先 winsound(标准库,零依赖)
     if sys.platform == "win32":
         try:
             from smartbutler.voice.player.winsound_player import WinsoundAudioPlayer
@@ -429,9 +426,30 @@ def _create_player():
         except Exception as e:
             logger.warning("  ⚠ WinsoundAudioPlayer 不可用: %s", e)
 
+        # Windows 上 winsound 失败,再试 pygame
+        try:
+            from smartbutler.voice.player.pygame_player import PygameAudioPlayer
+
+            player = PygameAudioPlayer()
+            logger.info("  ✓ PygameAudioPlayer (pygame)")
+            return player
+        except Exception as e:
+            logger.warning("  ⚠ PygameAudioPlayer 不可用: %s", e)
+
+    # 2) 非 Windows:只能用 pygame
+    else:
+        try:
+            from smartbutler.voice.player.pygame_player import PygameAudioPlayer
+
+            player = PygameAudioPlayer()
+            logger.info("  ✓ PygameAudioPlayer (pygame)")
+            return player
+        except Exception as e:
+            logger.warning("  ⚠ PygameAudioPlayer 不可用: %s", e)
+
     # 3) 都失败了
     logger.error("  ✗ 所有播放器都不可用!")
-    logger.error("    建议: pip install pygame")
+    logger.error("    建议: Windows 用 winsound(无需安装);其他平台 pip install pygame")
     return None
 
 

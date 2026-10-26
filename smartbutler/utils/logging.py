@@ -12,6 +12,15 @@
 - 这样第三方库的日志（如 langchain、fastapi）能汇聚到同一管道
 
 本模块不直接依赖 config（避免循环依赖），调用方需显式传入 LoggingSettings 或参数。
+
+统一渲染管线
+------------
+项目里 structlog（``structlog.get_logger``）与 stdlib（``logging.getLogger``）
+两种 logger 混用。这里用 ``structlog.stdlib.ProcessorFormatter`` 把两者汇入
+**同一条**渲染管线，避免同一份日志出现两种格式。
+
+同时通过 ``structlog.stdlib.ExtraAdder`` 把 stdlib ``extra={...}`` 里的字段
+也带进结构化输出（stdlib 原生只会把它们挂到 LogRecord 上）。
 """
 
 from __future__ import annotations
@@ -35,6 +44,8 @@ def configure_logging(
 ) -> None:
     """配置全局 structlog（stdlib 模式）。
 
+    structlog 与 stdlib logging 都会被重定向到同一条渲染管线。
+
     Args:
         settings: 完整的 LoggingSettings。传入时优先使用其中的字段。
         level/json_output/log_file: 单独覆盖任一字段（用于单元测试快速配置）。
@@ -49,14 +60,47 @@ def configure_logging(
 
     numeric_level = getattr(logging, level, logging.INFO)
 
-    # ---- 1. 配置 stdlib logging（接管根 logger）----
+    # ---- 1. 组装渲染管线 ----
+    shared_processors: list[structlog.types.Processor] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.UnicodeDecoder(),
+    ]
+
+    renderer: structlog.types.Processor = (
+        structlog.processors.JSONRenderer()
+        if json_output
+        else structlog.dev.ConsoleRenderer(colors=True)
+    )
+
+    # ProcessorFormatter 让 stdlib record 与 structlog record 走同一套渲染逻辑:
+    # - structlog record: processors 链直接产出 event_dict
+    # - stdlib record: 先过 foreign_pre_chain,再走同一套 processors
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=[
+            *shared_processors,
+            # 把 stdlib extra={...} 的字段带进 event_dict
+            structlog.stdlib.ExtraAdder(),
+        ],
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.processors.format_exc_info,
+            renderer,
+        ],
+    )
+
+    # ---- 2. 配置 stdlib logging（接管根 logger）----
     root_logger = logging.getLogger()
-    # 清除已有的 handler，避免重复输出
+    # 清除已有的 handler，避免重复输出。
+    # 必须 close():FileHandler 持有文件句柄,Windows 上不关的话
+    # 后续写入/删除该文件会报 PermissionError(WinError 32)。
     for h in list(root_logger.handlers):
         root_logger.removeHandler(h)
+        h.close()
     root_logger.setLevel(numeric_level)
-
-    formatter = logging.Formatter("%(message)s")
 
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(numeric_level)
@@ -70,30 +114,12 @@ def configure_logging(
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
 
-    # ---- 2. 配置 structlog（stdlib 模式）----
-    timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
-    shared_processors: list[structlog.types.Processor] = [
-        structlog.contextvars.merge_contextvars,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        timestamper,
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.UnicodeDecoder(),
-    ]
-
-    if json_output:
-        renderer: structlog.types.Processor = structlog.processors.JSONRenderer()
-    else:
-        renderer = structlog.dev.ConsoleRenderer(colors=True)
-
-    final_processors: list[structlog.types.Processor] = [
-        *shared_processors,
-        structlog.processors.format_exc_info,
-        renderer,
-    ]
-
+    # ---- 3. 配置 structlog（交给上面同一个 formatter）----
     structlog.configure(
-        processors=final_processors,
+        processors=[
+            *shared_processors,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
         wrapper_class=structlog.make_filtering_bound_logger(numeric_level),
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,

@@ -37,7 +37,7 @@ await adapter.run()
 | TTS | FakeTTS | EdgeTTSImpl | edge-tts |
 | Speaker | FakeSpeakerEmbedder | ResemblyzerEmbedder | resemblyzer |
 | WakeWord | SimpleWakeWordDetector | PvPorcupineImpl | pvporcupine |
-| Player | FakeAudioPlayer | PygameAudioPlayer | pygame |
+| Player | FakeAudioPlayer | WinsoundAudioPlayer / PygameAudioPlayer | soundfile(转码) / pygame |
 
 Author: SmartButler Team
 Date: 2026-10-15
@@ -45,6 +45,7 @@ Date: 2026-10-15
 
 from __future__ import annotations
 
+import sys
 from typing import Literal
 
 from smartbutler.events.core.event_bus import EventBus
@@ -182,9 +183,22 @@ def _create_tts(use_fakes: bool, impl: str) -> BaseTTS | None:
 
 
 def _create_player(use_fakes: bool) -> BaseAudioPlayer | None:
-    """创建播放器。"""
+    """创建播放器。
+
+    Windows 优先 winsound(标准库,零依赖,且能自动转码 MP3);
+    非 Windows 只能用 pygame。
+    """
     if use_fakes:
         return FakeAudioPlayer()
+
+    if sys.platform == "win32":
+        try:
+            from smartbutler.voice.player.winsound_player import WinsoundAudioPlayer
+
+            return WinsoundAudioPlayer()
+        except Exception:
+            pass
+
     # 真实:pygame 需要 pygame
     try:
         return PygameAudioPlayer()

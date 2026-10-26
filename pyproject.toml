@@ -53,6 +53,15 @@ dependencies = [
     # Phase 6.6: Personality 配置文件(personality.md)的 YAML frontmatter 解析。
     # 跟 Skill loader 共用同一份 pyyaml(已存在于环境,但显式声明避免干净环境漏装)。
     "pyyaml>=6.0,<7.0",
+    # Phase 7: 语音链路依赖。
+    # numpy: 音频缓冲/VAD/声纹的数组运算(全项目 18 个文件在用)。
+    # soundfile: 基于 libsndfile,负责把 Edge TTS 输出的 MP3 解码成 PCM,
+    #   再编码成 WAV 交给 winsound 播放。Windows 的 winsound 只能直接播 WAV,
+    #   没有这一步就没法出声。
+    # edge-tts: Edge TTS 在线语音合成。
+    "numpy>=1.26",
+    "soundfile>=0.12",
+    "edge-tts>=6.1",
 ]
 
 [project.optional-dependencies]

@@ -14,13 +14,13 @@ Date: 2026-10-15
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue as _std_queue  # 线程安全队列,用于 sounddevice callback 跨线程投递
 import threading
-from typing import AsyncIterator
+from collections.abc import AsyncGenerator
 
 import numpy as np
 
-import logging
 _logger = logging.getLogger(__name__)
 
 from smartbutler.voice.capture.base import (
@@ -28,7 +28,6 @@ from smartbutler.voice.capture.base import (
     AudioChunk,
     BaseAudioCapture,
 )
-
 
 # ---------------------------------------------------------------------------
 # 辅助:音频格式转换
@@ -122,7 +121,7 @@ class MicCapture(BaseAudioCapture):
         # 因为 sounddevice callback 在 PortAudio 内部线程调,
         # asyncio.Queue 不是线程安全的,跨线程 put_nowait 会丢消息
         self._thread_queue: _std_queue.Queue[AudioChunk | None] = _std_queue.Queue(maxsize=200)
-        self._stream: "sd.InputStream | None" = None
+        self._stream: sd.InputStream | None = None
         # 🆕 每个 stream() 自己的 pump thread(无 bridge,无 round-robin)
         self._consumer_threads: list[tuple[threading.Thread, threading.Event]] = []
         self._next_consumer_idx: int = 0
@@ -146,8 +145,9 @@ class MicCapture(BaseAudioCapture):
 
     def _start_stream(self) -> None:
         """同步启动 sounddevice 流。"""
-        import sounddevice as sd
         import logging
+
+        import sounddevice as sd
         _sst_logger = logging.getLogger(__name__)
         _sst_logger.info("🎛️ _start_stream() 进入, device=%s, sr=%d, chunk_ms=%d",
                          self._device_index, self._target_sr, self._chunk_ms)
@@ -173,7 +173,7 @@ class MicCapture(BaseAudioCapture):
         indata: np.ndarray,
         frames: int,
         time_info: dict,
-        status: "sd.CallbackFlags",
+        status: sd.CallbackFlags,
     ) -> None:
         """sounddevice 回调(在音频线程同步调用)。"""
         import logging
@@ -227,7 +227,7 @@ class MicCapture(BaseAudioCapture):
         amplified = np.clip(amplified, -1.0, 1.0).astype(np.float32)
         return amplified
 
-    async def stream(self) -> AsyncIterator[AudioChunk]:
+    async def stream(self) -> AsyncGenerator[AudioChunk, None]:
         """异步音频流(每次调用返回独立的消费者,有自己的 asyncio queue)。
 
         🐛 关键设计:每个 stream() 启动**自己专属的后台 thread**,从 _thread_queue
@@ -368,7 +368,7 @@ class FakeMicCapture(BaseAudioCapture):
     async def stop(self) -> None:
         self._ready = False
 
-    async def stream(self) -> AsyncIterator[AudioChunk]:
+    async def stream(self) -> AsyncGenerator[AudioChunk, None]:
         if not self._ready:
             await self.start()
         for chunk in self._chunks:

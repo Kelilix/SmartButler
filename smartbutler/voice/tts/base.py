@@ -2,7 +2,7 @@
 
 设计原则:
 - 抽象 TTS 实现(edge-tts / piper / 阿里云 TTS),业务方不感知底层算法。
-- 暴露 ``speak(text, voice) -> AsyncIterator[bytes]`` 接口,输入文本,yield 音频分片。
+- 暴露 ``speak(text, voice) -> AsyncGenerator[bytes, None]`` 接口,输入文本,yield 音频分片。
 - 同时暴露 ``speak_to_file(text, path)`` 便捷方法,直接写 wav。
 - 内部实现可插拔:先用 edge-tts 快速跑通,后期换 piper 离线也不影响业务方。
 - 单测:直接 mock speak() 即可。
@@ -14,8 +14,8 @@ Date: 2026-10-15
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from typing import AsyncIterator
 
 
 @dataclass(frozen=True)
@@ -49,12 +49,20 @@ class BaseTTS(ABC):
     """
 
     @abstractmethod
-    async def speak(
+    def speak(
         self,
         text: str,
         voice: TTSVoice | None = None,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes, None]:
         """文本转语音流。
+
+        注意:这里是**普通 def**,不是 async def。
+        子类实现成 ``async def speak(...): yield ...``(异步生成器),
+        调用方用 ``async for chunk in tts.speak(...)`` 消费。
+        基类若写成 ``async def ... -> AsyncIterator[bytes]``,
+        mypy 会把方法体只有 ``...``(无 yield)的基类误判为协程函数,
+        返回 ``Coroutine[..., AsyncIterator[bytes]]``,
+        导致所有调用点的 ``async for`` 报 "has no attribute __aiter__"。
 
         Args:
             text: 要转换的文本。

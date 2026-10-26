@@ -12,14 +12,12 @@ Date: 2026-10-15
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any, AsyncIterator
+from collections.abc import AsyncGenerator
 
 import numpy as np
 
 from smartbutler.voice.wake_word.base import (
     BaseWakeWordDetector,
-    WakeWordError,
     WakeWordResult,
 )
 
@@ -78,12 +76,20 @@ class SimpleWakeWordDetector(BaseWakeWordDetector):
         # 归一化到 [0, 1]
         return min(1.0, rms * 2)
 
-    async def listen(self) -> AsyncIterator[WakeWordResult | np.ndarray]:
-        """持续监听唤醒词(需要外部注入音频流)。"""
+    async def listen(self) -> AsyncGenerator[WakeWordResult | np.ndarray, None]:
+        """持续监听唤醒词(需要外部注入音频流)。
+
+        注意:这是个**真正的异步生成器**(方法体含 yield)。
+        若写成 ``async def ... -> AsyncIterator[...]`` 但方法体里没有 yield,
+        Python 会把它当成普通协程函数 —— 调用方 ``async for event in
+        detector.listen()`` 会直接抛
+        ``TypeError: 'async for' requires an object with __aiter__ method``。
+        """
         raise NotImplementedError(
             "SimpleWakeWordDetector.listen() 需要外部注入音频流,"
             "请用 VoiceAdapter 或手动调用 process_audio()"
         )
+        yield  # pragma: no cover - 让本函数成为真正的异步生成器
 
     async def process_audio(self, audio: np.ndarray) -> WakeWordResult | None:
         """处理单个音频块,检测唤醒词。
