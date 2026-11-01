@@ -13,6 +13,7 @@ Date: 2026-10-15
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
@@ -24,6 +25,8 @@ from smartbutler.events.routing.speaker_registry import (
     SpeakerProfile,
     SpeakerRegistry,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -138,6 +141,7 @@ class EmbeddingSpeakerRegistry(SpeakerRegistry):
             SpeakerMatch: 匹配结果。
         """
         if embedding is None:
+            logger.info("🔍 声纹识别: embedding 为空，无法匹配")
             return SpeakerMatch(
                 matched_user_id=None,
                 confidence=0.0,
@@ -157,6 +161,27 @@ class EmbeddingSpeakerRegistry(SpeakerRegistry):
         # 按相似度降序排序
         candidates.sort(key=lambda x: x[1], reverse=True)
 
+        # 🐛 2026-11-01 加日志:相似度明细。
+        #
+        # 之前 candidates 算出来了但没人看 → 识别失败时完全无从判断:
+        # 是"没注册过"还是"注册了但相似度不够"?差多少?
+        # 这条日志能直接区分这两种情况,并看出阈值是否需要调整。
+        if candidates:
+            detail = ", ".join(
+                f"{uid}={sim:.4f}" for uid, sim in candidates
+            )
+            logger.info(
+                "🔍 声纹识别: %d 个候选 [%s] 阈值=%.2f",
+                len(candidates),
+                detail,
+                self._threshold,
+            )
+        else:
+            # ⚠️ 最常见的失败原因:一个声纹都没注册过
+            logger.warning(
+                "🔍 声纹识别: 注册表为空（0 个已注册声纹），无法匹配任何用户"
+            )
+
         if not candidates:
             return SpeakerMatch(
                 matched_user_id=None,
@@ -168,6 +193,22 @@ class EmbeddingSpeakerRegistry(SpeakerRegistry):
 
         best_user_id, best_similarity = candidates[0]
         is_above = best_similarity >= self._threshold
+
+        if is_above:
+            logger.info(
+                "✅ 声纹识别成功: %s (相似度=%.4f ≥ 阈值=%.2f)",
+                best_user_id,
+                best_similarity,
+                self._threshold,
+            )
+        else:
+            # 低于阈值 → 判定为陌生人
+            logger.info(
+                "❌ 声纹识别未匹配: 最高 %s 相似度=%.4f < 阈值=%.2f（判为陌生人）",
+                best_user_id,
+                best_similarity,
+                self._threshold,
+            )
 
         return SpeakerMatch(
             matched_user_id=best_user_id if is_above else None,

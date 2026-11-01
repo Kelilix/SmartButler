@@ -41,6 +41,7 @@
 """
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -51,6 +52,8 @@ from smartbutler.events.core.event import (
     SPEAKER_MATCH_THRESHOLD,
     SpeakerInfo,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -164,6 +167,14 @@ class SpeakerRegistry(ABC):
         """
         match = await self.identify(embedding)
         if match.is_known and match.matched_user_id:
+            # 🐛 2026-11-01 加日志:识别成功的最终结果。
+            # 这一层是 VoiceEvent.speakers 的直接来源,之前完全没有日志 ——
+            # 用户反馈"识别不出身份"时,连识别成谁都看不到。
+            logger.info(
+                "👤 声纹身份确认: user_id=%s confidence=%.4f is_known=True",
+                match.matched_user_id,
+                match.confidence,
+            )
             return SpeakerInfo(
                 user_id=match.matched_user_id,
                 confidence=match.confidence,
@@ -179,6 +190,12 @@ class SpeakerRegistry(ABC):
             ).hexdigest()[:8]
         else:
             embed_hash = "noembed"
+        # 🐛 2026-11-01 加日志:识别失败(陌生人)的最终结果。
+        logger.info(
+            "👤 声纹身份未确认: user_id=unknown:%s confidence=%.4f is_known=False",
+            embed_hash,
+            match.confidence,
+        )
         return SpeakerInfo(
             user_id=f"unknown:{embed_hash}",
             confidence=match.confidence,

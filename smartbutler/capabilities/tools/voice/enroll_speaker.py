@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from smartbutler.capabilities.tools.decorator import register_tool
+from smartbutler.capabilities.tools.types import ToolScope
 
 if TYPE_CHECKING:
     from smartbutler.events.routing.speaker_registry import SpeakerRegistry
@@ -73,6 +74,17 @@ def _generate_user_id(embedding: list[float]) -> str:
     return f"speaker_{short_hash}"
 
 
+def _norm(embedding: list[float]) -> float:
+    """计算 embedding 的 L2 范数(用于诊断音频是否有效)。
+
+    全 0 范数说明音频里没有可用信号;数值异常偏大说明模型输出异常。
+    """
+    try:
+        return float(sum(v * v for v in embedding) ** 0.5)
+    except Exception:  # noqa: BLE001
+        return float("nan")
+
+
 # ---------------------------------------------------------------------------
 # Tool 实现
 # ---------------------------------------------------------------------------
@@ -88,7 +100,7 @@ def _generate_user_id(embedding: list[float]) -> str:
         "确认采集完成，保存声纹档案。\n"
         "后续：管家能通过声纹识别用户身份，无需重复注册。"
     ),
-    scope=None,  # 走默认 GLOBAL
+    scope=ToolScope.GLOBAL,
     timeout_seconds=120.0,
     idempotent=False,
 )
@@ -134,7 +146,10 @@ async def enroll_speaker(
 
         _enrollment_audio.clear()
 
-        logger.info("声纹采集已启动，等待用户说话（display_name=%s）", display_name)
+        logger.info(
+            "🎙️ 声纹采集已启动，等待用户说话（display_name=%s）",
+            display_name,
+        )
 
         return {
             "status": "collecting",
@@ -158,6 +173,21 @@ async def enroll_speaker(
     audio_segments = await _voice_adapter.stop_voice_enrollment()
     _enrollment_audio = audio_segments
 
+    # 🐛 2026-11-01 加日志:采集结果的细节。
+    # 之前只知道"没采集到音频",但不知道是"完全没说话"还是
+    # "说了但片段太短被 MIN_SAMPLES_FOR_VALID_SEGMENT 过滤掉了"。
+    if audio_segments:
+        durations = [len(a) / sr for a, sr in audio_segments]
+        logger.info(
+            "🎙️ 声纹采集确认: %d 个片段, 时长=%s",
+            len(audio_segments),
+            ", ".join(f"{d:.2f}s" for d in durations),
+        )
+    else:
+        logger.warning(
+            "🎙️ 声纹采集确认: 0 个片段（用户可能没说话，或说的太短被最小长度过滤）"
+        )
+
     if not audio_segments:
         return {
             "status": "error",
@@ -176,6 +206,10 @@ async def enroll_speaker(
         embedder = getattr(_speaker_registry, "_embedder", None)
 
     if embedder is None:
+        logger.error(
+            "❌ 声纹模型未初始化: registry=%s 无法取到 embedder",
+            type(_speaker_registry).__name__,
+        )
         return {
             "status": "error",
             "message": "声纹模型未初始化，无法提取声纹特征。",
@@ -183,15 +217,31 @@ async def enroll_speaker(
 
     # 提取 embedding（多句取平均）
     embeddings: list[list[float]] = []
-    for audio, sample_rate in audio_segments:
+    for idx, (audio, sample_rate) in enumerate(audio_segments):
+        dur = len(audio) / sample_rate
         try:
             emb = await embedder.embed(audio, sample_rate=sample_rate)
             embeddings.append(emb)
+            # 🐛 2026-11-01 加日志:每段的 embedding 维度 + 范数。
+            # 范数异常(全 0 / 爆炸)能直接看出是音频没内容还是模型出了问题。
+            logger.info(
+                "🔢 声纹提取 #%d: 时长=%.2fs 维度=%d 范数=%.4f",
+                idx + 1,
+                dur,
+                len(emb),
+                _norm(emb),
+            )
         except Exception as e:
-            logger.warning("声纹提取失败: %s", e)
+            logger.warning(
+                "⚠️ 声纹提取失败 #%d (时长=%.2fs): %s",
+                idx + 1,
+                dur,
+                e,
+            )
             continue
 
     if not embeddings:
+        logger.error("❌ 所有片段的声纹提取均失败")
         return {
             "status": "error",
             "message": "声纹提取失败，请重新尝试。",
@@ -208,6 +258,9 @@ async def enroll_speaker(
     # 生成或确认 user_id
     if user_id is None or not user_id.strip():
         user_id = _generate_user_id(avg_embedding)
+        logger.info("🆔 自动生成 user_id: %s", user_id)
+    else:
+        logger.info("🆔 使用指定 user_id: %s", user_id)
 
     # 构建 SpeakerProfile
     from datetime import UTC, datetime
@@ -226,16 +279,25 @@ async def enroll_speaker(
     try:
         await _speaker_registry.register(profile)
     except ValueError as e:
+        # 🐛 2026-11-01 加日志:之前注册失败路径**完全静默**,
+        # 只会把错误 message 返回给 LLM,用户看不到发生了什么。
+        logger.warning(
+            "⚠️ 声纹档案注册失败: user_id=%s display_name=%s error=%s",
+            user_id,
+            display_name,
+            e,
+        )
         return {
             "status": "error",
             "message": f"注册失败：{e}。如需更新请先注销原有档案。",
         }
 
     logger.info(
-        "声纹档案建立成功: user_id=%s, display_name=%s, samples=%d",
+        "✅ 声纹档案建立成功: user_id=%s, display_name=%s, samples=%d, 维度=%d",
         user_id,
         display_name,
         len(audio_segments),
+        len(avg_embedding),
     )
 
     return {

@@ -345,6 +345,19 @@ class ButlerOrchestrator:
         self._chat_adapter = self._make_chat_adapter()
         # 2. 收集工具
         self._all_tools = self._collect_tools()
+        # 🐛 2026-11-01 加日志:管家实际能看到的工具清单。
+        #
+        # 为什么必须打:工具"注册了但 LLM 看不见"是**静默失效** ——
+        # registry 里有 3 个,get_butler() 只返回 2 个,不报错不告警,
+        # 表现只是 LLM 从不调用那个工具。之前只有 tool_count=2 这个数字,
+        # 没有名字列表,对不上账根本看不出来。
+        #
+        # 有了这行日志,"enroll_speaker 消失了"会变成一眼可见。
+        _logger.info(
+            "orchestrator.visible_tools",
+            count=len(self._all_tools),
+            names=[getattr(t, "name", str(t)) for t in self._all_tools],
+        )
         # 3. 拼 system prompt(含 skill list 注入 + memory 注入)
         skill_snippets = list(self._skill_prompt_snippets)
         if self._skill_runtime is not None:

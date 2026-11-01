@@ -27,7 +27,7 @@ def register_tool(
     *,
     name: str | None = None,
     description: str | None = None,
-    scope: ToolScope = ToolScope.GLOBAL,
+    scope: ToolScope | None = ToolScope.GLOBAL,
     owner: str | None = None,
     required_permissions: list[Permission] | None = None,
     timeout_seconds: float | None = None,
@@ -40,7 +40,7 @@ def register_tool(
     Args:
         name: 工具名（默认用函数名）。
         description: 工具描述（默认用 docstring 首行）。
-        scope: 可见性范围，默认 GLOBAL。
+        scope: 可见性范围，默认 GLOBAL。传 None 等价于 GLOBAL（会被自动归一化）。
         owner: 当 scope=AGENT 时是 agent name；当 scope=SKILL 时是 skill name。
         required_permissions: 调用方需持有的权限列表。
         timeout_seconds: 单次执行超时（秒），None 不限。
@@ -58,6 +58,20 @@ def register_tool(
     if scope == ToolScope.SKILL and not owner:
         msg = "@register_tool(scope=SKILL) 必须指定 owner=<skill_name>"
         raise ValueError(msg)
+
+    # 🐛 2026-11-01 防御:scope=None 静默失效的根治。
+    #
+    # 背景:enroll_speaker 曾写成 scope=None(注释说"走默认 GLOBAL"),
+    # 但 None 会被原样传给 FunctionTool → tool.scope 真的变成 None →
+    # ToolRegistry.get_butler() 的 `t.scope in (GLOBAL, COMMON, BUTLER, SKILL)`
+    # 判断为 False → **工具注册成功但 LLM 永远看不见**。
+    #
+    # 为什么难查:不报错、不告警,只是"工具凭空消失"。
+    # 日志里 tool_count=2 而注册表里有 3 个工具,这种对不上极易被忽略。
+    #
+    # 现在把 None 归一化成 GLOBAL,与函数签名的默认值语义一致。
+    if scope is None:
+        scope = ToolScope.GLOBAL
 
     target_registry = registry if registry is not None else ToolRegistry.get_default()
 

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -22,6 +23,8 @@ from smartbutler.capabilities.tools.types import (
     ToolError,
     ToolResult,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def to_langchain_tool(
@@ -55,6 +58,43 @@ def _default_context_factory() -> ToolContext:
     return ToolContext(user_id="system", session_id="system")
 
 
+# ---------------------------------------------------------------------------
+# 日志辅助
+# ---------------------------------------------------------------------------
+
+_MAX_LOG_LEN = 200
+"""日志里参数/结果的最大长度,避免把整个 prompt / 长文本灌进日志。"""
+
+
+def _safe_args(kwargs: dict[str, Any]) -> str:
+    """把工具参数渲染成一行可读字符串(不抛异常)。
+
+    参数里可能有不可序列化对象,直接 repr 可能抛异常 —— 日志绝不能搞崩业务。
+    """
+    try:
+        parts = []
+        for k, v in kwargs.items():
+            text = repr(v)
+            if len(text) > 100:
+                text = text[:100] + "..."
+            parts.append(f"{k}={text}")
+        return ", ".join(parts) if parts else "(无参数)"
+    except Exception:  # noqa: BLE001
+        return "(参数渲染失败)"
+
+
+def _preview(content: Any) -> str:
+    """把工具返回内容截断成一行预览。"""
+    try:
+        text = content if isinstance(content, str) else repr(content)
+        text = text.replace("\n", " ")
+        if len(text) > _MAX_LOG_LEN:
+            text = text[:_MAX_LOG_LEN] + "..."
+        return text
+    except Exception:  # noqa: BLE001
+        return "(结果渲染失败)"
+
+
 def _build_from_function_tool(
     tool: FunctionTool,
     context_factory: Callable[[], ToolContext] | None,
@@ -69,13 +109,36 @@ def _build_from_function_tool(
         我们统一返回 str（ToolResult.content / error），简化 LLM 端处理。
         """
         ctx = factory()
+        # 🐛 2026-11-01 加日志:tool 调用链路是"LLM 有没有真的调工具"的唯一观测点。
+        # 之前完全静默,导致"工具注册了但 LLM 看不见"这类问题无从查证。
+        logger.info(
+            "🔧 tool 调用开始: %s args=%s",
+            tool.name,
+            _safe_args(kwargs),
+        )
         try:
             result = await tool.ainvoke(ctx, **kwargs)
         except ToolError as exc:
+            logger.warning(
+                "🔧 tool 调用失败: %s error=%s: %s",
+                tool.name,
+                type(exc).__name__,
+                exc,
+            )
             # ToolError 包成字符串错误，LLM 自主决策（重试 / 换工具 / 道歉）
             return f"[ToolError] {type(exc).__name__}: {exc}"
         if not result.success:
+            logger.warning(
+                "🔧 tool 返回失败: %s error=%s",
+                tool.name,
+                result.error or "unknown error",
+            )
             return f"[ToolError] {result.error or 'unknown error'}"
+        logger.info(
+            "🔧 tool 调用成功: %s → %s",
+            tool.name,
+            _preview(result.content),
+        )
         return result.content
 
     return StructuredTool.from_function(
@@ -99,12 +162,33 @@ def _build_from_base_tool(
 
     async def _coroutine(**kwargs: Any) -> str:
         ctx = factory()
+        logger.info(
+            "🔧 tool 调用开始: %s args=%s",
+            tool.name,
+            _safe_args(kwargs),
+        )
         try:
             result = await tool.ainvoke(ctx, **kwargs)
         except ToolError as exc:
+            logger.warning(
+                "🔧 tool 调用失败: %s error=%s: %s",
+                tool.name,
+                type(exc).__name__,
+                exc,
+            )
             return f"[ToolError] {type(exc).__name__}: {exc}"
         if not result.success:
+            logger.warning(
+                "🔧 tool 返回失败: %s error=%s",
+                tool.name,
+                result.error or "unknown error",
+            )
             return f"[ToolError] {result.error or 'unknown error'}"
+        logger.info(
+            "🔧 tool 调用成功: %s → %s",
+            tool.name,
+            _preview(result.content),
+        )
         return result.content
 
     return StructuredTool.from_function(

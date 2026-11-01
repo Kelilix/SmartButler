@@ -53,6 +53,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _rms(audio: np.ndarray) -> float:
+    """计算音频 RMS(用于诊断片段里有没有实际声音)。"""
+    if audio is None or len(audio) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.asarray(audio, dtype=np.float32) ** 2)))
+
+
 class VoiceAdapter:
     """语音交互集成入口。
 
@@ -374,6 +381,15 @@ class VoiceAdapter:
                 if self._registry:
                     sp_info = await self._registry.identify_speaker_info(embedding)
                     speakers = [sp_info]
+                    # 🐛 2026-11-01 加日志:识别结果是否成功挂到事件上。
+                    # 这一层能确认"识别成功了,但事件里没带上 speaker"这类
+                    # 中间环节丢失的问题。
+                    logger.info(
+                        "🗣️  声纹结果已挂载到事件: user_id=%s confidence=%.4f is_known=%s",
+                        sp_info.user_id,
+                        sp_info.confidence,
+                        sp_info.is_known,
+                    )
                 else:
                     speakers = [
                         SpeakerInfo(
@@ -383,8 +399,16 @@ class VoiceAdapter:
                             embedding=embedding,
                         )
                     ]
+                    # ⚠️ registry 缺失 → 永远识别不出身份
+                    logger.warning(
+                        "⚠️ 无声纹注册表(SpeakerRegistry 未注入)，跳过身份识别"
+                    )
             except Exception as e:
                 logger.warning("Speaker embedding failed", exc_info=e)
+        elif not self._embedder:
+            logger.warning("⚠️ 无声纹 embedder，跳过身份识别")
+        elif not asr_result:
+            logger.info("🔇 ASR 结果为空，跳过声纹识别")
 
         # 发布 VoiceEvent
         event = VoiceEvent.make(
@@ -444,20 +468,33 @@ class VoiceAdapter:
                     self._silence_ms += chunk_ms
                     # 3秒静默 → 保存当前片段
                     if self._silence_ms >= self._cfg.silence_timeout_ms:
+                        # 🐛 2026-11-01 加日志:片段被丢弃时也要打日志。
+                        # 之前只有"保存片段"有日志,被 MIN_SAMPLES_FOR_VALID_SEGMENT
+                        # 过滤掉的片段**完全静默** —— 用户明明说了话,却收到
+                        # "没有采集到有效音频",却不知道短在哪。
                         if len(self._buffer) >= MIN_SAMPLES_FOR_VALID_SEGMENT:
                             segment_audio = np.concatenate(self._buffer)
                             self._enrollment_audio.append(segment_audio)
                             logger.info(
-                                "声纹采集:保存第 %d 个片段,时长 %.1fs",
+                                "🎙️ 声纹采集: 保存第 %d 个片段, 时长=%.2fs, RMS=%.4f",
                                 len(self._enrollment_audio),
                                 self._buffer_ms / 1000,
+                                _rms(segment_audio),
+                            )
+                        else:
+                            logger.info(
+                                "🎙️ 声纹采集: 丢弃过短片段 (时长=%.2fs < 最短 %d 个 chunk)",
+                                self._buffer_ms / 1000,
+                                MIN_SAMPLES_FOR_VALID_SEGMENT,
                             )
                         self._buffer.clear()
                         self._buffer_ms = 0
                         self._silence_ms = 0
                         # 采集到足够片段自动退出（3句）
                         if len(self._enrollment_audio) >= 3:
-                            logger.info("声纹采集:已采集 3 个片段，退出采集模式")
+                            logger.info(
+                                "🎙️ 声纹采集: 已采集 3 个片段，退出采集模式"
+                            )
                             self._enrollment_mode = False
                             break
 
@@ -563,7 +600,9 @@ class VoiceAdapter:
         暂停正常监听，进入专注采集状态。
         采集过程中音频会缓存到 _enrollment_audio，不会发布 VoiceEvent。
         """
-        logger.info("VoiceAdapter 进入声纹采集模式")
+        logger.info(
+            "🎙️ VoiceAdapter 进入声纹采集模式（静默采集中，不发布 VoiceEvent）"
+        )
         self._enrollment_mode = True
         self._enrollment_audio.clear()
         self._enrollment_complete.clear()
@@ -576,8 +615,9 @@ class VoiceAdapter:
             list of (audio, sample_rate) tuples。每句独立采集为一个片段。
         """
         logger.info(
-            "VoiceAdapter 退出声纹采集模式，采集到 %d 个音频片段",
+            "🎙️ VoiceAdapter 退出声纹采集模式，采集到 %d 个音频片段（总时长 %.2fs）",
             len(self._enrollment_audio),
+            sum(len(a) / self._cfg.sample_rate for a in self._enrollment_audio),
         )
         self._enrollment_mode = False
         # 返回 (audio_array, sample_rate) 元组列表

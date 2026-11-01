@@ -11,12 +11,16 @@
 
 from __future__ import annotations
 
+import logging
+
 from smartbutler.capabilities.tools.base import BaseTool
 from smartbutler.capabilities.tools.types import (
     ToolAlreadyRegisteredError,
     ToolNotFoundError,
     ToolScope,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
@@ -62,6 +66,16 @@ class ToolRegistry:
                 return  # 幂等
             msg = f"Tool '{tool.name}' 已被注册（现有: {type(existing).__name__}）"
             raise ToolAlreadyRegisteredError(msg)
+        # 🐛 2026-11-01 加日志:注册时打出 scope。
+        #
+        # scope 决定 LLM 能否看到该工具(get_butler 过滤 AGENT)。
+        # 之前 scope=None 的 bug 之所以难查,就是因为注册日志里看不到 scope,
+        # 只有拿到"LLM 看不见"的现象后反推才找得到。
+        logger.info(
+            "📦 注册工具: %s scope=%s",
+            tool.name,
+            getattr(tool.scope, "value", tool.scope),
+        )
         self._tools[tool.name] = tool
 
     def unregister(self, name: str) -> None:
