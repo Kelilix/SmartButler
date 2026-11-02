@@ -37,6 +37,7 @@ class WinsoundAudioPlayer(BaseAudioPlayer):
 
     def __init__(self) -> None:
         self._is_windows = sys.platform == "win32"
+        super().__init__()
 
     async def play(self, audio_stream: AsyncIterator[bytes]) -> None:
         """Windows 播放音频流。

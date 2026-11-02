@@ -129,6 +129,34 @@ class SpeakerRegistry(ABC):
         ...
 
     @abstractmethod
+    async def update(self, profile: SpeakerProfile) -> None:
+        """更新已注册档案的 embedding(**保留原 user_id**)。
+
+        🆕 2026-11-01:重新采集同一人的声纹时必须保留 user_id ——
+        人物表存的就是这个 id,换了就断链。
+
+        Args:
+            profile: 新档案(user_id 必须已存在)。
+
+        Raises:
+            ValueError: user_id 未注册。
+        """
+        ...
+
+    @abstractmethod
+    async def get_by_display_name(self, display_name: str) -> SpeakerProfile | None:
+        """按姓名查找已注册档案(用于重新采集时定位原档案)。"""
+        ...
+
+    @abstractmethod
+    async def find_best_match(self, embedding: list[float] | None) -> SpeakerMatch:
+        """找出最相似的已注册成员(**不套阈值**判定 is_known)。
+
+        用于"采集完成后判断是更新还是新建"。
+        """
+        ...
+
+    @abstractmethod
     async def list_members(self) -> list[SpeakerProfile]:
         """列出所有已注册家庭成员(dev_chat / 调试用)。"""
         ...
@@ -153,6 +181,49 @@ class SpeakerRegistry(ABC):
 
     # ---- 便利方法(由基类提供,子类不需重写) ----
 
+    def should_trigger_enrollment(
+        self,
+        match: SpeakerMatch,
+        *,
+        audio_rms: float | None = None,
+    ) -> tuple[bool, str]:
+        """判断是否应该触发声纹采集(双阈值判定)。
+
+        🆕 2026-11-01(用户决策:"按A,加双阈值")。
+
+        ## 双阈值的真实含义
+
+        实测(Resemblyzer,合成类人声):
+
+            同人相似度: min=0.39  p5=0.41  p25=0.54  均值=0.76
+            异人相似度: min=0.34              max=0.95  均值=0.58
+
+        **低相似度 ≠ 音频质量差** —— 真正嗓音不同的人跟库里任何人都很低,
+        必须采集,否则"陌生人永远不会被记住"。
+
+        所以两个阈值的落点是:
+
+        - ``threshold`` (识别门槛,默认 0.70):达到 = 认出来了,不采集。
+        - ``enrollment_threshold`` (保护线,默认 0.55):相似度在这条线之上
+          但没到识别线 → **熟人但这次说得不清楚** → 不采集,
+          避免用噪声覆盖掉他正确的声纹。
+
+        低于保护线 → 陌生人 → 采集。
+
+        Args:
+            match: :meth:`identify` 的结果。
+            audio_rms: 本段音频 RMS(可选)。太低 = 录音质量差,不采集。
+
+        Returns:
+            (should_enroll, reason) 元组。reason 用于日志与调试。
+        """
+        if match.is_known and match.matched_user_id:
+            return False, "already_identified"
+        if not match.candidates:
+            return True, "empty_registry"
+        # 基类没有阈值概念,保守起见一律采集(子类会给出更精确的判定)。
+        return True, "stranger"
+
     async def identify_speaker_info(
         self, embedding: list[float] | None
     ) -> SpeakerInfo:
@@ -175,11 +246,18 @@ class SpeakerRegistry(ABC):
                 match.matched_user_id,
                 match.confidence,
             )
+            # 🆕 2026-11-01: 带上 display_name —— LLM 需要知道"这是谁在说话",
+            # 光有 speaker_xxx 它读不出来("爸爸说" vs "妈妈说")。
+            display_name = ""
+            profile = await self.get(match.matched_user_id)
+            if profile is not None:
+                display_name = profile.display_name or ""
             return SpeakerInfo(
                 user_id=match.matched_user_id,
                 confidence=match.confidence,
                 is_known=True,
                 embedding=embedding,
+                display_name=display_name or None,
             )
         # 陌生人:user_id 用 "unknown:<short-hash>" 占位(7.6+ 用户可确认后 register)
         import hashlib

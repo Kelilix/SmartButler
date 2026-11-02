@@ -48,6 +48,23 @@ class ButlerState(MessagesState):
     # - format_for_prompt 时注入 system prompt 作为"短期片段"
     # - 默认 ""(没历史 task 时为空)
     last_task_summary: str
+    # 🆕 2026-11-01: 本轮的"当前对话用户"上下文(每轮变化,必须放 state)。
+    #
+    # 为什么不能只放 system prompt:
+    #   system prompt 是**编译期**产物(ButlerGraphBuilder.build 时拼好,
+    #   塞进 decide_node 的闭包)。而"当前在跟谁说话"是**每轮变化**的 ——
+    #   爸爸说完妈妈说,同一条 thread 里 user_id 一直在变。
+    #
+    #   之前只改 orchestrator._current_user_id 而不重建 graph,
+    #   prompt 里就停留在上一轮的值 → LLM 被告知"你在跟爸爸说话",
+    #   实际是妈妈在说话。
+    #
+    # 现在:user_id 放 state(每轮自然带入),decide_node 每轮据此
+    # 动态渲染"当前会话上下文"段,拼在 SystemMessage 后面。
+    current_user_id: str
+    # 🆕 2026-11-01: 本轮说话人的可读姓名(声纹库 display_name)。
+    # LLM 需要知道"这是谁在说话"而不只是一串 speaker_xxx。
+    current_user_name: str
 
 
 class ButlerStateDelta(TypedDict, total=False):

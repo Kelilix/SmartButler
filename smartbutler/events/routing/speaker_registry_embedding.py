@@ -28,6 +28,12 @@ from smartbutler.events.routing.speaker_registry import (
 
 logger = logging.getLogger(__name__)
 
+# 🆕 2026-11-01: 采集时的最低音频 RMS。
+#
+# 低于这个值说明录到的是静音/底噪,拿去建档只会污染声纹。
+# 正常说话(麦克风增益下)RMS 通常在 0.01 以上。
+MIN_AUDIO_RMS_FOR_ENROLLMENT = 0.005
+
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     """计算两个向量的余弦相似度。
@@ -81,15 +87,34 @@ class EmbeddingSpeakerRegistry(SpeakerRegistry):
         self,
         embedder: Any,  # BaseSpeakerEmbedder,使用 Any 避免循环 import
         threshold: float = SPEAKER_MATCH_THRESHOLD,
+        enrollment_threshold: float | None = None,
     ) -> None:
         """
         Args:
             embedder: 声纹 embedding 生成器(ResemblyzerEmbedder / EcapaTdnnEmbedder)。
                 用于 enroll 时验证 embedding 维度。
             threshold: 余弦相似度阈值,低于此值视为陌生人。
+            enrollment_threshold: 🆕 2026-11-01 采集触发阈值(双阈值)。
+
+                **为什么需要双阈值**:低于 ``threshold`` 有两种完全不同的原因:
+                  - 真的是陌生人 → 应该采集
+                  - 是熟人但这次说得含糊/环境吵 → **不该采集**
+
+                如果一律采集,后者会用噪声覆盖掉正确的声纹,越用越差。
+                所以:
+                  - 相似度 >= threshold                → 识别成功
+                  - enrollment_threshold <= 相似度 < threshold → 陌生人,触发采集
+                  - 相似度 < enrollment_threshold         → 疑似音频质量差,**不采集**
+
+                默认取 ``threshold * 0.78``(0.70 → 0.546)。
         """
         self._embedder = embedder
         self._threshold = threshold
+        self._enrollment_threshold = (
+            enrollment_threshold
+            if enrollment_threshold is not None
+            else threshold * 0.78
+        )
         self._store: dict[str, SpeakerProfile] = {}
 
     async def register(self, profile: SpeakerProfile) -> None:
@@ -119,6 +144,169 @@ class EmbeddingSpeakerRegistry(SpeakerRegistry):
     async def get(self, user_id: str) -> SpeakerProfile | None:
         """获取已注册档案。"""
         return self._store.get(user_id)
+
+    async def update(self, profile: SpeakerProfile) -> None:
+        """更新已注册档案的 embedding(**保留原 user_id**)。
+
+        🆕 2026-11-01(用户决策:"按A,更新embedding,保留原user_id")。
+
+        为什么需要:重新采集声纹时,**必须保留 user_id** —— 人物表里存的就是
+        这个 id,换了就断链。所以"更新声纹"和"新建档案"是两件不同的事:
+          - 声纹相似度 >= 阈值 → update(覆盖 embedding,user_id 不变)
+          - 声纹相似度 <  阈值 → register(全新的人,新 user_id)
+
+        Args:
+            profile: 新的档案(``user_id`` 必须与已存在的档案一致)。
+
+        Raises:
+            ValueError: user_id 未注册,或 embedding 为 None。
+        """
+        if profile.user_id not in self._store:
+            msg = f"user_id={profile.user_id!r} 未注册，无法更新"
+            raise ValueError(msg)
+        if profile.embedding is None:
+            msg = "EmbeddingSpeakerRegistry 要求 embedding 必须非 None"
+            raise ValueError(msg)
+
+        # ⚠️ 保留原 user_id(虽然 profile 里也是同一个,这里显式强调语义)
+        self._store[profile.user_id] = profile
+        logger.info(
+            "🔄 声纹档案已更新: user_id=%s display_name=%s (user_id 保持不变)",
+            profile.user_id,
+            profile.display_name,
+        )
+
+    async def get_by_display_name(self, display_name: str) -> SpeakerProfile | None:
+        """按姓名查找已注册档案。
+
+        用于"重新采集同一人的声纹"时定位原档案。
+        """
+        target = display_name.strip()
+        for profile in self._store.values():
+            if profile.display_name.strip() == target:
+                return profile
+        return None
+
+    async def find_best_match(
+        self, embedding: list[float] | None
+    ) -> SpeakerMatch:
+        """找出最相似的已注册成员(不套用 is_known 判定)。
+
+        用于"采集完成后判断是更新还是新建":拿新采集的声纹去比对,
+        相似度够高 → 是已注册的人 → update;不够 → 新建。
+
+        与 :meth:`identify` 的区别:``identify`` 会套 ``_threshold``
+        判定 is_known;这里只返回最相似的那一个,由调用方自己决定阈值。
+
+        Args:
+            embedding: 声纹向量。
+
+        Returns:
+            SpeakerMatch: matched_user_id 为最相似的 user_id(即便低于阈值),
+            confidence 为相似度,is_known 恒为 False(不套阈值)。
+        """
+        if embedding is None:
+            return SpeakerMatch(
+                matched_user_id=None,
+                confidence=0.0,
+                is_known=False,
+                is_above_threshold=False,
+                candidates=(),
+            )
+
+        candidates: list[tuple[str, float]] = []
+        for user_id, profile in self._store.items():
+            if profile.embedding is None:
+                continue
+            similarity = cosine_similarity(embedding, profile.embedding)
+            candidates.append((user_id, similarity))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        if not candidates:
+            return SpeakerMatch(
+                matched_user_id=None,
+                confidence=0.0,
+                is_known=False,
+                is_above_threshold=False,
+                candidates=(),
+            )
+
+        best_user_id, best_similarity = candidates[0]
+        return SpeakerMatch(
+            matched_user_id=best_user_id,
+            confidence=best_similarity,
+            is_known=False,  # 不套阈值,由调用方判断
+            is_above_threshold=best_similarity >= self._threshold,
+            candidates=tuple(candidates),
+        )
+
+    def should_trigger_enrollment(
+        self,
+        match: SpeakerMatch,
+        *,
+        audio_rms: float | None = None,
+    ) -> tuple[bool, str]:
+        """判断是否应该触发声纹采集(双阈值判定)。
+
+        🆕 2026-11-01(用户决策:"按A,加双阈值")。
+
+        ## 双阈值的真实含义
+
+        实测(Resemblyzer,4 个说话人 × 5 句,合成类人声):
+
+            同人相似度: min=0.39  p5=0.41  p25=0.54  均值=0.76
+            异人相似度: min=0.34              max=0.95  均值=0.58
+
+        注意 **异人相似度可以低到 0.34** —— 真正嗓音完全不同的人,
+        跟库里任何人的相似度都很低。所以:
+
+        - **低相似度 ≠ 音频质量差**。第一次见面的人就是低相似度,
+          必须采集!否则"陌生人永远不会被记住"。
+        - **高相似度但未达识别阈值** → 这才是需要保护的场景:
+          熟人这次说得含糊 / 环境噪音,不该用噪声覆盖他正确的声纹。
+
+        因此两个阈值的落点是:
+
+        - ``_threshold`` (match,默认 0.70):**识别**门槛。
+          达到 = 认出来了,不采集。
+        - ``_enrollment_threshold`` (默认 0.55):**保护线**。
+          相似度落在这条线之上但没到识别线 → 是熟人但这次不清楚 →
+          **不采集**(避免污染声纹),交由 LLM 用别的方式确认身份。
+
+        低于保护线 → 就是陌生人 → **采集**。
+
+        Args:
+            match: :meth:`identify` 的结果。
+            audio_rms: 本段音频的 RMS(可选)。太低说明录音质量差,
+                此时不采集(避免拿噪声建档)。
+
+        Returns:
+            (should_enroll, reason) 元组。reason 用于日志与调试。
+        """
+        if match.is_known and match.matched_user_id:
+            return False, "already_identified"
+
+        # 音频质量保护:RMS 太低 → 录到的是静音/噪声,采了也没用
+        if audio_rms is not None and audio_rms < MIN_AUDIO_RMS_FOR_ENROLLMENT:
+            return False, "poor_audio_quality"
+
+        if not match.candidates:
+            # 声纹库为空 —— 没别的办法,只能采集
+            return True, "empty_registry"
+
+        best_similarity = match.candidates[0][1]
+        if best_similarity >= self._enrollment_threshold:
+            # 相似度够高但没到识别线 —— 是熟人但这次说得不清楚。
+            # 不采集,避免用噪声覆盖掉他正确的声纹。
+            return False, "ambiguous_similar_not_enough"
+
+        # 低于保护线 → 判定为陌生人 → 采集
+        return True, "stranger"
+
+    @property
+    def enrollment_threshold(self) -> float:
+        """声纹保护线(双阈值的下界)。"""
+        return self._enrollment_threshold
 
     async def list_members(self) -> list[SpeakerProfile]:
         """列出所有已注册家庭成员。"""

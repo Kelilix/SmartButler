@@ -154,7 +154,12 @@ class TTSOutputAdapter(OutputAdapter):
 
                 # 2. 播放音频流
                 if self._player:
-                    await self._player.play(audio_stream)
+                    # 🆕 2026-11-01 (Phase 7.6.1): 用 play_gated 而不是裸 play。
+                    #
+                    # 这是 **Agent 正常回复的播放路径**(走 AnswerRouter →
+                    # TTSOutputAdapter → player)。如果不加门控,管家说话时
+                    # 麦克风会把管家自己的声音录进声纹。
+                    await self._player.play_gated(audio_stream)
                 else:
                     # 没有播放器:只生成音频流(测试用)
                     async for _ in audio_stream:

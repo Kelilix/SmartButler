@@ -56,6 +56,8 @@ import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
+
 from smartbutler.config.logging import load_logging_settings
 from smartbutler.config.voice import load_voice_settings
 from smartbutler.utils import configure_logging
@@ -234,6 +236,75 @@ async def create_voice_service(config: VoiceServiceConfig):
         logger.info("  ✓ enroll_speaker Tool 已就绪")
     except Exception as e:
         logger.warning("  ⚠ enroll_speaker Tool 注入失败: %s", e)
+
+    # 🆕 2026-11-01: 声纹自动注册(用户决策:"按A,自动注册")。
+    #
+    # 链路:
+    #   采集够 3 句 → VoiceAdapter._fire_enrollment_complete
+    #              → 本回调 → VoiceprintEnrollmentService
+    #              → find_best_match 判"更新 or 新建" → 落库
+    #
+    # 关键:这一步在**后台**完成,不阻塞 LLM —— LLM 那轮对话早就返回了。
+    if speaker_registry is not None and embedder is not None:
+        try:
+            from smartbutler.capabilities.tools.voice.enroll_speaker import (
+                take_pending_context,
+            )
+            from smartbutler.events.routing.voiceprint_enrollment import (
+                VoiceprintEnrollmentService,
+            )
+
+            enrollment_service = VoiceprintEnrollmentService(
+                registry=speaker_registry,
+                embedder=embedder,
+            )
+
+            async def _on_enrollment_complete(
+                segments: list[tuple[np.ndarray, int]],
+            ) -> None:
+                """采集完成 → 自动注册/更新声纹(后台)→ TTS 播报结果。
+
+                🆕 2026-11-01 (Phase 7.6.1): 注册完成后**播报一次**结果。
+
+                用户决策:"采集期间不需要逐句播报,采集开始前一次播报,
+                采集后播报记住了" —— 所以这里播报最终结果即可。
+
+                注意:这段 TTS 在采集模式**之外**播放,所以不会被录进声纹;
+                而且 player 的回声门控会保护后续的正常对话。
+                """
+                ctx = take_pending_context()
+                result = await enrollment_service.enroll_from_segments(
+                    segments,
+                    display_name=ctx.get("display_name"),
+                    known_user_id=ctx.get("user_id"),
+                )
+                logger.info(
+                    "🆔 声纹自动注册完成: status=%s user_id=%s display_name=%s similarity=%.4f",
+                    result.status,
+                    result.user_id,
+                    result.display_name,
+                    result.similarity,
+                )
+
+                # 🔊 播报结果(用户反馈闭环)
+                name = result.display_name or ctx.get("display_name") or "你"
+                if result.status in ("registered", "updated"):
+                    if result.sample_count and result.sample_count < 3:
+                        await voice_adapter.speak(
+                            f"记住了，{name}。不过你说得有点少，"
+                            f"以后多说说会更准。"
+                        )
+                    else:
+                        await voice_adapter.speak(f"记住了，{name}。以后我能听出是你了。")
+                else:
+                    await voice_adapter.speak(
+                        "抱歉，没听清，方便再说一次吗？"
+                    )
+
+            voice_adapter.set_enrollment_callback(_on_enrollment_complete)
+            logger.info("  ✓ 声纹自动注册已启用")
+        except Exception as e:
+            logger.warning("  ⚠ 声纹自动注册初始化失败: %s", e)
 
     # 6. 创建 TTSOutputAdapter (实现 OutputAdapter 接口)
     logger.info("[4/5] 初始化 TTS 输出适配器...")

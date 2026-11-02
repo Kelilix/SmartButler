@@ -119,6 +119,14 @@ class SpeakerInfo(BaseModel):
         description="同一段语音内的说话人片段 ID(0/1/2...)",
     )
     language: str | None = Field(default=None, description="BCP-47 语种代码")
+    display_name: str | None = Field(
+        default=None,
+        description=(
+            "说话人的可读姓名(如'爸爸'/'妈妈')。"
+            "🆕 2026-11-01:LLM 需要知道'这是谁在说话',"
+            "光有 speaker_xxx 它读不出来。"
+        ),
+    )
 
 
 class BaseEvent(BaseModel):

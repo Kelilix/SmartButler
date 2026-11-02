@@ -43,6 +43,7 @@ class PygameAudioPlayer(BaseAudioPlayer):
         self._stream = None
         self._initialized = False
         self._sample_rate: int | None = None
+        super().__init__()
 
     def _ensure_init(self, sample_rate: int | None = None) -> None:
         """懒加载并初始化 pygame mixer。
@@ -153,6 +154,7 @@ class FakeAudioPlayer(BaseAudioPlayer):
 
     def __init__(self) -> None:
         self._played: list[bytes] = []
+        super().__init__()
 
     async def play(self, audio_stream: AsyncIterator[bytes]) -> None:
         async for chunk in audio_stream:

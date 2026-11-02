@@ -55,12 +55,26 @@ def make_decide_node(
         prev_count = int(state.get("iteration_count", 0))
         new_count = prev_count + 1
 
-        # 拼 messages:system prompt + state.messages
+        # 🆕 2026-11-01: "当前会话上下文"段**每轮动态渲染**。
+        #
+        # 为什么不能只放在编译期的 system prompt 里:
+        #   system prompt 是 build() 时拼好的,塞进闭包。而"当前在跟谁说话"
+        #   是每轮变化的 —— 爸爸说完妈妈说,同一条 thread 里 user_id 一直在变。
+        #   之前只改 orchestrator._current_user_id 而不重建 graph,
+        #   prompt 里就停留在上一轮的值 → LLM 被告知"你在跟爸爸说话",
+        #   实际是妈妈在说话。
+        #
+        # 现在从 state 每轮读,永远和本轮 user_id 一致。
+        session_context = _render_session_context(
+            current_user_id=state.get("current_user_id", ""),
+            current_user_name=state.get("current_user_name", ""),
+        )
+
+        # 拼 messages:system prompt + session context + state.messages
         # state.messages 第一条通常是 user,系统 prompt 由本节点前置
         state_messages = state.get("messages", [])
         if not state_messages:
-            _logger.warning("decide_node.empty_state_messages")
-            # 防御:不该发生(state schema 必有 messages)
+            _logger.warning("decide_node.empty_state_messages")            # 防御:不该发生(state schema 必有 messages)
             return {
                 "messages": [
                     AIMessage(content="(内部错误: 输入消息为空,请重试。)"),
@@ -79,6 +93,16 @@ def make_decide_node(
             llm_messages = list(state_messages)
         else:
             llm_messages = [SystemMessage(content=system_prompt), *state_messages]
+
+        # 把"当前会话上下文"插在 system prompt 之后、用户消息之前。
+        # ⚠️ 不能追加到 messages 末尾 —— 那会变成"用户说完话之后管家才被告知
+        # 用户是谁",LLM 读到的顺序就反了。
+        if session_context:
+            llm_messages = [
+                llm_messages[0],
+                SystemMessage(content=session_context),
+                *llm_messages[1:],
+            ]
 
         # 调 LLM —— 错误回流(异常包成 AIMessage),让 LangGraph 走到 END 不再循环
         try:
@@ -130,6 +154,38 @@ def make_decide_node(
         }
 
     return decide_node
+
+
+def _render_session_context(
+    *, current_user_id: str, current_user_name: str = ""
+) -> str:
+    """渲染"当前会话上下文"段(2026-11-01)。
+
+    🆕 从编译期的 system prompt 挪到**每轮 state 驱动**。
+
+    为什么:system prompt 是 build() 时拼死的,而"当前在跟谁说话"每轮都在变
+    (爸爸说完妈妈说)。只改 orchestrator._current_user_id 而不重建 graph,
+    prompt 里就停留在上一轮的值 —— LLM 被告知"你在跟爸爸说话",
+    实际是妈妈在说话。现在每轮从 state 读,永远一致。
+
+    Args:
+        current_user_id: 本轮说话人的 user_id(如 ``speaker_xxx``)。
+        current_user_name: 本轮说话人的可读姓名(如 ``"爸爸"``)。
+
+    Returns:
+        渲染后的 markdown 段;current_user_id 为空时返回 ""(不注入)。
+    """
+    if not current_user_id or not current_user_id.strip():
+        return ""
+
+    who = current_user_name.strip() or current_user_id
+    return (
+        "## 当前会话上下文\n"
+        f"- 当前对话用户: **{who}** (user_id: {current_user_id})\n"
+        f"- **重要**:你正在和【{who}】对话,不要把其他人说过的话当成眼前用户的身份。\n"
+        "  历史记忆里每条都有 \"[xxx 说]\" 前缀,这是信息来源标记——如果前缀不是【"
+        f"{who}】,那说明这条记忆是别人说的,与当前对话用户无关。"
+    )
 
 
 __all__ = ["make_decide_node", "LLMCallable"]

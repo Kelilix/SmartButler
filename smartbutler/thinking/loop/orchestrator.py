@@ -526,6 +526,8 @@ class ButlerOrchestrator:
         }
         if speakers_dicts is not None:
             human_kwargs["speakers"] = speakers_dicts
+        # 🆕 2026-11-01: 解析本轮说话人的可读姓名(声纹库 display_name)。
+        current_user_name = self._resolve_user_name(speakers)
         initial_state: ButlerState = {
             "messages": [HumanMessage(content=user_input.strip(), additional_kwargs=human_kwargs)],
             "user_id": user_id,
@@ -534,6 +536,9 @@ class ButlerOrchestrator:
             "skill_prompt_snippets": list(self._skill_prompt_snippets),
             "iteration_count": 0,
             "max_iterations": DEFAULT_MAX_ITERATIONS,
+            # 🆕 每轮动态注入 —— decide_node 据此渲染"当前会话上下文"
+            "current_user_id": user_id,
+            "current_user_name": current_user_name,
         }
         config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
         result = await compiled.ainvoke(initial_state, config=config)
@@ -604,6 +609,8 @@ class ButlerOrchestrator:
         }
         if speakers_dicts is not None:
             human_kwargs_a["speakers"] = speakers_dicts
+        # 🆕 2026-11-01: 解析本轮说话人的可读姓名(声纹库 display_name)
+        current_user_name = self._resolve_user_name(speakers)
         initial_state: ButlerState = {
             "messages": [HumanMessage(content=user_input.strip(), additional_kwargs=human_kwargs_a)],
             "user_id": user_id,
@@ -612,6 +619,9 @@ class ButlerOrchestrator:
             "skill_prompt_snippets": list(self._skill_prompt_snippets),
             "iteration_count": 0,
             "max_iterations": DEFAULT_MAX_ITERATIONS,
+            # 🆕 每轮动态注入 —— decide_node 据此渲染"当前会话上下文"
+            "current_user_id": user_id,
+            "current_user_name": current_user_name,
         }
         config: dict[str, Any] = {"configurable": {"thread_id": session_id}}
         async for event in compiled.astream(initial_state, config=config, stream_mode="values"):
@@ -648,6 +658,40 @@ class ButlerOrchestrator:
             session_id=f"proactive-{event.event_id}",
         )
         return await loop.tick(event)
+
+    @staticmethod
+    def _resolve_user_name(speakers: list[Any] | None) -> str:
+        """从 speakers 里取本轮说话人的可读姓名(2026-11-01)。
+
+        声纹库里有 ``display_name``(爸爸/妈妈),但 :class:`SpeakerInfo`
+        只带 ``user_id`` + ``confidence`` + ``is_known``。所以这里
+        从 ``user_id`` 反查 registry 拿姓名。
+
+        拿不到就返回 "" —— decide_node 会退化成只显示 user_id。
+
+        Args:
+            speakers: 本轮声纹识别结果。
+
+        Returns:
+            姓名(如"爸爸");拿不到时返回 ""。
+        """
+        if not speakers:
+            return ""
+        sp = speakers[0]
+        if not getattr(sp, "is_known", False):
+            # 陌生人:没有档案,拿不到姓名
+            return ""
+
+        user_id = getattr(sp, "user_id", "")
+        if not user_id:
+            return ""
+
+        # SpeakerInfo 上可能已经带了 display_name(有就用)
+        direct = getattr(sp, "display_name", "")
+        if direct:
+            return str(direct)
+
+        return ""
 
     async def _get_or_build_proactive_loop(
         self,

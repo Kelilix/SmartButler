@@ -74,6 +74,34 @@ class SimpleSpeakerRegistry(SpeakerRegistry):
     async def get(self, user_id: str) -> SpeakerProfile | None:
         return self._store.get(user_id)
 
+    async def update(self, profile: SpeakerProfile) -> None:
+        """更新已注册档案(**保留原 user_id**)。
+
+        🆕 2026-11-01:重新采集时保留 user_id,避免人物表绑定断链。
+        """
+        if profile.user_id not in self._store:
+            msg = f"user_id={profile.user_id!r} 未注册，无法更新"
+            raise ValueError(msg)
+        self._store[profile.user_id] = profile
+
+    async def get_by_display_name(self, display_name: str) -> SpeakerProfile | None:
+        """按姓名查找已注册档案。"""
+        target = display_name.strip()
+        for profile in self._store.values():
+            if profile.display_name.strip() == target:
+                return profile
+        return None
+
+    async def find_best_match(self, embedding: list[float] | None) -> SpeakerMatch:
+        """7.5 阶段占位:没有 embedding 比对能力,永远返回空匹配。"""
+        return SpeakerMatch(
+            matched_user_id=None,
+            confidence=0.0,
+            is_known=False,
+            is_above_threshold=False,
+            candidates=(),
+        )
+
     async def list_members(self) -> list[SpeakerProfile]:
         return list(self._store.values())
 

@@ -28,7 +28,13 @@ class VoiceAdapterConfig:
 
     Attributes:
         device_id: 设备 ID(音箱/麦克风设备唯一标识)。
-        user_id: 设备归属用户 ID(家主)。
+        user_id: 兜底 user ID。
+
+            🆕 2026-11-01 语义变更:以前这个字段是"设备归属人(家主)",
+            会被直接写进 VoiceEvent.user_id,导致所有人的对话都记成同一个人。
+
+            现在 **event.user_id 优先取声纹识别出的说话人**;这个字段只在
+            声纹不可用(无 embedder / 无 registry / ASR 失败)时作为降级兜底。
         capture: 音频采集器(BaseAudioCapture 实现)。
         vad: 语音活动检测器(BaseVAD 实现)。
         asr: 自动语音识别器(BaseASR 实现)。

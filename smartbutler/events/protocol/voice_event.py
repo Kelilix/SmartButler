@@ -53,6 +53,16 @@ class VoiceAction(StrEnum):
     COMMAND = "command"          # 唤醒后用户说话
     INTERRUPT = "interrupt"      # 用户打断
     SILENT = "silent"            # 唤醒后无语音(放弃)
+    # 🆕 2026-11-01 (Phase 7.6.1): 声纹采集同意窗口内的用户回答。
+    #
+    # 场景:Agent 问"方便让我记住你的声音吗?" → 用户回"要"/"不用"
+    # → VoiceAdapter 在 CONFIRMING 状态下发这个事件,把原话交给 LLM 判定。
+    #
+    # 为什么不直接发 COMMAND:
+    #   COMMAND 会触发完整的"理解意图 → 作答 → 工具调用"链路,
+    #   而这里 LLM 只需要做一个**是/否**判断。用独立 action 可以让
+    #   路由层把它导向专门的确认处理分支,避免误触发普通对话逻辑。
+    CONFIRM_ANSWER = "confirm_answer"
 
 
 class VoiceEvent(BaseEvent):
@@ -74,6 +84,29 @@ class VoiceEvent(BaseEvent):
         default=None,
         description="音频元数据(采样率 / 声道 / VAD 信息)",
     )
+    # 🆕 2026-11-01 (Phase 7.6.1): 是否**建议**询问用户登记声纹。
+    #
+    # ⚠️ 语义边界(极易误解):
+    #   True = "这个人是陌生人,且音频质量达标,**可以**问用户要不要录声纹"
+    #   False = 不建议问
+    #   **不代表已经采集**,也不代表用户已经同意。
+    #
+    # 改造前:VoiceAdapter 判定陌生人后**直接**启动采集(后台静默)。
+    # 改造后:VoiceAdapter 只**标记**,由 Agent(LLM)决定要不要开口打断用户
+    #         —— 用户可能只是随口一句话,不值得为此打断。
+    #
+    # 真正的采集启动必须走:用户明确同意 → LLM 调 enroll_speaker(confirm=True)。
+    suggest_enrollment: bool = Field(
+        default=False,
+        description="是否建议询问用户登记声纹(仅表示'可以问',不代表已采集/已同意)",
+    )
+    # 🆕 2026-11-01 (Phase 7.6.1): 触发建议的原因(可观测/调试)。
+    # 取值见 SpeakerRegistry.should_trigger_enrollment():
+    #   "stranger" / "empty_registry" / "no_registry"
+    enrollment_reason: str = Field(
+        default="",
+        description="建议询问登记声纹的原因(如 stranger / empty_registry)",
+    )
 
     @classmethod
     def make(
@@ -92,11 +125,16 @@ class VoiceEvent(BaseEvent):
         payload: dict[str, Any] | None = None,
         timestamp: datetime | None = None,
         speakers: list[SpeakerInfo] | None = None,
+        suggest_enrollment: bool = False,
+        enrollment_reason: str = "",
     ) -> VoiceEvent:
         """工厂方法。
 
         🆕 7.6 声纹扩展:``speakers`` 传入声纹识别结果(7.5 阶段默认 None = 空 list)。
         7.6 之前不传,默认空 list,老调用零修改。
+
+        🆕 2026-11-01 (Phase 7.6.1): ``suggest_enrollment`` / ``enrollment_reason``
+        告诉 Agent"这个人是陌生人,可以问要不要录声纹"。**不代表已采集**。
         """
         topic = f"voice.{action.value}"
         return cls(
@@ -115,6 +153,8 @@ class VoiceEvent(BaseEvent):
             payload=payload or {},
             timestamp=timestamp or datetime.now().astimezone(),
             speakers=speakers or [],
+            suggest_enrollment=suggest_enrollment,
+            enrollment_reason=enrollment_reason,
         )
 
     def to_user_input(self) -> str:
@@ -138,12 +178,42 @@ class VoiceEvent(BaseEvent):
             if self.speakers:
                 speaker_strs = []
                 for sp in self.speakers:
-                    tag = sp.user_id
-                    if not sp.is_known:
+                    # 🆕 2026-11-01: 优先显示姓名(display_name),
+                    # 让 LLM 读得懂"爸爸说"/"妈妈说"而不是一串 speaker_xxx。
+                    if sp.is_known:
+                        tag = sp.display_name or sp.user_id
+                    else:
                         tag = f"陌生人({sp.user_id})"
                     speaker_strs.append(f"{tag}({sp.confidence:.0%})")
                 parts.append(f"[会话参与者:{'+'.join(speaker_strs)}]")
+
+            # 🆕 2026-11-01 (Phase 7.6.1): 告诉 Agent"这个人是陌生人,
+            # **可以**问要不要录声纹"。
+            #
+            # ⚠️ 这里只是"建议",不代表已采集、也不代表用户已同意。
+            # Agent 可以选择忽略(用户只是随口一句,不值得打断)。
+            if self.suggest_enrollment:
+                parts.append(
+                    "[可询问登记声纹:当前说话人是陌生人且音频质量可用,"
+                    "你可以自然地询问对方是否愿意让你记住他的声音,"
+                    "并顺便问出对方的名字。必须得到明确同意后才能调用 enroll_speaker]"
+                )
             return " ".join(parts)
+
+        # 🆕 2026-11-01 (Phase 7.6.1): 声纹采集同意窗口的回答。
+        #
+        # 这是一个**是/否**判断,不是普通对话。单独走这个分支,
+        # 避免 LLM 把"要"/"不用"当成正常指令去理解。
+        if self.action == VoiceAction.CONFIRM_ANSWER:
+            parts = [
+                "[声纹采集确认] 刚才询问用户是否愿意登记声纹,用户的回答是:",
+                f'"{self.asr_text}"',
+                "[请判断这是同意还是拒绝:同意(如 要/好/可以/行/yes)→ "
+                "调用 enroll_speaker(display_name=..., confirm=true);"
+                "拒绝(如 不用/不要/算了/no)或无法判断 → 不要调用该工具,继续正常对话]",
+            ]
+            return " ".join(parts)
+
         # 其他情况(唤醒/打断/静默)走标准事件格式
         parts: list[str] = [
             f"[系统事件] 语音事件: {self.action.value}",

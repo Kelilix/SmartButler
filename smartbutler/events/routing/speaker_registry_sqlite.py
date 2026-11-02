@@ -89,12 +89,15 @@ class SQLiteSpeakerRegistry(EmbeddingSpeakerRegistry):
         db_path: Path | str = Path("data/speakers.db"),
         *,
         threshold: float = 0.70,
+        enrollment_threshold: float | None = None,
     ) -> None:
         """
         Args:
             embedder: 声纹 embedding 生成器(EcapaTdnnEmbedder / ResemblyzerEmbedder)。
             db_path: SQLite 数据库路径，父目录不存在会自动创建。
             threshold: 余弦相似度阈值。
+            enrollment_threshold: 🆕 2026-11-01 采集触发阈值(双阈值的下界)。
+                None = threshold * 0.78。
         """
         db_path = Path(db_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,8 +106,15 @@ class SQLiteSpeakerRegistry(EmbeddingSpeakerRegistry):
         self._conn: aiosqlite.Connection | None = None
 
         # 先初始化内存 dict（不调用 super().__init__，避免加载）
+        # ⚠️ 但**必须**手动同步父类新增的字段 —— 父类 __init__ 不跑,
+        # _enrollment_threshold 就不会存在,should_trigger_enrollment 会 AttributeError。
         self._embedder = embedder
         self._threshold = threshold
+        self._enrollment_threshold = (
+            enrollment_threshold
+            if enrollment_threshold is not None
+            else threshold * 0.78
+        )
         self._store: dict[str, SpeakerProfile] = {}
 
     async def start(self) -> None:
@@ -210,6 +220,17 @@ class SQLiteSpeakerRegistry(EmbeddingSpeakerRegistry):
     async def register(self, profile: SpeakerProfile) -> None:
         """注册家庭成员，写入内存 + SQLite。"""
         await super().register(profile)
+        await self._save_to_db(profile)
+
+    async def update(self, profile: SpeakerProfile) -> None:
+        """更新声纹档案，写入内存 + SQLite。
+
+        🆕 2026-11-01:父类加了 update() 后,这里必须覆写 —— 否则
+        重新采集更新声纹时**只改内存不落库**,重启就丢了。
+
+        user_id 保持不变(用户决策:"更新embedding,保留原user_id")。
+        """
+        await super().update(profile)
         await self._save_to_db(profile)
 
     async def unregister(self, user_id: str) -> bool:
