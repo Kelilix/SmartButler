@@ -654,8 +654,83 @@ class TaskSegmenter:
                         "WHERE task_id = ? AND status IN ('ongoing', 'paused')",
                         (_now_iso(), tid),
                     )
+                # 🆕 2026-11-02: participants 累积更新
+                #
+                # 为什么:participants 原本只在 `start_new` 时算一次
+                # (那一轮参与的人)。后续轮次新加入的说话人**不会**被记进去 ——
+                # 多人家庭里 task 常常是"爸爸先开,妈妈中途加入",
+                # 结果 task 的参与者只有爸爸。
+                #
+                # 而 participants 是归属链路的输入:
+                # fact 的 `participants:` tag → 日报的 participants tag →
+                # 召回时"这次任务有谁参与"。参与者丢了,归属就残缺。
+                #
+                # 这里把**本轮落到该 task 的 user 消息的 user_id**并进去
+                # (assistant/tool 不算 —— 它们没有 user_id)。
+                self._merge_participants(conn, pairs)
             conn.commit()
         # with 块退出 → connection 关闭;但事务已 commit,其他 connection 可见
+
+    @staticmethod
+    def _merge_participants(
+        conn: Any,
+        pairs: list[tuple[dict[str, Any], str]],
+    ) -> None:
+        """把本轮 user 消息的 user_id 并入对应 task 的 participants。
+
+        🆕 2026-11-02:participants 累积更新。
+
+        背景:``participants`` 原本只在 ``start_new`` 时算一次(那一轮的
+        参与人)。后续轮次新加入的说话人不会被记进去 —— 多人家庭里 task
+        常常是"爸爸先开、妈妈中途加入",结果参与者只有爸爸。
+
+        而 participants 是**归属链路**的输入:
+        fact 的 ``participants:`` tag → 日报的 participants tag →
+        召回时"这次任务有谁参与"。参与者丢了,归属就残缺。
+
+        实现:
+        - 从 ``pairs``(消息 + 归属 task_id)里收集每个 task 的 user 消息 user_id
+        - 读出该 task 现有 participants(合并),去重排序后写回
+        - 只处理**本轮真的有 user 消息落到**的 task —— 没有新参与者就不动,
+          避免无谓写库
+
+        Args:
+            conn: 已在事务内的 sqlite connection。
+            pairs: ``[(消息 dict, task_id), ...]``。
+        """
+        # 1) 收集每个 task 本轮的 user 说话人
+        by_task: dict[str, set[str]] = {}
+        for m, tid in pairs:
+            role = (m.get("role") or "").lower()
+            if role not in ("user", "human"):
+                continue
+            uid = (m.get("user_id") or "").strip()
+            if uid:
+                by_task.setdefault(tid, set()).add(uid)
+
+        if not by_task:
+            return
+
+        # 2) 逐 task 合并写回
+        for tid, new_uids in by_task.items():
+            row = conn.execute(
+                "SELECT participants FROM tasks WHERE task_id = ?", (tid,)
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                existing = json.loads(row["participants"] or "[]")
+            except (TypeError, ValueError):
+                existing = []
+            if not isinstance(existing, list):
+                existing = []
+            merged = sorted({str(x) for x in existing if x} | new_uids)
+            if merged == sorted({str(x) for x in existing if x}):
+                continue  # 没变化,不写库
+            conn.execute(
+                "UPDATE tasks SET participants = ? WHERE task_id = ?",
+                (json.dumps(merged, ensure_ascii=False), tid),
+            )
 
     def _fallback_segment(
         self,

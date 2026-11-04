@@ -276,35 +276,93 @@ async def test_thinking_ainvoke_no_relevant_memory_no_crash(
 
 
 @pytest.mark.asyncio
-async def test_thinking_source_isolation_real(
+async def test_thinking_recall_is_global_with_attribution(
     orchestrator_with_memory: ButlerOrchestrator,
     memory_facade: MemoryFacade,
 ) -> None:
-    """真实链路下,source A 的记忆不会在 source B 的召回中出现。"""
-    # Alice 存一条
+    """🆕 2026-11-02:用户决策"**全局召回 + 归属标注**"。
+
+    旧实现按 ``source`` 隔离记忆(A 存的 B 召不回),后来被改成全局召回
+    —— 但这个测试还在断言隔离语义,已与决策冲突,在此升级。
+
+    新语义:
+    - **全局召回** —— 任何人的记忆都能被召回(管家是面向所有用户的单一实体)
+    - **归属标注** —— 召回结果里带着"这是谁说的",由 LLM 综合判断
+
+    验证:
+    - Bob 召回 → 能看到 Alice 的猫,但**带着 Alice 的归属标注**
+    - 归属来自结构化 tag(``user:``),不是靠 content 文本里的名字
+    """
+    # Alice 存一条(带 user tag = 归属)
     ctx_a = MemoryContext(
         user_id="alice", session_id="e2e-sess", source="alice",
     )
-    await memory_facade.remember("Alice 养了一只猫", ctx=ctx_a)
+    await memory_facade.remember(
+        "Alice 养了一只猫",
+        ctx=ctx_a,
+        tags=["user:alice"],
+    )
 
-    # Bob 召回 → 不应看到 Alice 的
+    # Bob 召回 → 应该能看到(全局召回)
     ctx_b = MemoryContext(
         user_id="bob", session_id="e2e-sess", source="bob",
     )
     hits = await memory_facade.recall(
         "养了什么宠物?", ctx=ctx_b, k=5, min_importance=0.0,
     )
-    assert not any("Alice" in h["content"] for h in hits), (
-        f"Bob 召回了 Alice 的记忆(隔离失败): {[h['content'] for h in hits]}"
+    assert any("Alice" in h["content"] for h in hits), (
+        f"全局召回落空(应能召回 Alice 的记忆): {[h['content'] for h in hits]}"
     )
 
-    # Alice 召回 → 应当看到自己的
+    # 但归属标注必须正确 —— 标明这条是 alice 说的
+    cat_hit = next(h for h in hits if "Alice" in h["content"])
+    assert "user:alice" in (cat_hit.get("tags") or []), (
+        f"召回结果缺少归属标注: {cat_hit.get('tags')}"
+    )
+
+    # Alice 自己召回 → 同样能看到
     hits_a = await memory_facade.recall(
         "养了什么宠物?", ctx=ctx_a, k=5, min_importance=0.0,
     )
     assert any("Alice" in h["content"] for h in hits_a), (
         f"Alice 召不到自己的记忆: {[h['content'] for h in hits_a]}"
     )
+
+
+@pytest.mark.asyncio
+async def test_recall_renders_grouped_by_task_with_display_name(
+    orchestrator_with_memory: ButlerOrchestrator,
+    memory_facade: MemoryFacade,
+) -> None:
+    """🆕 2026-11-02:召回渲染按 task 分组,归属用**显示名**。
+
+    这是"记忆以 task 维度组织、让 LLM 知道最近大家在做什么"的落地:
+    LLM 看到的不是一堆零散事实,而是一个个工作单元。
+    """
+    memory_facade.bind_name_resolver(lambda uid: {"u_dad": "爸爸"}.get(uid, uid))
+
+    await memory_facade.remember(
+        "[user=u_dad] 我明天要去上海",
+        tags=["user:u_dad", "task:t_shanghai"],
+    )
+    await memory_facade.remember(
+        "[user=u_mom] 我也去",
+        tags=["user:u_mom", "task:t_shanghai"],
+    )
+
+    block = await memory_facade.format_for_prompt(
+        query="上海",
+        ctx=MemoryContext(user_id="u_dad", source="u_dad", session_id="e2e-sess"),
+        k=5,
+    )
+
+    # 按 task 分组:段落标题带 task id
+    assert "t_shanghai" in block, f"召回块未按 task 分组:\n{block}"
+    # 归属标签用显示名而不是 user_id
+    # (content 里的 "[user=u_dad]" 前缀是对话流格式,用来区分 user/assistant
+    #  轮次,不属于归属标注 —— 归属标注是 "- **[xxx 说]**" 这一段)
+    assert "**[爸爸 说]**" in block, f"归属未解析成显示名:\n{block}"
+    assert "**[u_dad 说]**" not in block, f"归属标签应显示名:\n{block}"
 
 
 # ---------------------------------------------------------------------------

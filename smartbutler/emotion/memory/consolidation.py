@@ -25,42 +25,48 @@
 
 from __future__ import annotations
 
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, UTC
-from enum import StrEnum, unique
-from typing import Any
-from zoneinfo import ZoneInfo
-
 # 🆕 时区:Consolidation 的"自然日"以 Asia/Shanghai 为准。
 # 所有窗口边界都在本地 00:00,再转 UTC 后传给 _scan 做字符串比较
 # (Qdrant.created_at 也是 UTC,字符串可比较)。
 # 测试可注入 _LOCAL_TZ=UTC 验证时区无关逻辑。
 import os
+import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum, unique
+from typing import Any
+from zoneinfo import ZoneInfo
+
 _LOCAL_TZ_NAME = os.environ.get("SMARTBUTLER_MEMORY_TZ", "Asia/Shanghai")
 LOCAL_TZ = ZoneInfo(_LOCAL_TZ_NAME)
 
 from smartbutler.capabilities.embedding.base import Embedder, EmbedderError
+from smartbutler.emotion.memory.hooks import MemoryEventType, MemoryHooks
 from smartbutler.emotion.memory.levels import (
     CONSOLIDATION_TTL_THRESHOLD,
     DAILY_TO_WEEKLY_DAYS,
-    MemoryLevel,
+    UNKNOWN_USER,
     WEEKLY_TO_MONTHLY_DAYS,
+    MemoryLevel,
     level_tag,
+    parse_participants_tag,
+    parse_task_started_at,
+    parse_task_tags,
+    parse_user_tag,
+    participants_tag,
+    task_tag,
+    user_tag,
 )
 from smartbutler.emotion.memory.long_term import (
-    LongTermStore,
     PAYLOAD_CREATED_AT,
     PAYLOAD_DELETED,
-    PAYLOAD_IMPORTANCE,
-    PAYLOAD_SOURCE_KEYS,
+    LongTermStore,
 )
 from smartbutler.emotion.memory.summarizer import (
     HeuristicSummarizer,
     LLMScorer,
     LLMSummarizer,
 )
-from smartbutler.emotion.memory.hooks import MemoryEventType, MemoryHooks
 from smartbutler.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -78,6 +84,52 @@ class ConsolidationLevel(StrEnum):
 #: 每周 / 每月近似天数(用于把"本周期"换算成时间窗)
 _DAYS_PER_WEEK = 7
 _DAYS_PER_MONTH = 30
+
+
+# ---------------------------------------------------------------------------
+# 🆕 2026-11-02: 归属保持 —— 分组数据结构
+# ---------------------------------------------------------------------------
+#
+# 设计要点(**归档层级 ≠ 段落层级**):
+#
+# 类比:员工一天分做 2 个项目,但向领导汇报的是**一条日报**,
+# 分别讲述这两个项目的进展和问题。
+#
+# 所以:
+# - **归档层级**(日报/周报/月报)= 时间粒度 → 决定"产出几条"
+# - **段落层级**(项目/task)      = 工作单元粒度 → 决定"每条里面怎么分段"
+#
+# 分桶键 = **主体(user)**,不是 task。
+# 若按 task 分桶,一天有 3 个 task 就出 3 条日报 —— 拆得太散。
+#
+# 一个 task 被多人参与时,归给该 task 内**消息数最多的说话人**
+# (主说话人),participants tag 记录全部参与人。
+# 这样"两人聊一件事"不会被切成两条各说一半的日报。
+
+
+@dataclass
+class SubjectGroup:
+    """一个主体(说话人)在一个时间窗内的记忆分组。
+
+    这是升格的分桶单位 —— **一条日报 = 一个 SubjectGroup**。
+    """
+
+    #: 主归属 user_id(说话人)。归给谁,这条日报就是谁的。
+    primary_user: str
+    #: 组内涉及的 task_id 列表(日报内部的段落锚点)
+    task_ids: list[str] = field(default_factory=list)
+    #: 组内涉及的全部 user_id(含 primary_user)—— 参与者
+    participants: list[str] = field(default_factory=list)
+    #: 组内的 fact(每个 fact 是 {key, content, importance, tags, ...})
+    facts: list[dict[str, Any]] = field(default_factory=list)
+    #: 组内 fact 按 task 归组后的段落:[(task_id, [fact, ...]), ...]
+    #: task_id 为 "" 表示无 task 归属的 fact(老数据)
+    segments: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
+
+    @property
+    def fact_count(self) -> int:
+        """组内 fact 数。"""
+        return len(self.facts)
 
 
 @dataclass
@@ -101,6 +153,12 @@ class ConsolidationReport:
     source_keys: list[str] = field(default_factory=list)
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
+    #: 🆕 2026-11-02: 本次按主体分出的组数(= 产出的摘要条数)
+    groups: int = 0
+    #: 🆕 2026-11-02: 分桶依据(固定 "subject" —— 按说话人分桶)
+    grouped_by: str = "subject"
+    #: 🆕 2026-11-02: 各组的主归属(便于排查"归属有没有丢")
+    group_users: list[str] = field(default_factory=list)
 
     @property
     def compression_ratio(self) -> float:
@@ -235,56 +293,76 @@ class Consolidator:
             )
             return report
 
-        # 3. LLM 总结成 1 条摘要(失败降级拼接)
+        # 3. 🆕 2026-11-02: 按主体分组,每组产出一条摘要
+        #
+        # 归档层级 = 时间粒度(这条日报覆盖哪段时间)
+        # 段落层级 = task(日报内部按项目分段)
+        # **分桶键是 user,不是 task** —— 否则一天 3 个 task 就出 3 条日报,太散。
         target_level = MemoryLevel(level.value)
-        summary, method = await self._summarize(
-            candidates,
-            level=target_level,
-            period=report.period,
-        )
-        report.summary_method = method
+        groups = self._group_by_subject(candidates)
+        report.groups = len(groups)
+        report.group_users = [g.primary_user for g in groups]
 
-        if not summary:
-            report.skipped_empty += 1
+        if not groups:
             report.finished_at = datetime.now(UTC)
             return report
 
-        # 4. 入库:1 条新记忆,带 level tag + source_keys 溯源
-        new_key = await self._write_summary(
-            summary=summary,
-            target_level=target_level,
-            source_keys=[c["key"] for c in candidates],
-            importance=self._aggregate_importance(candidates),
-            period=report.period,
-            source_count=len(candidates),
-        )
-        if new_key is None:
-            report.errors.append("embed_failed")
-            report.finished_at = datetime.now(UTC)
-            return report
+        all_new_keys: list[str] = []
+        all_source_keys: list[str] = []
+        methods: list[str] = []
 
-        report.promoted = 1
-        report.source_count = len(candidates)
-        report.new_keys.append(new_key)
-        report.source_keys = [c["key"] for c in candidates]
+        for group in groups:
+            summary, method = await self._summarize(
+                group,
+                level=target_level,
+                period=report.period,
+            )
+            methods.append(method)
 
-        # 5. ON_PROMOTE 钩子
-        if self._hooks:
-            try:
-                self._hooks.trigger(
-                    MemoryEventType.ON_PROMOTE,
-                    key=new_key,
-                    source_keys=report.source_keys,
-                )
-            except Exception:  # pragma: no cover - hooks 自身已 try/except
-                pass
+            if not summary:
+                report.skipped_empty += 1
+                continue
+
+            new_key = await self._write_summary(
+                summary=summary,
+                target_level=target_level,
+                source_keys=[c["key"] for c in group.facts],
+                importance=self._aggregate_importance(group.facts),
+                period=report.period,
+                source_count=len(group.facts),
+                group=group,
+            )
+            if new_key is None:
+                report.errors.append("embed_failed")
+                continue
+
+            report.promoted += 1
+            all_new_keys.append(new_key)
+            all_source_keys.extend(c["key"] for c in group.facts)
+
+            # ON_PROMOTE 钩子(每组一次)
+            if self._hooks:
+                try:
+                    self._hooks.trigger(
+                        MemoryEventType.ON_PROMOTE,
+                        key=new_key,
+                        source_keys=[c["key"] for c in group.facts],
+                    )
+                except Exception:  # pragma: no cover - hooks 自身已 try/except
+                    pass
+
+        report.summary_method = methods[0] if methods else ""
+        report.new_keys.extend(all_new_keys)
+        report.source_keys.extend(all_source_keys)
+        report.source_count = len(all_source_keys)
 
         report.finished_at = datetime.now(UTC)
         logger.info(
-            "consolidate.%s period=%s scanned=%d -> 1 %s summary "
+            "consolidate.%s period=%s scanned=%d groups=%d -> %d %s summaries "
             "(method=%s importance=%.2f compression=%sx)",
-            level.value, report.period, report.source_count,
-            level.value, method,
+            level.value, report.period, report.candidates_scanned, report.groups,
+            report.promoted, level.value,
+            report.summary_method,
             self._aggregate_importance(candidates),
             report.compression_ratio,
         )
@@ -360,8 +438,35 @@ class Consolidator:
             created = it.get("created_at", "") or it.get(PAYLOAD_CREATED_AT, "")
             if not created:
                 continue
-            # 窗口过滤:created_at ∈ [since, now)
-            if created < since_iso or created >= now_iso:
+            # 🆕 2026-11-02: 跨天 task 归一化
+            #
+            # 一个 task 可能跨午夜(比如"订机票"聊了三天)。如果按 fact 自己的
+            # created_at 切时间窗,这个 task 会被切成 3 段 —— task 断裂,
+            # 日报里看不到"这件事还没完"。
+            #
+            # 解决:fact 的 tags 里带 `task_started_at:`(写入时记的 task 起始
+            # 时间),窗口过滤用**双条件**:
+            #
+            #   fact 自身时间 ∈ 窗口  **或**  task 起始时间 ∈ 窗口
+            #
+            # 为什么是"或"而不是只看 task 起始时间:
+            # - 只看 task 起始时间 → task 从 10/31 开始,11/01 的后续内容
+            #   会落进 10/31 的日报,而 11/01 的日报里**看不到这件事还在推进**
+            #   (漏掉当天真实发生的内容)
+            # - 只看 fact 自身时间 → 跨天 task 被切成两段(任务视角断裂)
+            #
+            # "或"的语义:一个 fact 只要**当天有活动**,或**这个 task 当天开始**,
+            # 就该进当天的日报。前者保证"当天发生的事不丢",后者保证
+            # "新任务开启当天就有记录"。
+            #
+            # 老数据没有这个 tag → 退回用 created_at(行为不变)。
+            tags = list(it.get("tags", []) or [])
+            task_started = parse_task_started_at(tags)
+            in_window = since_iso <= created < now_iso
+            task_started_in_window = bool(
+                task_started and since_iso <= task_started < now_iso
+            )
+            if not (in_window or task_started_in_window):
                 continue
             if it.get(PAYLOAD_DELETED):
                 continue
@@ -370,8 +475,146 @@ class Consolidator:
                 "content": it.get("content", ""),
                 "importance": float(it.get("importance", 0.5)),
                 "created_at": created,
+                # 🆕 2026-11-02: 归属信息 —— 升格按它分桶(user)与分段(task)
+                "tags": tags,
             })
         return out
+
+    # ------------------- 🆕 分组(归属保持) -------------------
+
+    def _group_by_subject(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> list[SubjectGroup]:
+        """按**主体(说话人)**分桶,桶内按 task 分段。
+
+        🆕 2026-11-02。**归属保持的核心。**
+
+        归档层级(日报/周报/月报)= 时间粒度,决定"产出几条";
+        段落层级(task)= 工作单元粒度,决定"每条里面怎么分段"。
+        两者正交 —— 分桶键是 user,**不是** task。
+
+        类比:员工一天做 2 个项目,向领导汇报**一条日报**,
+        分别讲这两个项目的进展和问题。若按 task 分桶就变成 2 条日报,拆太散。
+
+        分桶规则:
+        1. 每条 fact 解析出 ``user:`` tag(主归属)和 ``task:`` tag(段落锚点)
+        2. **共享 task 裁决**:同一 task 被多人参与时,归给该 task 内
+           消息数最多的说话人(主说话人)—— 避免"两人聊一件事"
+           被切成两条各说一半的日报
+        3. 组内按 task 聚成段落(:func:`_build_segments`)
+
+        Args:
+            candidates: :meth:`_scan` 的结果(含 tags)。
+
+        Returns:
+            组列表(按 fact 数量倒序)。
+        """
+        # ── 步骤 1: 解析每条 fact 的归属 ──
+        # fact → {"user": uid, "tasks": [tid...], "fact": {...}}
+        parsed: list[dict[str, Any]] = []
+        for c in candidates:
+            tags = list(c.get("tags", []) or [])
+            uid = parse_user_tag(tags) or UNKNOWN_USER
+            tids = parse_task_tags(tags)
+            parsed.append({
+                "user": uid,
+                "tasks": tids,
+                "fact": c,
+            })
+
+        # ── 步骤 2: 共享 task 裁决 ──
+        # 统计每个 task 内各说话人的 fact 数,选出"主说话人"。
+        # 只有该 task 的**全部** fact 都归同一人时,才没有歧义。
+        task_speaker_counts: dict[str, dict[str, int]] = {}
+        for p in parsed:
+            for tid in p["tasks"]:
+                task_speaker_counts.setdefault(tid, {})
+                counts = task_speaker_counts[tid]
+                counts[p["user"]] = counts.get(p["user"], 0) + 1
+
+        # task → 主说话人(消息数最多;并列时取 user_id 字典序最小,保证确定性)
+        task_primary: dict[str, str] = {}
+        for tid, counts in task_speaker_counts.items():
+            task_primary[tid] = sorted(
+                counts.items(), key=lambda kv: (-kv[1], kv[0])
+            )[0][0]
+
+        # ── 步骤 3: 按主体分桶 ──
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for p in parsed:
+            user = p["user"]
+            tids = p["tasks"]
+            if tids:
+                # 该 fact 属于一个或多个 task → 归属由**主说话人**决定
+                # (多人共享 task 时,统一归主说话人,避免日报割裂)
+                primaries = {task_primary.get(tid, user) for tid in tids}
+                # 若该 fact 关联的 task 主说话人不一致(罕见:fact 带了多个 task),
+                # 取其中"属于该 fact 说话人自己"的那个;否则取第一个,保持确定性
+                user = user if user in primaries else sorted(primaries)[0]
+            buckets.setdefault(user, []).append(p)
+
+        # ── 步骤 4: 组装 SubjectGroup ──
+        groups: list[SubjectGroup] = []
+        for user, items in buckets.items():
+            facts = [it["fact"] for it in items]
+            task_ids: list[str] = []
+            participants: set[str] = set()
+            for it in items:
+                for tid in it["tasks"]:
+                    if tid not in task_ids:
+                        task_ids.append(tid)
+                # participants: 优先用 fact 上的 participants tag,
+                # 没有则退回该 fact 的归属 user
+                tag_p = parse_participants_tag(list(it["fact"].get("tags", []) or []))
+                if tag_p:
+                    participants.update(tag_p)
+                else:
+                    participants.add(it["user"])
+
+            g = SubjectGroup(
+                primary_user=user,
+                task_ids=task_ids,
+                participants=sorted(p for p in participants if p),
+                facts=facts,
+            )
+            g.segments = self._build_segments(items)
+            groups.append(g)
+
+        # 排序:fact 多的组在前(稳定,同数量按 user_id 保证确定性)
+        groups.sort(key=lambda g: (-g.fact_count, g.primary_user))
+        logger.info(
+            "consolidate.group_by_subject groups=%d users=%s facts=%d",
+            len(groups), [g.primary_user for g in groups], len(candidates),
+        )
+        return groups
+
+    @staticmethod
+    def _build_segments(
+        items: list[dict[str, Any]],
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
+        """把组内 fact 按 task 聚成段落。
+
+        段落 = 日报里的一个"项目小节"。无 task 归属的 fact(老数据)
+        归到 task_id="" 的段落。
+
+        Args:
+            items: :meth:`_group_by_subject` 步骤 3 的分桶结果元素。
+
+        Returns:
+            ``[(task_id, [fact, ...]), ...]``,按 task 首次出现顺序。
+        """
+        seg_order: list[str] = []
+        seg_map: dict[str, list[dict[str, Any]]] = {}
+        for it in items:
+            tids = it["tasks"]
+            # 一条 fact 可能关联多个 task(理论上不该发生),取第一个作段落归属
+            tid = tids[0] if tids else ""
+            if tid not in seg_map:
+                seg_map[tid] = []
+                seg_order.append(tid)
+            seg_map[tid].append(it["fact"])
+        return [(tid, seg_map[tid]) for tid in seg_order]
 
     # ------------------- 过滤 / 汇总 -------------------
 
@@ -417,16 +660,23 @@ class Consolidator:
 
     async def _summarize(
         self,
-        candidates: list[dict[str, Any]],
+        group: SubjectGroup,
         *,
         level: MemoryLevel,
         period: str,
     ) -> tuple[str, str]:
-        """生成 1 条时段摘要。返回 (摘要文本, 方法:llm/heuristic)。"""
+        """为一个主体组生成 1 条摘要。返回 (摘要文本, 方法:llm/heuristic)。
+
+        🆕 2026-11-02:入参从"扁平 candidates"改为 :class:`SubjectGroup`,
+        这样 LLM 拿到的是**已按 task 分好段的**输入 —— 让 LLM 只做
+        "怎么讲清楚",不参与"怎么分组"(分组是代码的职责)。
+        """
         summary: str | None = None
         try:
-            summary = await self._llm_summarizer.summarize_period(
-                candidates, level=level.value, period=period,
+            summary = await self._llm_summarizer.summarize_group(
+                group,
+                level=level.value,
+                period=period,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("consolidate.summarize_failed err=%s", e)
@@ -435,9 +685,9 @@ class Consolidator:
         if summary and summary.strip():
             return summary.strip(), "llm"
 
-        # 降级:启发式拼接
+        # 降级:启发式拼接(仍按 task 分段,保证结构不塌)
         fallback = self._summarizer.summarize_text(
-            [c["content"] for c in candidates]
+            [c["content"] for c in group.facts]
         )
         return fallback, "heuristic"
 
@@ -452,8 +702,22 @@ class Consolidator:
         importance: float,
         period: str,
         source_count: int,
+        group: SubjectGroup | None = None,
     ) -> str | None:
-        """把 1 条摘要写进 Qdrant。失败返回 None。"""
+        """把 1 条摘要写进 Qdrant。失败返回 None。
+
+        🆕 2026-11-02:**归属由代码在这里重新写一遍**。
+
+        这是"归属跨三层不丢"不变式的实现方式 —— 不是靠 LLM 在正文里
+        写上名字(那样每次升格都会漂移、无法断言),而是**每一层升格时
+        由代码把归属 tag 重新写一遍**:
+
+            fact  tags: user:X, task:Y
+            日报  tags: user:X, task:Y      ← 这里写
+            周报  tags: user:X, task:Y      ← 同上
+
+        LLM 只负责正文措辞,归属永远由代码守。
+        """
         content = self._render_summary_content(
             summary=summary,
             target_level=target_level,
@@ -466,12 +730,29 @@ class Consolidator:
             logger.warning("consolidate.embed_failed err=%s", e)
             return None
 
-        new_key = f"consolidated:{target_level.value}:{uuid.uuid4().hex[:12]}"
         tags = [
             level_tag(target_level),
             f"period:{target_level.value}",
             f"src_count:{source_count}",
         ]
+
+        # 🆕 归属 tag —— 代码写,不是 LLM 生成
+        if group is not None:
+            tags.append(user_tag(group.primary_user))
+            p_tag = participants_tag(group.participants)
+            if p_tag:
+                tags.append(p_tag)
+            # task 锚点:一条日报可包含多个 task(日报内部按项目分段)
+            for tid in group.task_ids:
+                t = task_tag(tid)
+                if t:
+                    tags.append(t)
+
+        # key 里带上归属,人工排查时一眼看出这条日报是谁的
+        key_suffix = f"{group.primary_user}:" if group is not None else ""
+        new_key = (
+            f"consolidated:{target_level.value}:{key_suffix}{uuid.uuid4().hex[:12]}"
+        )
         self._store.store_memory(
             new_key,
             embedding,
@@ -480,6 +761,12 @@ class Consolidator:
             tags=tags,
             level=target_level.value,
             source_keys=source_keys,
+        )
+        logger.info(
+            "consolidate.write_summary key=%s level=%s user=%s tasks=%d",
+            new_key, target_level.value,
+            group.primary_user if group else "(none)",
+            len(group.task_ids) if group else 0,
         )
         return new_key
 
@@ -507,4 +794,5 @@ __all__ = [
     "Consolidator",
     "ConsolidationLevel",
     "ConsolidationReport",
+    "SubjectGroup",
 ]

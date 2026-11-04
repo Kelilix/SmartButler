@@ -29,6 +29,10 @@ from typing import Any
 from smartbutler.capabilities.embedding.base import Embedder
 from smartbutler.emotion.memory.forgetting import ForgetResult
 from smartbutler.emotion.memory.hooks import MemoryEventType, MemoryHooks
+from smartbutler.emotion.memory.levels import (
+    parse_participants_tag,
+    parse_task_tags,
+)
 from smartbutler.emotion.memory.retrieval import MemoryRetriever
 from smartbutler.emotion.memory.long_term import LongTermStore
 from smartbutler.utils.logging import get_logger
@@ -177,10 +181,43 @@ class MemoryFacade:
         # 🆕 recall 相似度下限(默认 0=不过滤;由 wiring 层按
         # MemorySettings.recall_min_score 注入,避免每个调用点都要传参)
         self._min_score: float = 0.0
+        # 🆕 2026-11-02: user_id → 显示名解析器(可选)
+        #
+        # 归属 tag 里存的是 user_id(如 ``speaker_a3f2b1c``),直接注入 prompt
+        # 用户看不懂。注入一个回调把 user_id 换成显示名(如"高天禹")。
+        # 签名: ``Callable[[str], str]`` —— 传 user_id,返回可读名字。
+        # 由 wiring 层绑定声纹库(voiceprint registry)。
+        self._name_resolver: Any = None
 
     def set_min_score(self, min_score: float) -> None:
         """设置 recall 默认相似度下限(0-1,由 wiring 层调一次)。"""
         self._min_score = min_score
+
+    def bind_name_resolver(self, resolver: Any) -> None:
+        """绑定 user_id → 显示名解析器(由 wiring 层调)。
+
+        Args:
+            resolver: 可调用对象 ``fn(user_id) -> display_name``;
+                None = 解绑(回退到直接显示 user_id)。
+        """
+        self._name_resolver = resolver
+
+    def _display_name(self, user_id: str) -> str:
+        """把 user_id 解析成显示名(解析失败回退到原值)。
+
+        解析器抛异常时**不能**影响召回渲染 —— 显示成裸 user_id 仍然
+        是可用的(甚至更安全,不会泄露错误的姓名)。
+        """
+        if not user_id:
+            return "未知"
+        if self._name_resolver is None:
+            return user_id
+        try:
+            name = self._name_resolver(user_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("facade.name_resolver_failed user_id=%s err=%s", user_id, e)
+            return user_id
+        return name or user_id
 
     # ------------------- 6.3 子服务注入(可选) -------------------
 
@@ -445,14 +482,7 @@ class MemoryFacade:
         hits = await self.recall(query, ctx=ctx, k=k)
         long_block = ""
         if hits:
-            lines: list[str] = [f"### 相关历史记忆(共 {len(hits)} 条)"]
-            for h in hits:
-                content = h.get("content", "")
-                content = _truncate_middle(content, _resolve_max_fact_chars())
-                # 从 key("mem:user_id:uuid") 或 tags("source:user_id") 提取 user_id
-                user_id = _extract_user_id_from_hit(h)
-                lines.append(f"- **[{user_id} 说]** {content}")
-            long_block = "\n".join(lines)
+            long_block = self._render_long_block(hits)
 
         # ---- 3. 拼装 ----
         #
@@ -471,6 +501,79 @@ class MemoryFacade:
         if long_block:
             parts.append(long_block)
         return "\n\n".join(parts)
+
+    def _render_long_block(self, hits: list[dict[str, Any]]) -> str:
+        """把长期记忆命中渲染成 prompt 块 —— **按 task 分组**。
+
+        🆕 2026-11-02。设计依据:用户决策"记忆以 task 维度组织,
+        让 LLM 知道最近大家在做什么,力求 task 闭环"。
+
+        旧实现是平铺的 ``- [user 说] content``,LLM 看到的是一堆零散事实,
+        拼不出"这件事进展到哪了"。现在按 ``task:`` tag 分组:
+
+            ### 相关历史记忆(共 N 条,3 个任务)
+
+            **【订上海机票】**(高天禹)
+            - **[高天禹 说]** 我明天要去上海
+            - **[妈妈 说]** 我也去
+
+            **【看房】**(高天禹、妈妈)
+            - **[高天禹 说]** 周末看房
+
+        归属用**显示名**(经 ``_name_resolver`` 解析),解析不了则显示 user_id。
+        没有 task 归属的 fact(老数据)归到"其他"组。
+
+        Args:
+            hits: :meth:`recall` 的结果。
+
+        Returns:
+            markdown 字符串(无 hits 时返回 "")。
+        """
+        if not hits:
+            return ""
+
+        # 按 task 分组(保持首次出现顺序)
+        groups: dict[str, list[dict[str, Any]]] = {}
+        order: list[str] = []
+        for h in hits:
+            tids = parse_task_tags(h.get("tags", []) or [])
+            tid = tids[0] if tids else ""
+            if tid not in groups:
+                groups[tid] = []
+                order.append(tid)
+            groups[tid].append(h)
+
+        n_tasks = len([t for t in order if t])
+        header = f"### 相关历史记忆(共 {len(hits)} 条"
+        header += f",{n_tasks} 个任务)" if n_tasks else ")"
+
+        lines: list[str] = [header]
+        for tid in order:
+            items = groups[tid]
+            if tid:
+                # 段落标题:task id + 该组的参与者
+                parts = set()
+                for h in items:
+                    parts.update(parse_participants_tag(h.get("tags", []) or []))
+                if not parts:
+                    for h in items:
+                        uid = _extract_user_id_from_hit(h)
+                        if uid:
+                            parts.add(uid)
+                who = "、".join(
+                    sorted(self._display_name(p) for p in parts)
+                )
+                lines.append(f"\n**【{tid}】**" + (f"({who})" if who else ""))
+            else:
+                lines.append("\n**【其他】**")
+            for h in items:
+                content = h.get("content", "")
+                content = _truncate_middle(content, _resolve_max_fact_chars())
+                user_id = _extract_user_id_from_hit(h)
+                name = self._display_name(user_id)
+                lines.append(f"- **[{name} 说]** {content}")
+
+        return "\n".join(lines)
 
     # ------------------- 6.3 新增方法(6 个) -------------------
 

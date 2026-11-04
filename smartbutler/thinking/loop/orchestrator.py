@@ -167,6 +167,8 @@ class ButlerOrchestrator:
         # Phase 6.2 P0: Memory 接入层
         self._memory_facade = memory_facade
         self._current_memory_block: str = ""  # 每次 ainvoke 时刷新
+        # 🆕 2026-11-02: 记忆系统句柄(由 attach_memory_system 注入)
+        self._memory_system: Any = None
 
         # Phase 6.2 P0: Short-term memory checkpointer(SqliteSaver)
         self._short_term = short_term
@@ -179,6 +181,48 @@ class ButlerOrchestrator:
         self._personality = personality
         # 缓存 Personality 渲染结果(避免每次 _build_graph_builder 都重渲染)
         self._current_personality_block: str = ""
+
+    # ---------- 记忆系统注入(2026-11-02) ----------
+
+    @property
+    def memory_system(self) -> Any:
+        """已装配的记忆系统句柄(None = 未注入)。
+
+        供 :class:`~smartbutler.server.runtime.ButlerServer` 在优雅关停时
+        停掉 task judge 后台调度器。
+        """
+        return self._memory_system
+
+    def attach_memory_system(self, memory_system: Any) -> None:
+        """注入已装配好的记忆系统。
+
+        🆕 2026-11-02。装配逻辑在
+        :mod:`smartbutler.emotion.memory.wiring` 里,这里只负责把它
+        接进 thinking 层。
+
+        做什么:
+        1. ``_memory_facade`` —— 召回 + 注入 prompt
+        2. ``_short_term``  —— LangGraph checkpointer(重启不丢短期上下文)
+        3. 标记 graph 需要重建(system prompt 会带上记忆块)
+
+        Args:
+            memory_system: :class:`~smartbutler.emotion.memory.wiring.MemorySystem`。
+        """
+        if memory_system is None:
+            return
+        self._memory_system = memory_system
+        facade = getattr(memory_system, "facade", None)
+        if facade is not None:
+            self._memory_facade = facade
+        short_term = getattr(memory_system, "short_term", None)
+        if short_term is not None:
+            self._short_term = short_term
+        # system prompt 需要重建(记忆块要重新注入)
+        self._compiled = None
+        _logger.info(
+            "orchestrator.attach_memory_system",
+            facade=facade is not None, short_term=short_term is not None,
+        )
 
     # ---------- Skill 注入(Phase 5 占位) ----------
 
@@ -487,7 +531,16 @@ class ButlerOrchestrator:
             try:
                 from smartbutler.emotion.memory.facade import MemoryContext
 
-                ctx = MemoryContext(user_id=user_id, session_id=session_id)
+                # 🆕 2026-11-02: source = 当前说话人 user_id
+                #
+                # 归属链路:voiceprint → user_id → ctx.source → `source:` tag。
+                # 召回侧**不按** source 过滤(全局召回 + 归属标注),
+                # 这个 tag 的作用是让 CLI / 人工排查能按人翻查。
+                ctx = MemoryContext(
+                    user_id=user_id,
+                    source=user_id or "",
+                    session_id=session_id,
+                )
                 _logger.info(
                     "orchestrator.ainvoke memory_block_refresh",
                     user=user_id, session=session_id,
@@ -578,7 +631,12 @@ class ButlerOrchestrator:
             try:
                 from smartbutler.emotion.memory.facade import MemoryContext
 
-                ctx = MemoryContext(user_id=user_id, session_id=session_id)
+                # 🆕 2026-11-02: source = 当前说话人 user_id(同 ainvoke)
+                ctx = MemoryContext(
+                    user_id=user_id,
+                    source=user_id or "",
+                    session_id=session_id,
+                )
                 self._current_memory_block = await self._memory_facade.format_for_prompt(
                     query=user_input.strip(), ctx=ctx, k=5, max_chars=2000,
                 )

@@ -17,11 +17,12 @@ Phase 6.3 P1 已交付:4 层分片(levels.py) + 5 类遗忘(forgetting.py) + 5W1
   MemoryFacade 6 个新 API。
 """
 
-from smartbutler.emotion.memory.archive_store import ArchiveStore, ArchivedMemory
+from smartbutler.emotion.memory.archive_store import ArchivedMemory, ArchiveStore
 from smartbutler.emotion.memory.consolidation import (
-    Consolidator,
     ConsolidationLevel,
     ConsolidationReport,
+    Consolidator,
+    SubjectGroup,
 )
 from smartbutler.emotion.memory.facade import MemoryContext, MemoryFacade
 from smartbutler.emotion.memory.forgetting import (
@@ -42,13 +43,22 @@ from smartbutler.emotion.memory.levels import (
     DAILY_TO_WEEKLY_DAYS,
     DELETED_RECOVERABLE_DAYS,
     LEVEL_RANK,
-    MemoryLevel,
     MONTHLY_TO_PERMANENT_DAYS,
-    RecallLevel,
+    UNKNOWN_USER,
     WEEKLY_TO_MONTHLY_DAYS,
+    MemoryLevel,
+    RecallLevel,
     importance_to_levels,
     level_tag,
+    parse_participants_tag,
     parse_recall_level,
+    parse_task_started_at,
+    parse_task_tags,
+    parse_user_tag,
+    participants_tag,
+    task_started_at_tag,
+    task_tag,
+    user_tag,
 )
 from smartbutler.emotion.memory.long_term import (
     LongTermStore,
@@ -74,6 +84,7 @@ from smartbutler.emotion.memory.vacuum import (
     VacuumReport,
     VacuumService,
 )
+from smartbutler.emotion.memory.wiring import MemorySystem, build_memory_system
 
 __all__ = [
     # 6.1 已交付
@@ -116,6 +127,7 @@ __all__ = [
     "Consolidator",
     "ConsolidationLevel",
     "ConsolidationReport",
+    "SubjectGroup",
     "TaskBoundaryDetector",
     "TurnInfo",
     "BoundaryResult",
@@ -124,4 +136,17 @@ __all__ = [
     "VacuumService",
     "VacuumReport",
     "DeletedMemoryEntry",
+    # 归属 tag(2026-11-02)
+    "UNKNOWN_USER",
+    "user_tag",
+    "task_tag",
+    "participants_tag",
+    "task_started_at_tag",
+    "parse_user_tag",
+    "parse_task_tags",
+    "parse_participants_tag",
+    "parse_task_started_at",
+    # 装配层(2026-11-02)
+    "MemorySystem",
+    "build_memory_system",
 ]

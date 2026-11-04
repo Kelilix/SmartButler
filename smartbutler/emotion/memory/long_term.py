@@ -360,7 +360,11 @@ class LongTermStore:
             limit: 最多返多少条(Qdrant scroll 默认 10000)。
 
         Returns:
-            [{"key": ..., "created_at": ..., "deleted": ..., "importance": ..., "level": ..., "content": ...}, ...]
+            [{"key": ..., "created_at": ..., "deleted": ..., "importance": ...,
+              "level": ..., "content": ..., "tags": [...]}, ...]
+
+            🆕 2026-11-02: 新增 ``tags`` —— 归属信息(user:/task:/participants:)
+            存在 tags 里,升格层要靠它按主体分桶、按 task 分段。
         """
         from smartbutler.storage.qdrant import FieldCondition, Filter, MatchValue
         if not self._q._client.collection_exists(self._q.collection):
@@ -388,6 +392,10 @@ class LongTermStore:
                 "deleted": bool(pl.get(PAYLOAD_DELETED, False)),
                 "level": pl.get(PAYLOAD_LEVEL, ""),
                 "content": pl.get(PAYLOAD_CONTENT, ""),
+                # 🆕 2026-11-02: 归属信息在 tags 里(user:/task:/participants:)。
+                # 升格(Consolidator)要按 user 分桶、按 task 分段,必须能读到这里 ——
+                # 之前不返回,导致升格时归属被丢弃(日报变成"无主"条目)。
+                "tags": list(pl.get(PAYLOAD_TAGS, []) or []),
             })
         return out
 

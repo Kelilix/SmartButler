@@ -326,6 +326,8 @@ async def create_voice_service(config: VoiceServiceConfig):
 
     # 8. 创建 ButlerOrchestrator (需要 LLM)
     logger.info("创建管家大脑...")
+    llm = None
+    llm_settings = None
     try:
         from smartbutler.capabilities.llm.factory import create_llm
         from smartbutler.config.llm import load_llm_settings
@@ -338,6 +340,25 @@ async def create_voice_service(config: VoiceServiceConfig):
         logger.warning("LLM 初始化失败: %s", e)
         logger.warning("  将使用模拟 Orchestrator")
         orchestrator = _create_mock_orchestrator()
+
+    # 8.5 🆕 2026-11-02: 装配记忆系统
+    #
+    # 之前记忆系统的所有组件(短库/长库/task 索引/调度器/自动抽取/升格)
+    # **从来没有被创建过** —— 它们各自有单测,但线上进程里没有实例,
+    # 所以长期记忆不写不读、短期 task 摘要也不注入 prompt。
+    #
+    # 现在统一在这里装配。失败不阻断启动(记忆挂了管家还能聊天)。
+    memory_system = await _build_memory_system(llm, speaker_registry)
+    if memory_system is not None:
+        attach = getattr(orchestrator, "attach_memory_system", None)
+        if callable(attach):
+            attach(memory_system)
+            memory_system.start()
+            logger.info("  ✓ 记忆系统已就绪")
+        else:
+            logger.warning("  ⚠ orchestrator 不支持 attach_memory_system,跳过注入")
+    else:
+        logger.warning("  ⚠ 记忆系统装配失败,本次运行无记忆能力")
 
     # 9. 创建 ButlerServer
     # 🐛 修复:必须把同一个 event_bus 传给 server,否则 voice_adapter 发布的事件
@@ -356,6 +377,68 @@ async def create_voice_service(config: VoiceServiceConfig):
     server.set_answer_router(answer_router)
 
     return voice_adapter, server, event_bus, speaker_registry
+
+
+async def _build_memory_system(llm: object, speaker_registry: object) -> object | None:
+    """装配记忆系统(2026-11-02)。
+
+    失败返回 ``None`` —— 记忆是增强能力,不该让语音服务起不来。
+
+    Args:
+        llm: LLM 实例(给 judge / 评分 / 摘要用);None → 降级到规则模式。
+        speaker_registry: 声纹注册表(用于把 user_id 解析成显示名)。
+
+    Returns:
+        :class:`~smartbutler.emotion.memory.wiring.MemorySystem` 或 None。
+    """
+    try:
+        from smartbutler.config.memory import load_memory_settings
+        from smartbutler.emotion.memory.wiring import build_memory_system
+
+        settings = load_memory_settings()
+
+        # 显示名解析器:user_id → "高天禹"/"妈妈"
+        # 声纹库的 get() 是 async,而召回渲染是同步的 —— 这里预取一份
+        # 快照存进 dict,渲染时查表。
+        name_map = await _load_speaker_names(speaker_registry)
+
+        def _resolve(user_id: str) -> str:
+            return name_map.get(user_id, user_id)
+
+        system = await build_memory_system(
+            settings,
+            llm=llm,
+            name_resolver=_resolve,
+        )
+        return system
+    except Exception as e:  # noqa: BLE001
+        logger.warning("记忆系统装配失败: %s", e)
+        return None
+
+
+async def _load_speaker_names(speaker_registry: object) -> dict[str, str]:
+    """预取声纹库里的 user_id → display_name 映射。
+
+    Args:
+        speaker_registry: 声纹注册表(可能为 None)。
+
+    Returns:
+        ``{user_id: display_name}``;取不到返回空 dict。
+    """
+    if speaker_registry is None:
+        return {}
+    try:
+        members = await speaker_registry.list_members()  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001
+        logger.debug("声纹成员读取失败(忽略): %s", e)
+        return {}
+    out: dict[str, str] = {}
+    for m in members or []:
+        uid = getattr(m, "user_id", "") or ""
+        name = getattr(m, "display_name", "") or ""
+        if uid and name:
+            out[uid] = name
+    return out
 
 
 def _create_voice_components(config: VoiceServiceConfig):

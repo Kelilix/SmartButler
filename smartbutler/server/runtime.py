@@ -245,6 +245,11 @@ class ButlerServer:
 
     async def stop(self) -> None:
         """优雅关闭。"""
+        # 🆕 2026-11-02: 记忆系统的关停**不依赖 _started** ——
+        # 记忆系统可能已装配并启动了后台调度器,但 server 还没 start
+        # (或 start 失败)。调度器跑着不关 = 进程退出时残留后台任务。
+        await self._stop_memory_system()
+
         if not self._started:
             return  # 幂等
         if self._stopped:
@@ -256,6 +261,16 @@ class ButlerServer:
             await self._event_bus.stop()
         self._started = False
         _logger.info("butler_server.stopped")
+
+    async def _stop_memory_system(self) -> None:
+        """停掉记忆系统(task judge 后台调度器)。失败只 warn。"""
+        memory_system = getattr(self._orchestrator, "memory_system", None)
+        if memory_system is None:
+            return
+        try:
+            await memory_system.stop()
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("butler_server.memory_stop_failed err=%s", e)
 
     async def submit_reactive(self, sub: ReactiveSubmission) -> ButlerReply:
         """Reactive 入口 — 用户主动说话 / 智能音箱识别 / REPL 输入。

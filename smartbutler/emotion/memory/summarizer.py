@@ -474,6 +474,156 @@ class LLMSummarizer:
         )
         return text
 
+    async def summarize_group(
+        self,
+        group: Any,
+        *,
+        level: str = "daily",
+        period: str = "昨天",
+    ) -> str | None:
+        """把一个**主体组**(已按 task 分好段)总结成一条摘要。
+
+        🆕 2026-11-02。输入是 :class:`~smartbutler.emotion.memory.consolidation.SubjectGroup`
+        —— 组内已由**代码**按 task 分好段。
+
+        为什么分段在代码侧做:
+        - "这条记忆属于哪个 task / 归给谁"是**客观**的(code 知道),
+          不该让 LLM 判断(LLM 判断会漂移、无法断言)。
+        - LLM 只负责"怎么讲清楚" —— 措辞、归并、按项目组织叙述。
+        - 这就是"代码承担事实,LLM 承担表达"。
+
+        Args:
+            group: SubjectGroup 实例(duck-typed,避免循环 import)。
+            level: 目标层("daily"/"weekly"/"monthly")。
+            period: 时间段描述。
+
+        Returns:
+            markdown 摘要;未注入 LLM / 调用失败 / 内容为空 → ``None``
+            (调用方降级到 :class:`HeuristicSummarizer`)。
+        """
+        if self._llm is None:
+            return None
+
+        from smartbutler.capabilities.llm.types import Message
+
+        segments = list(getattr(group, "segments", []) or [])
+        facts = list(getattr(group, "facts", []) or [])
+        if not facts:
+            return None
+
+        prompt = self._build_group_prompt(level, period, segments, facts)
+        if not prompt.strip():
+            return None
+
+        try:
+            import asyncio
+
+            resp = await asyncio.wait_for(
+                self._llm.chat(
+                    [
+                        Message(
+                            role="system",
+                            content=(
+                                "你只做记忆归档,不闲聊。"
+                                "输出纯 markdown,不要代码块围栏,不要开场白。"
+                            ),
+                        ),
+                        Message(role="user", content=prompt),
+                    ],
+                    temperature=0.2,
+                    max_tokens=self._max_tokens,
+                ),
+                timeout=self._timeout_seconds,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "LLMSummarizer.summarize_group_failed level=%s n_facts=%d err=%s",
+                level, len(facts), e,
+            )
+            return None
+
+        text = (getattr(resp, "content", "") or "").strip()
+        if not text:
+            logger.warning("LLMSummarizer.empty_summary level=%s", level)
+            return None
+
+        text = _strip_code_fence(text)
+        logger.info(
+            "LLMSummarizer.summarize_group_done level=%s n_facts=%d "
+            "n_segments=%d summary_len=%d",
+            level, len(facts), len(segments), len(text),
+        )
+        return text
+
+    def _build_group_prompt(
+        self,
+        level: str,
+        period: str,
+        segments: list[tuple[str, list[dict[str, Any]]]],
+        facts: list[dict[str, Any]],
+    ) -> str:
+        """按"项目分段"结构拼 prompt。
+
+        🆕 2026-11-02:关键改动 —— 输入不再是扁平的 ``[记忆1] ...``,
+        而是**先按项目分组**,并明确要求 LLM 按项目分段叙述。
+
+        类比:员工一天做 2 个项目,向领导汇报**一条日报**,
+        分别讲述这两个项目目前的进展和问题。
+        """
+        from smartbutler.emotion.memory.levels import MemoryLevel
+
+        label = {
+            MemoryLevel.DAILY.value: "日报",
+            MemoryLevel.WEEKLY.value: "周报",
+            MemoryLevel.MONTHLY.value: "月报",
+        }.get(level, "摘要")
+
+        lines: list[str] = []
+        if segments:
+            for seg_idx, (task_id, seg_facts) in enumerate(segments, 1):
+                # 段落标题:用 task_id(代码侧已知的事实)。
+                # 这里**不要求** LLM 自己命名项目 —— 命名属于语义加工,
+                # 但归属/分组属于代码职责,两者边界清晰。
+                header = f"【项目{seg_idx}】" if task_id else "【其他】"
+                lines.append(header)
+                for f in seg_facts:
+                    content = str(f.get("content", "")).strip()
+                    if not content:
+                        continue
+                    if len(content) > self._max_fact_chars:
+                        content = content[: self._max_fact_chars] + "…(略)"
+                    lines.append(f"  - {content}")
+        else:
+            # 无分段信息(老数据)→ 退化成扁平列表
+            for i, f in enumerate(facts[: self._max_facts], 1):
+                content = str(f.get("content", "")).strip()
+                if not content:
+                    continue
+                if len(content) > self._max_fact_chars:
+                    content = content[: self._max_fact_chars] + "…(略)"
+                lines.append(f"[记忆{i}] {content}")
+
+        n_items = len(lines)
+        return (
+            f"你是记忆整理助手。请把下面 {period} 的 {n_items} 条记忆"
+            f"合并成**一条{label}**。\n"
+            "\n"
+            "要求:\n"
+            "1. **只写记忆里真实存在的信息**,严禁推断、补充、编造。\n"
+            "2. **按【项目】分段组织** —— 每个项目一小段,讲清三件事:\n"
+            "   这个项目在做什么、目前进展到哪、有什么待解决/注意事项。\n"
+            "   项目的先后顺序保持与输入一致。\n"
+            "3. **每段只讲该项目的记忆,不要把不同项目的内容混在一起。**\n"
+            "4. 保留具体的数字、日期、地点、人名、偏好等细节。\n"
+            "5. 这些记忆来自**同一个人**的经历。用直接陈述的语气,\n"
+            "   不要写\"用户\"\"用户说\"这类第三人称转述。\n"
+            "6. 如果记忆里提到\"他/她/我妈/我爸\"等人,照原文保留这种指称,\n"
+            "   **不要**替 LLM 判断那是谁的事(原话是谁说的就是谁说的)。\n"
+            "7. 用中文 markdown,分条列出,控制在 600 字以内。\n"
+            f"\n"
+            f"【{period}的记忆】\n" + "\n".join(lines)
+        )
+
     async def summarize_5w1h(
         self, facts: list[FiveW1H]
     ) -> list[FiveW1H] | None:

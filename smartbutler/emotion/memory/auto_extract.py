@@ -37,6 +37,12 @@ from typing import TYPE_CHECKING, Any
 
 from smartbutler.emotion.memory.hooks import MemoryEventType, MemoryHooks
 from smartbutler.emotion.memory.importance import ImportanceScorer
+from smartbutler.emotion.memory.levels import (
+    participants_tag,
+    task_started_at_tag,
+    task_tag,
+    user_tag,
+)
 from smartbutler.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -172,9 +178,13 @@ class AutoExtractHook:
         步骤:
         1. 读 task 期间 user 消息(从 short_term)
            - 如果读不到(任务在 session 重启前已关)→ 用 title 兜底
-        2. 拼成 content,**不再做 importance 启发式门控** —— 所有事实都进库
+        2. **按说话人分桶**(2026-11-02)—— 每个说话人一条 fact
         3. 默认 importance=0.5(中性,consolidator 后处理)
         4. remember() 写 Qdrant,tags 完整保留 user / task / category / status
+
+        🆕 2026-11-02: 一个 task 可能产出**多条** fact(按说话人拆),
+        但它们**共享同一个 ``task:`` tag** —— 这是"task 是工作单元、
+        记忆以 task 组织"的落地方式:按 task 召回时能把分片拼回完整闭环。
         """
         try:
             # 1) 读 user 消息(按 task_id 从 task_index 抽,不再按 thread)
@@ -204,35 +214,78 @@ class AutoExtractHook:
             else:
                 importance = 0.5  # 中性默认值
 
-            # 3) 拼 tags:user + task + category + status 都进去
-            # 🆕 2026-10-13:user_id 也进 tags,这样 recall 渲染时能拿到
-            #   "这条是哪个 user 说的"——之前只有 content 文本前缀
-            #   "[user=u-male]"可读,key/tags 都没显式 user 字段。
-            tags = [
-                f"task:{task_id}",
-                f"category:{category}",
-                f"status:{status}",
-            ]
-            # 主 user(取出现最多的 user_id,通常就 1 个)
-            if user_ids:
-                from collections import Counter
-                main_user = Counter(user_ids).most_common(1)[0][0]
-                tags.append(f"user:{main_user}")
+            # 3) 🆕 2026-11-02: 按说话人拆 fact
+            #
+            # 归属 = 说话人(声纹给的 user_id,客观)。转述内容原样留在正文里,
+            # 不做"我妈 → 妈妈 user_id"的映射 —— 那是置信度问题,交给 LLM
+            # 在召回时判断,代码只负责客观的 speaker 归属。
+            #
+            # 读不到 task_messages 时(兜底路径)只能落一条 unknown 归属的 fact,
+            # 总比丢信息强。
+            buckets = self._group_by_speaker(self._safe_iter_messages(task_id))
+            if not buckets:
+                buckets = {"": [user_content]}
+                user_ids = []
 
-            # 4) remember —— level=None 留给 Consolidator 升格
-            await self._facade.remember(
-                user_content,
-                tags=tags,
-                importance=importance,
-            )
-            self._extracted_count += 1
-            logger.info(
-                "auto_extract.stored task_id=%s importance=%.2f content=%s",
-                task_id, importance, user_content[:80],
-            )
+            # task 起始时间(跨天 task 归一化用)
+            task_started_at = self._task_started_at(task_id)
+
+            # 参与者 = 本 task 涉及的全部 user
+            participants = list(user_ids) or [
+                u for u in buckets.keys() if u
+            ]
+
+            for speaker, lines in buckets.items():
+                tags = self._build_fact_tags(
+                    task_id=task_id,
+                    speaker=speaker,
+                    category=category,
+                    status=status,
+                    participants=participants,
+                    task_started_at=task_started_at,
+                )
+                content = "\n".join(lines) if lines else user_content
+                await self._facade.remember(
+                    content,
+                    tags=tags,
+                    importance=importance,
+                )
+                self._extracted_count += 1
+                logger.info(
+                    "auto_extract.stored task_id=%s speaker=%s n_lines=%d "
+                    "importance=%.2f tags=%s content=%s",
+                    task_id, speaker or "(unknown)", len(lines),
+                    importance, tags, content[:80],
+                )
         except Exception as e:  # noqa: BLE001
             self._failed_count += 1
             logger.warning("auto_extract.failed task_id=%s err=%s", task_id, e)
+
+    def _safe_iter_messages(self, task_id: str) -> list[Any]:
+        """读 task 消息,失败返回空列表(不抛)。"""
+        try:
+            return list(self._task_index.iter_task_messages(task_id))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "auto_extract.iter_task_messages_failed task_id=%s err=%s", task_id, e
+            )
+            return []
+
+    def _task_started_at(self, task_id: str) -> str:
+        """取 task 的起始时间(ISO)。
+
+        用于跨天 task 归一化:一个 task 跨了午夜时,它的 fact 应该全部
+        落在"开始那天"的日报里,而不是被切成两段。
+        读不到返回 ""(退化为用 fact 自身的 created_at)。
+        """
+        try:
+            rec = self._task_index.get_task(task_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "auto_extract.get_task_failed task_id=%s err=%s", task_id, e
+            )
+            return ""
+        return getattr(rec, "start_ts", "") or ""
 
     async def _collect_user_content(
         self,
@@ -306,6 +359,109 @@ class AutoExtractHook:
         if lines:
             return "\n".join(lines), user_ids
         return title, []
+
+    # 🆕 2026-11-02: 按说话人分桶
+    # -----------------------------------------------------------------------
+    #
+    # 设计要点(**归属 = 说话人,不是话语里提到的人**):
+    #
+    # 高天禹说"我妈今天也去上海" → fact 归属**高天禹**,不是他妈妈。
+    # 因为"我妈去上海"是**高天禹的说法**,可信度取决于谁说的;
+    # 如果高天禹自己说"我今天去上海",才是他本人的事实。
+    #
+    # 这就是"转述的置信度问题"在系统里的落法:
+    # - **归属只认 speaker**(声纹识别出的 user_id,客观事实)
+    # - **转述内容靠 content 里的自然语言保留**(LLM 读正文时自己判断)
+    #
+    # 代码不能做、也不该做"这句话描述的是谁的行程"的判断 —— 那没有客观
+    # 答案。只有 speaker 是客观的。
+    #
+    # 为什么按说话人拆成多条 fact(而不是一个 task 一条):
+    # - 一个 task 里多人说话时,单条 fact 只能挂一个 user tag → 另一半发言
+    #   的归属被"Counter 取主用户"悄悄丢掉(旧实现的 bug)。
+    # - 拆开后,升格时按 user 分桶就能得到"每个人的一天",互不污染。
+
+    def _group_by_speaker(
+        self,
+        msgs: list[Any],
+    ) -> dict[str, list[str]]:
+        """把 task 内的消息按**说话人**分桶。
+
+        Args:
+            msgs: :meth:`TaskIndex.iter_task_messages` 的结果。
+
+        Returns:
+            ``{user_id: [行, ...]}`` —— user_id 为主说话人,行是拼好的对话流。
+            无 user_id 的消息归到 ``""``(unknown 桶)。
+
+        规则:
+        - ``user`` 消息进**自己**的桶
+        - ``assistant`` 消息进**上一位 user**的桶
+          (管家在回应谁 → 那条 task 的结论属于谁;
+           与 ``task_segmenter`` 的锚点逻辑一致 —— assistant 跟随锚点 user)
+        - 桶内保持原始消息顺序
+        """
+        buckets: dict[str, list[str]] = {}
+        last_speaker = ""
+        for m in msgs:
+            role = (getattr(m, "role", "") or "").lower()
+            user_id = (getattr(m, "user_id", "") or "").strip()
+            content = (getattr(m, "content", "") or "").strip()
+            if not content:
+                continue
+            if role in ("user", "human"):
+                last_speaker = user_id
+                tag = f"[user={user_id}]" if user_id else "[user]"
+                buckets.setdefault(user_id, []).append(f"{tag} {content}")
+            elif role in ("assistant", "ai"):
+                # assistant 跟随上一位 user;若还没有 user,归 unknown 桶
+                buckets.setdefault(last_speaker, []).append(f"[assistant] {content[:300]}")
+        return buckets
+
+    def _build_fact_tags(
+        self,
+        *,
+        task_id: str,
+        speaker: str,
+        category: str,
+        status: str,
+        participants: list[str],
+        task_started_at: str,
+    ) -> list[str]:
+        """拼 fact 的 tags。
+
+        **归属三层不变式的起点** —— 升格时这三类 tag 会被代码重新写一遍:
+
+        - ``task:<task_id>``     工作单元锚点(同一 task 的多条 fact 共享)
+        - ``user:<speaker>``     **主归属 = 说话人**
+        - ``participants:<ids>`` 本 task 涉及的全部 user(多人 task 才写)
+        - ``task_started_at:<iso>`` task 起始时间(跨天 task 归一化用)
+
+        Args:
+            task_id: task id。
+            speaker: 本条 fact 的说话人(主归属)。
+            category: task 类别。
+            status: task 状态。
+            participants: 本 task 涉及的全部 user_id。
+            task_started_at: task 起始时间(ISO),空则不写该 tag。
+
+        Returns:
+            tag 列表。
+        """
+        tags = [
+            task_tag(task_id),
+            user_tag(speaker),
+            f"category:{category}",
+            f"status:{status}",
+        ]
+        if len(participants) > 1:
+            p_tag = participants_tag(participants)
+            if p_tag:
+                tags.append(p_tag)
+        started = task_started_at_tag(task_started_at)
+        if started:
+            tags.append(started)
+        return [t for t in tags if t]
 
 
 __all__ = ["AutoExtractHook"]

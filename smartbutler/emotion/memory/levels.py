@@ -91,6 +91,113 @@ def level_tag(level: MemoryLevel) -> str:
     return f"level:{level.value}"
 
 
+# ---------------------------------------------------------------------------
+# 归属 tag 生成(2026-11-02)
+# ---------------------------------------------------------------------------
+#
+# 设计原则:**归属是结构化字段,不是文本**。
+#
+# 归属(谁说的)必须由代码保证,不能靠 LLM 在摘要正文里"写上名字"——
+# 那样每次升格的结果会漂移、无法断言、跨层必然衰减。
+# 归属以 tag 形式落库,每层升格时由代码**重新写一遍**,形成不变式:
+#
+#     fact  tags: user:X, task:Y
+#     日报  tags: user:X, task:Y          ← 代码写
+#     周报  tags: user:X, task:Y          ← 代码写
+#
+# 只有正文措辞交给 LLM,归属永远由代码守。
+#
+# tag 语义:
+# - ``user:<user_id>``      —— **主归属**。谁的"这一天/这一周"= 说话人
+#   (声纹识别出的 user_id),**不是**话语里提到的人。
+#   例:"我妈今天也去上海"由高天禹说 → 归属高天禹,转述对象留在正文里。
+# - ``task:<task_id>``      —— 工作单元锚点。一条日报可含多个 task tag。
+# - ``participants:<ids>``  —— 本条目涉及的全部 user_id(逗号分隔,排序去重)。
+# - ``task_started_at:<iso>`` —— task 的起始时间。跨天 task 用它归一化时间窗,
+#   避免一个 task 被切成几段日报。
+
+#: 无归属时使用的占位 user_id(老数据没有 user: tag 的情况)
+UNKNOWN_USER = "unknown"
+
+
+def user_tag(user_id: str | None) -> str:
+    """生成主归属 tag(``user:speaker_abc``)。
+
+    空值统一转成 ``user:unknown`` —— 老数据(升格前写的 fact)没有归属,
+    归到 unknown 组,**不丢弃**也不污染具体某个人的组。
+    """
+    uid = (user_id or "").strip()
+    return f"user:{uid or UNKNOWN_USER}"
+
+
+def task_tag(task_id: str | None) -> str:
+    """生成 task 锚点 tag(``task:task_abc``)。空值返回 ""(不写该 tag)。"""
+    tid = (task_id or "").strip()
+    return f"task:{tid}" if tid else ""
+
+
+def participants_tag(user_ids: list[str] | tuple[str, ...] | None) -> str:
+    """生成参与者 tag(``participants:a,b``)。
+
+    去重 + 排序,保证同一组参与者每次生成的值一致(便于幂等比较)。
+    空列表返回 ""。
+    """
+    if not user_ids:
+        return ""
+    cleaned = sorted({(u or "").strip() for u in user_ids if (u or "").strip()})
+    if not cleaned:
+        return ""
+    return f"participants:{','.join(cleaned)}"
+
+
+def task_started_at_tag(started_at: str | None) -> str:
+    """生成 task 起始时间 tag(``task_started_at:2026-11-01T10:00:00``)。"""
+    ts = (started_at or "").strip()
+    return f"task_started_at:{ts}" if ts else ""
+
+
+def parse_user_tag(tags: list[str] | tuple[str, ...] | None) -> str | None:
+    """从 tags 里解析主归属 user_id。
+
+    找不到返回 ``None``(**不是** ``"unknown"``)—— 调用方需要区分
+    "没有归属信息"和"归属是 unknown"两种情况,前者才走兜底逻辑。
+    """
+    for tag in tags or ():
+        if tag.startswith("user:"):
+            uid = tag[len("user:") :].strip()
+            if uid:
+                return uid
+    return None
+
+
+def parse_task_tags(tags: list[str] | tuple[str, ...] | None) -> list[str]:
+    """从 tags 里解析全部 task_id(按出现顺序去重)。"""
+    out: list[str] = []
+    for tag in tags or ():
+        if tag.startswith("task:"):
+            tid = tag[len("task:") :].strip()
+            if tid and tid not in out:
+                out.append(tid)
+    return out
+
+
+def parse_participants_tag(tags: list[str] | tuple[str, ...] | None) -> list[str]:
+    """从 tags 里解析参与者 user_id 列表。"""
+    for tag in tags or ():
+        if tag.startswith("participants:"):
+            raw = tag[len("participants:") :]
+            return [u for u in (x.strip() for x in raw.split(",")) if u]
+    return []
+
+
+def parse_task_started_at(tags: list[str] | tuple[str, ...] | None) -> str:
+    """从 tags 里解析 task 起始时间(ISO 字符串),取不到返回 ""。"""
+    for tag in tags or ():
+        if tag.startswith("task_started_at:"):
+            return tag[len("task_started_at:") :].strip()
+    return ""
+
+
 def parse_recall_level(levels: RecallLevel | str | list[str] | None) -> list[str]:
     """把 RecallLevel / 字符串 / 列表统一解析成 ``level:xxx`` tag 列表。
 
@@ -160,4 +267,14 @@ __all__ = [
     "level_tag",
     "parse_recall_level",
     "importance_to_levels",
+    # 归属 tag(2026-11-02)
+    "UNKNOWN_USER",
+    "user_tag",
+    "task_tag",
+    "participants_tag",
+    "task_started_at_tag",
+    "parse_user_tag",
+    "parse_task_tags",
+    "parse_participants_tag",
+    "parse_task_started_at",
 ]
