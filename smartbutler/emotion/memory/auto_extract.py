@@ -33,16 +33,22 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from smartbutler.emotion.memory.hooks import MemoryEventType, MemoryHooks
 from smartbutler.emotion.memory.importance import ImportanceScorer
 from smartbutler.emotion.memory.levels import (
+    INVALIDATES_TAG,
     participants_tag,
+    spoken_at_tag,
     task_started_at_tag,
     task_tag,
     user_tag,
+    valid_at_tag,
 )
+from smartbutler.emotion.memory.temporal import TemporalExtractor, TemporalInfo
 from smartbutler.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -51,6 +57,34 @@ if TYPE_CHECKING:
     from smartbutler.emotion.memory.task_index import TaskIndex
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class SpeakerBucket:
+    """一个说话人在一个 task 里的发言分桶。
+
+    🆕 2026-11-04:加上 ``spoken_at`` —— 每条 fact 的**说话时间**。
+
+    为什么取**最早**那条 user 消息的时间:
+    - 它代表"这批内容最早是什么时候被说出来的"
+    - 相对时间("明天""下周一")必须以**说话时刻**为基准绝对化 ——
+      同一句话如果隔天再被提到,含义就变了
+    - 桶内通常只有 1-2 条 user 消息,取最早基本等于"这句话说的时间"
+    """
+
+    #: 主说话人 user_id("" = unknown)
+    user_id: str = ""
+    #: 拼好的对话流行(``[user=xxx] 内容`` / ``[assistant] 内容``)
+    lines: list[str] = field(default_factory=list)
+    #: 桶内最早那条 user 消息的说话时间(ISO)
+    spoken_at: str = ""
+
+    def note_spoken_at(self, ts: str) -> None:
+        """记录一条 user 消息的说话时间(取最早)。"""
+        if not ts:
+            return
+        if not self.spoken_at or ts < self.spoken_at:
+            self.spoken_at = ts
 
 
 class AutoExtractHook:
@@ -66,21 +100,27 @@ class AutoExtractHook:
             ``MemorySettings.auto_extract_min_importance`` 注入)。
             = 0.0(默认)→ 不门控,所有 fact 进库(importance=0.5);
             > 0       → 启发式评分 < 此值丢弃(老行为)。
+        temporal_extractor: 时间抽取器(可选)。注入后每条 fact 会带
+            ``spoken_at``(说话时间,代码取)与 ``valid_at``(事件生效时间,
+            LLM 绝对化)。None = 只写 spoken_at,不写 valid_at。
     """
 
     def __init__(
         self,
         *,
-        facade: "MemoryFacade",
-        short_term: "ShortTermMemory",
-        task_index: "TaskIndex",
+        facade: MemoryFacade,
+        short_term: ShortTermMemory,
+        task_index: TaskIndex,
         scorer: ImportanceScorer | None = None,
         min_importance: float = 0.0,
+        temporal_extractor: TemporalExtractor | None = None,
     ) -> None:
         self._facade = facade
         self._short_term = short_term
         self._task_index = task_index
         self._scorer = scorer or ImportanceScorer()
+        # 🆕 2026-11-04:时间抽取器(可选)。None → 不抽 valid_at。
+        self._temporal = temporal_extractor or TemporalExtractor(None)
         # 唯一门控源:min_importance 字段。0=不门控(默认),>0=老行为。
         self._min_importance = float(min_importance)
         self._extracted_count = 0
@@ -224,7 +264,11 @@ class AutoExtractHook:
             # 总比丢信息强。
             buckets = self._group_by_speaker(self._safe_iter_messages(task_id))
             if not buckets:
-                buckets = {"": [user_content]}
+                # 兜底:读不到 task_messages 时只能落一条 unknown 归属的 fact,
+                # 用 task 起始时间当 spoken_at(总比丢信息强)。
+                buckets = {
+                    "": SpeakerBucket(user_id="", lines=[user_content]),
+                }
                 user_ids = []
 
             # task 起始时间(跨天 task 归一化用)
@@ -235,7 +279,24 @@ class AutoExtractHook:
                 u for u in buckets.keys() if u
             ]
 
-            for speaker, lines in buckets.items():
+            for speaker, bucket in buckets.items():
+                lines = bucket.lines
+                content = "\n".join(lines) if lines else user_content
+
+                # 🆕 2026-11-04: 时间抽取
+                #
+                # - ``spoken_at``:客观,代码直接从 task_messages 取(桶内最早)
+                # - ``valid_at``:LLM 把"明天""下周一"绝对化(基于 spoken_at 基准)
+                #
+                # 为什么 valid_at 要以 spoken_at 为基准而不是"现在":
+                # "我明天去上海"如果是三天前说的,它的"明天"是**三天前的明天**。
+                # 用 now 做基准会把这个 fact 放到错误的日期上。
+                temporal = await self._extract_temporal(
+                    content=content,
+                    speaker=speaker,
+                    spoken_at=bucket.spoken_at,
+                )
+
                 tags = self._build_fact_tags(
                     task_id=task_id,
                     speaker=speaker,
@@ -243,8 +304,10 @@ class AutoExtractHook:
                     status=status,
                     participants=participants,
                     task_started_at=task_started_at,
+                    spoken_at=bucket.spoken_at,
+                    valid_at=temporal.valid_at,
+                    invalidates=temporal.invalidates,
                 )
-                content = "\n".join(lines) if lines else user_content
                 await self._facade.remember(
                     content,
                     tags=tags,
@@ -253,13 +316,65 @@ class AutoExtractHook:
                 self._extracted_count += 1
                 logger.info(
                     "auto_extract.stored task_id=%s speaker=%s n_lines=%d "
-                    "importance=%.2f tags=%s content=%s",
+                    "importance=%.2f spoken_at=%s valid_at=%s invalidates=%s "
+                    "tags=%s content=%s",
                     task_id, speaker or "(unknown)", len(lines),
-                    importance, tags, content[:80],
+                    importance, bucket.spoken_at or "(none)",
+                    temporal.valid_at or "(none)",
+                    temporal.invalidates, tags, content[:80],
                 )
         except Exception as e:  # noqa: BLE001
             self._failed_count += 1
             logger.warning("auto_extract.failed task_id=%s err=%s", task_id, e)
+
+    async def _extract_temporal(
+        self,
+        *,
+        content: str,
+        speaker: str,
+        spoken_at: str,
+    ) -> TemporalInfo:
+        """抽取一条 fact 的时间语义(降级安全)。
+
+        🆕 2026-11-04。
+
+        Args:
+            content: fact 正文。
+            speaker: 说话人 user_id(prompt 上下文用)。
+            spoken_at: 说话时间(ISO)—— 相对时间绝对化的基准。
+
+        Returns:
+            :class:`~smartbutler.emotion.memory.temporal.TemporalInfo`。
+            LLM 失败 → ``valid_at=None``(**不是** permanent)。
+        """
+        if not self._temporal.enabled:
+            return TemporalInfo(None, "none")
+
+        # 解析 spoken_at 成 datetime(基准)。解析失败 → 用 None(LLM 用 now)。
+        reference: datetime | None = None
+        if spoken_at:
+            try:
+                s = spoken_at.strip()
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                reference = datetime.fromisoformat(s)
+                if reference.tzinfo is None:
+                    reference = reference.replace(tzinfo=UTC)
+            except (TypeError, ValueError):
+                logger.debug(
+                    "auto_extract.bad_spoken_at value=%r → 用 now 做基准", spoken_at,
+                )
+                reference = None
+
+        try:
+            return await self._temporal.extract(
+                content,
+                speaker=speaker,
+                reference_time=reference,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("auto_extract.temporal_failed err=%s", e)
+            return TemporalInfo(None, "none")
 
     def _safe_iter_messages(self, task_id: str) -> list[Any]:
         """读 task 消息,失败返回空列表(不抛)。"""
@@ -384,24 +499,26 @@ class AutoExtractHook:
     def _group_by_speaker(
         self,
         msgs: list[Any],
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, SpeakerBucket]:
         """把 task 内的消息按**说话人**分桶。
 
         Args:
             msgs: :meth:`TaskIndex.iter_task_messages` 的结果。
 
         Returns:
-            ``{user_id: [行, ...]}`` —— user_id 为主说话人,行是拼好的对话流。
+            ``{user_id: SpeakerBucket}`` —— user_id 为主说话人。
             无 user_id 的消息归到 ``""``(unknown 桶)。
 
         规则:
         - ``user`` 消息进**自己**的桶
         - ``assistant`` 消息进**上一位 user**的桶
           (管家在回应谁 → 那条 task 的结论属于谁;
-           与 ``task_segmenter`` 的锚点逻辑一致 —— assistant 跟随锚点 user)
+          与 ``task_segmenter`` 的锚点逻辑一致 —— assistant 跟随锚点 user)
         - 桶内保持原始消息顺序
+        - ``spoken_at`` 取桶内**最早**那条 user 消息的说话时间
+          —— 它代表"这条事实最早被说出来的时间",也是相对时间绝对化的基准
         """
-        buckets: dict[str, list[str]] = {}
+        buckets: dict[str, SpeakerBucket] = {}
         last_speaker = ""
         for m in msgs:
             role = (getattr(m, "role", "") or "").lower()
@@ -412,10 +529,15 @@ class AutoExtractHook:
             if role in ("user", "human"):
                 last_speaker = user_id
                 tag = f"[user={user_id}]" if user_id else "[user]"
-                buckets.setdefault(user_id, []).append(f"{tag} {content}")
+                bucket = buckets.setdefault(user_id, SpeakerBucket(user_id=user_id))
+                bucket.lines.append(f"{tag} {content}")
+                spoken_at = (getattr(m, "spoken_at", "") or "").strip()
+                if spoken_at:
+                    bucket.note_spoken_at(spoken_at)
             elif role in ("assistant", "ai"):
                 # assistant 跟随上一位 user;若还没有 user,归 unknown 桶
-                buckets.setdefault(last_speaker, []).append(f"[assistant] {content[:300]}")
+                bucket = buckets.setdefault(last_speaker, SpeakerBucket(user_id=last_speaker))
+                bucket.lines.append(f"[assistant] {content[:300]}")
         return buckets
 
     def _build_fact_tags(
@@ -427,6 +549,9 @@ class AutoExtractHook:
         status: str,
         participants: list[str],
         task_started_at: str,
+        spoken_at: str = "",
+        valid_at: str | None = None,
+        invalidates: bool = False,
     ) -> list[str]:
         """拼 fact 的 tags。
 
@@ -437,6 +562,12 @@ class AutoExtractHook:
         - ``participants:<ids>`` 本 task 涉及的全部 user(多人 task 才写)
         - ``task_started_at:<iso>`` task 起始时间(跨天 task 归一化用)
 
+        🆕 2026-11-04 时间 tag:
+
+        - ``spoken_at:<iso>``   这条 fact **什么时候被说出来**(客观,代码取)
+        - ``valid_at:<value>``  这件事**本身什么时候成立**(LLM 绝对化)
+          四种形态:精确点 / 区间 / 周期 / 永久
+
         Args:
             task_id: task id。
             speaker: 本条 fact 的说话人(主归属)。
@@ -444,6 +575,10 @@ class AutoExtractHook:
             status: task 状态。
             participants: 本 task 涉及的全部 user_id。
             task_started_at: task 起始时间(ISO),空则不写该 tag。
+            spoken_at: 这条 fact 的说话时间(ISO),空则不写该 tag。
+            valid_at: 事件生效时间(编码值);None/空 → 不写该 tag。
+            invalidates: 这条话是否否定/修正了某个既有事实。为 True 时
+                额外写 ``invalidates:1`` tag(Step 3 的消解线索)。
 
         Returns:
             tag 列表。
@@ -461,7 +596,23 @@ class AutoExtractHook:
         started = task_started_at_tag(task_started_at)
         if started:
             tags.append(started)
+        spoken = spoken_at_tag(spoken_at)
+        if spoken:
+            tags.append(spoken)
+        valid = valid_at_tag(valid_at)
+        if valid:
+            tags.append(valid)
+        # 🆕 2026-11-04: 否定/修正标记。
+        #
+        # "张女士不再是我朋友了" 这类话会**终止**一个既有关系。
+        # 现在只**标记**(Step 1),不做自动消解 —— 消解需要知道
+        # "被否定的是哪一条",那要实体消解 + 图(Step 3)。
+        #
+        # 标记之后,Step 3 只需扫 ``invalidates:1`` 的条目就能定位候选,
+        # 不用重新分析全部事实。
+        if invalidates:
+            tags.append(INVALIDATES_TAG)
         return [t for t in tags if t]
 
 
-__all__ = ["AutoExtractHook"]
+__all__ = ["AutoExtractHook", "SpeakerBucket"]

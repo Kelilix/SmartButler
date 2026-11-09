@@ -44,6 +44,7 @@ from smartbutler.emotion.memory.summarizer import LLMScorer, LLMSummarizer
 from smartbutler.emotion.memory.task_index import TaskIndex
 from smartbutler.emotion.memory.task_scheduler import TaskScheduler
 from smartbutler.emotion.memory.task_segmenter import TaskSegmenter
+from smartbutler.emotion.memory.temporal import TemporalExtractor
 from smartbutler.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -226,6 +227,15 @@ async def build_memory_system(
     # ---- 自动抽取 hook(短期 → 长期 fact)----
     auto_extract: AutoExtractHook | None = None
     if bool(getattr(settings, "auto_extract_enabled", True)):
+        # 🆕 2026-11-04: 时间抽取器 —— 把"明天""下周一"绝对化。
+        #
+        # 为什么挂在这里而不是 consolidator:
+        # 时间是**fact 级**的属性(每条 fact 有自己的 spoken_at 和 valid_at),
+        # 不是摘要级的。日报是很多 fact 的聚合,没法再抽单条 fact 的时间。
+        #
+        # llm=None → TemporalExtractor 降级为"不抽 valid_at",
+        # 但 spoken_at(代码取)照常写 —— 不会因为没配 LLM 就完全丢失时间。
+        temporal_extractor = TemporalExtractor(llm)
         auto_extract = AutoExtractHook(
             facade=facade,
             short_term=short_term,
@@ -233,6 +243,7 @@ async def build_memory_system(
             min_importance=float(
                 getattr(settings, "auto_extract_min_importance", 0.0)
             ),
+            temporal_extractor=temporal_extractor,
         )
         auto_extract.register(hooks)
 

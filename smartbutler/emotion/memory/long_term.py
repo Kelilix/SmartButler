@@ -24,10 +24,15 @@ Phase 6.3 扩展(本文件新增):
 
 from __future__ import annotations
 
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from smartbutler.emotion.memory.levels import (
+    INVALIDATES_TAG,
+    parse_invalid_at,
+    parse_valid_at,
+)
 from smartbutler.storage.base import StorageError
 from smartbutler.storage.qdrant import QdrantStorage
 from smartbutler.utils.logging import get_logger
@@ -203,6 +208,19 @@ class LongTermStore:
                 row["deleted_reason"] = payload[PAYLOAD_DELETED_REASON]
             if PAYLOAD_SOURCE_KEYS in payload:
                 row["source_keys"] = payload[PAYLOAD_SOURCE_KEYS]
+            # 🆕 2026-11-04: 时间语义透传。
+            #
+            # 时间信息存在 tags 里(tag 体系),但为了让召回层(LLM 渲染、
+            # 失效判定)不用每次都去解析 tag 字符串,这里额外透传一份
+            # 结构化的便捷字段。tags 仍然是权威来源,这份是派生缓存。
+            valid_at = parse_valid_at(payload.get(PAYLOAD_TAGS, []) or [])
+            if valid_at:
+                row["valid_at"] = valid_at
+            invalid_at = parse_invalid_at(payload.get(PAYLOAD_TAGS, []) or [])
+            if invalid_at:
+                row["invalid_at"] = invalid_at
+            if INVALIDATES_TAG in (payload.get(PAYLOAD_TAGS, []) or []):
+                row["invalidates"] = True
             # 🆕 7.4 多模态字段透传(Qdrant payload schema-less,没有这些字段时
             # 不在 row 里出现,业务层 .get() 兜底 → None)
             if PAYLOAD_IMAGE_REF in payload:
@@ -351,6 +369,7 @@ class LongTermStore:
         *,
         include_deleted: bool = False,
         limit: int = 10_000,
+        only_unleveled: bool = False,
     ) -> list[dict[str, Any]]:
         """列某 level 的所有记忆(运维/审计用)。
 
@@ -358,6 +377,32 @@ class LongTermStore:
             level: "daily"/"weekly"/"monthly"/"permanent",None = 全部。
             include_deleted: True = 含软删除条目(配合 list_deleted 用)。
             limit: 最多返多少条(Qdrant scroll 默认 10000)。
+            only_unleveled: True = 只返回**payload 里没有 level 字段**的条目。
+
+                🆕 2026-11-04:修「日汇总重复压缩」bug 用的。
+
+                背景:``level=None`` 表示"不过滤 → 滚动全表"。而
+                :meth:`~smartbutler.emotion.memory.consolidation.Consolidator._scan`
+                在 DAILY 层级传 ``source_level=None``,本意是"扫**没有 level 字段**
+                的原始 fact"(``store_memory`` 在 ``level=None`` 时压根不写该 key)。
+                但旧实现把"无 level 字段"等同于"全表",
+                于是上一轮生成的日报/周报/月报本身也被扫进来 ——
+
+                    昨天 03:00 生成的日报,created_at 落在今天的时间窗内
+                    → 今天 03:00 又被当成源 fact 压缩一遍
+                    → 日复一日,越滚越大,归属标签也被层层重写。
+
+                修法:daily 层级显式要求"没有 level 字段"。
+
+                为什么用 ``IsEmptyCondition`` 而不是 ``MatchValue(value="")``:
+                ``MatchValue(value="")`` 匹配的是"level 字段的值等于空串",
+                而我们要的是"level 字段压根不存在"。IsEmptyCondition 语义精确。
+
+                ⚠️ 实测(Qdrant 1.19 本地模式):``IsEmptyCondition`` 只匹配
+                "key 缺失",**不**匹配"key 存在但值为空串"。所以 ``level=""``
+                会被排除 —— 这与客户端 ``has_level`` 判断一致,两侧不冲突。
+                (生产代码里 ``store_memory`` 只在 ``level is not None`` 时才写
+                这个字段,所以不会有 ``level=""`` 的条目。)
 
         Returns:
             [{"key": ..., "created_at": ..., "deleted": ..., "importance": ...,
@@ -366,12 +411,30 @@ class LongTermStore:
             🆕 2026-11-02: 新增 ``tags`` —— 归属信息(user:/task:/participants:)
             存在 tags 里,升格层要靠它按主体分桶、按 task 分段。
         """
+        from qdrant_client.models import IsEmptyCondition, PayloadField
+
         from smartbutler.storage.qdrant import FieldCondition, Filter, MatchValue
+
         if not self._q._client.collection_exists(self._q.collection):
             return []
-        must: list[FieldCondition] = []
+        must: list[Any] = []
         if level is not None:
             must.append(FieldCondition(key=PAYLOAD_LEVEL, match=MatchValue(value=level)))
+        if only_unleveled:
+            # 🆕 "payload 里没有 level 这个 key" —— IsEmptyCondition 是
+            # **Filter 级**的条件(不是 FieldCondition 内的一个字段),
+            # 所以要直接放进 must。
+            #
+            # ⚠️ 语义陷阱:IsEmptyCondition 表示"**这个 key 不存在**",
+            # 所以必须放在 **must** 里(要求它为空 = 要求它不存在)。
+            # 放进 must_not 会变成"要求它存在",正好反了。
+            #
+            # 实测(Qdrant 1.19 本地模式):
+            #   must=[IsEmpty(level)]        → 只返回 payload 里没有 level key 的
+            #   must_not=[IsEmpty(level)]    → 只返回 level **存在**的(反了!)
+            must.append(
+                IsEmptyCondition(is_empty=PayloadField(key=PAYLOAD_LEVEL))
+            )
         scroll_filter = Filter(must=must) if must else None
         points, _ = self._q._client.scroll(
             collection_name=self._q.collection,
@@ -391,6 +454,13 @@ class LongTermStore:
                 "created_at": pl.get(PAYLOAD_CREATED_AT, ""),
                 "deleted": bool(pl.get(PAYLOAD_DELETED, False)),
                 "level": pl.get(PAYLOAD_LEVEL, ""),
+                # 🆕 2026-11-04: 显式标记"payload 里有没有 level 字段"。
+                #
+                # 为什么要这个:上面的 "level" 用了 ``.get(key, "")``,
+                # 把"字段不存在"和"字段存在但值为空串"折叠成了同一个 ""。
+                # 而 daily 升格需要区分这两者(前者=原始 fact,后者=分层条目)。
+                # 详见 Consolidator._scan 的说明。
+                "has_level": PAYLOAD_LEVEL in pl,
                 "content": pl.get(PAYLOAD_CONTENT, ""),
                 # 🆕 2026-11-02: 归属信息在 tags 里(user:/task:/participants:)。
                 # 升格(Consolidator)要按 user 分桶、按 task 分段,必须能读到这里 ——

@@ -23,18 +23,26 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from smartbutler.capabilities.embedding.base import Embedder
 from smartbutler.emotion.memory.forgetting import ForgetResult
 from smartbutler.emotion.memory.hooks import MemoryEventType, MemoryHooks
 from smartbutler.emotion.memory.levels import (
+    INVALIDATES_TAG,
+    parse_invalid_at,
     parse_participants_tag,
+    parse_spoken_at,
     parse_task_tags,
+    parse_valid_at,
 )
-from smartbutler.emotion.memory.retrieval import MemoryRetriever
 from smartbutler.emotion.memory.long_term import LongTermStore
+from smartbutler.emotion.memory.retrieval import MemoryRetriever
+from smartbutler.emotion.memory.temporal import (
+    is_valid_at_active,
+    is_valid_at_pending,
+)
 from smartbutler.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -532,6 +540,23 @@ class MemoryFacade:
         if not hits:
             return ""
 
+        # 🆕 2026-11-04:算出"本轮被修正的旧 fact"。
+        #
+        # 为什么需要:Step 1 还不知道"张女士不再是我朋友了"具体否定的是
+        # **哪一条**(那要实体消解 + 图,属 Step 3)。但如果**同一 task 内**
+        # 同时召回了:
+        #     旧:"张女士是我朋友"              (无标记)
+        #     新:"张女士不再是我朋友了,我们掰了"  (invalidates:1)
+        # 那么旧的那条**就是**被修正的对象 —— 至少在同一 task 范围内成立。
+        #
+        # 为什么要限定"同一 task":不同 task 的两条 fact 可能是**不同主题**
+        # (task A 说"张女士是我朋友",task B 说"张女士不再是我朋友了"其实
+        # 指另一个张女士?)。跨 task 乱标会把不相关的事实打成"已修正",
+        # 比不标更糟。
+        #
+        # 限定 task 是 Step 1 能做到的最保守、最安全的推断。
+        superseded_keys = self._compute_superseded_keys(hits)
+
         # 按 task 分组(保持首次出现顺序)
         groups: dict[str, list[dict[str, Any]]] = {}
         order: list[str] = []
@@ -571,9 +596,142 @@ class MemoryFacade:
                 content = _truncate_middle(content, _resolve_max_fact_chars())
                 user_id = _extract_user_id_from_hit(h)
                 name = self._display_name(user_id)
-                lines.append(f"- **[{name} 说]** {content}")
+                lines.append(
+                    f"- **[{name} 说]** {content}"
+                    f"{self._render_time_hint(h, superseded=superseded_keys)}"
+                )
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _render_time_hint(
+        hit: dict[str, Any],
+        *,
+        superseded: set[str] | None = None,
+    ) -> str:
+        """给召回条目渲染时间提示(🆕 2026-11-04)。
+
+        让 LLM 在读记忆正文时**同时看到时间语义**,能区分:
+        - "2026-01-01 领证了" → 过去发生的事实
+        - "张女士是我朋友(长期有效)" → 当前状态
+        - "张女士不再是我朋友了(已失效/修正)" → 状态变更
+
+        为什么必须显式给 LLM 看:
+        正文里的"明天""下周一"在**抽取那一刻**已经绝对化过,
+        但正文本身还是原话("我明天去上海")。只给正文,LLM 不知道
+        "明天"指的是哪天 —— tag 里的绝对时间必须**翻译给 LLM**。
+
+        Args:
+            hit: 召回条目。
+            superseded: **已被本轮其他 fact 修正**的 key 集合。
+                命中 → 渲染成"已被修正",避免旧 fact 与新 fact 互相矛盾。
+
+        返回空串表示没有时间信息(不添乱)。
+        """
+        tags = list(hit.get("tags", []) or [])
+        valid = parse_valid_at(tags)
+        invalid = parse_invalid_at(tags)
+        is_superseded = bool(superseded) and hit.get("key", "") in superseded
+        if not valid and not invalid and not is_superseded:
+            return ""
+
+        parts: list[str] = []
+        if valid:
+            parts.append(_describe_valid_at(valid))
+        if invalid:
+            parts.append(f"已于 {invalid} 失效")
+        elif is_superseded:
+            # 🆕 已被本轮修正 → 明确告诉 LLM "这条不再是当前状态"。
+            #
+            # 这是 Step 1 能在**不建图**的前提下解决矛盾的关键:
+            # 旧 fact("张女士是我朋友")本身没有任何失效标记(我们还没法
+            # 知道该给它打什么 invalid_at),但同一轮召回里出现了
+            # "不再是我朋友了"这条修正 fact —— 那旧 fact 就是被修正的对象。
+            #
+            # 标记成"已被修正"而不是"长期有效",LLM 就不会把两条都当成
+            # 当前状态,答案唯一。
+            parts.append("已被后续说法修正")
+        elif valid:
+            # 🆕 2026-11-04:区分"尚未生效"与"当前已不适用"。
+            #
+            # 两者 ``is_valid_at_active`` 都是 False,但语义相反:
+            # - 未来精确点("我明天去上海")→ **尚未生效**(计划中的事)
+            # - 已过期的区间("我那阵子在杭州出差")→ **当前已不适用**(过去的事)
+            #
+            # 标错的话,LLM 会把用户明天的安排当成"已经作废"。
+            if is_valid_at_pending(valid):
+                parts.append("尚未生效")
+            elif not is_valid_at_active(valid):
+                parts.append("当前已不适用")
+        if INVALIDATES_TAG in tags:
+            parts.append("修正了此前的说法")
+        if not parts:
+            return ""
+        return f"({'，'.join(parts)})"
+
+    @staticmethod
+    def _compute_superseded_keys(hits: list[dict[str, Any]]) -> set[str]:
+        """算出本轮召回中**被修正 fact 覆盖**的旧 fact 的 key 集合。
+
+        🆕 2026-11-04。Step 1 范围内解决"历史关系矛盾"的关键。
+
+        规则(保守):
+        1. 只看**带 ``invalidates:1``** 的 fact(明确说了"不再是/已终止")
+        2. 只在**同一 task** 内找被覆盖的旧 fact
+           (跨 task 可能是不同主题,乱标比不标更糟)
+        3. 旧 fact 必须**说话时间更早**(修正总是发生在旧事实之后)
+        4. 旧 fact 自己**不能**也是 invalidates fact
+
+        为什么这些约束:
+        - 规则 1:没把握的不要动
+        - 规则 2:task 是我们已有的"工作单元"边界,是最保守的关联单位
+        - 规则 3:防止把"后来的修正"标成"修正了后来的东西"
+        - 规则 4:两条修正语句之间不该互相覆盖
+
+        ⚠️ 这仍然是**启发式**,不是精确的实体消解。精确版要靠
+        实体消解 + 图(Step 3)。当前实现的定位是:
+        **在绝大多数"同一件事前后两次说法"的场景下让 LLM 拿到唯一答案**,
+        而不是在所有场景下都正确。
+
+        Args:
+            hits: :meth:`recall` 的结果。
+
+        Returns:
+            被覆盖的旧 fact 的 key 集合(空集 = 没有可确定的覆盖关系)。
+        """
+        invalidated: list[tuple[str, str, str]] = []  # (key, task, spoken_at)
+        for h in hits:
+            tags = list(h.get("tags", []) or [])
+            if INVALIDATES_TAG not in tags:
+                continue
+            tids = parse_task_tags(tags)
+            invalidated.append((
+                h.get("key", ""),
+                tids[0] if tids else "",
+                parse_spoken_at(tags),
+            ))
+        if not invalidated:
+            return set()
+
+        superseded: set[str] = set()
+        for h in hits:
+            tags = list(h.get("tags", []) or [])
+            if INVALIDATES_TAG in tags:
+                continue  # 修正 fact 本身不参与"被覆盖"
+            key = h.get("key", "")
+            tids = parse_task_tags(tags)
+            task = tids[0] if tids else ""
+            spoken = parse_spoken_at(tags)
+            for _ikey, itask, ispoken in invalidated:
+                # 必须同 task(两边都要有 task,且相同)
+                if not task or not itask or task != itask:
+                    continue
+                # 旧 fact 的说话时间必须更早(或未知 —— 未知时不排除)
+                if spoken and ispoken and spoken >= ispoken:
+                    continue
+                superseded.add(key)
+                break
+        return superseded
 
     # ------------------- 6.3 新增方法(6 个) -------------------
 
@@ -752,6 +910,43 @@ class MemoryFacade:
         return self._vacuum.bulk_purge_archived(
             older_than_days=older_than_days, confirm=confirm,
         )
+
+
+# ---------------------------------------------------------------------------
+# 时间语义渲染辅助(🆕 2026-11-04)
+# ---------------------------------------------------------------------------
+
+
+def _describe_valid_at(valid_at: str) -> str:
+    """把 valid_at 编码值翻译成**人能读、LLM 能懂**的一句话。
+
+    编码值 → 中文描述:
+
+    ==============================  ====================================
+    编码                            描述
+    ==============================  ====================================
+    ``2026-01-01``                 "生效于 2026-01-01"
+    ``2026-11-09/2026-11-15``      "生效于 2026-11-09 至 2026-11-15"
+    ``recurring:01-29``            "每年 01-29 生效"
+    ``permanent``                  "长期有效"
+    ==============================  ====================================
+
+    为什么给 LLM 看中文而不是原始编码:
+    LLM 的语义理解基于自然语言。``recurring:01-29`` 这种自造编码
+    对 LLM 来说是**弱语义**,翻译成"每年 01-29 生效"才真正起作用。
+    """
+    v = (valid_at or "").strip()
+    if not v:
+        return ""
+    if v == "permanent":
+        return "长期有效"
+    if v.startswith("recurring:"):
+        md = v[len("recurring:") :]
+        return f"每年 {md} 生效"
+    if "/" in v:
+        start, _, end = v.partition("/")
+        return f"生效于 {start} 至 {end}"
+    return f"生效于 {v}"
 
 
 __all__ = ["MemoryFacade", "MemoryContext"]

@@ -119,6 +119,12 @@ def level_tag(level: MemoryLevel) -> str:
 #: 无归属时使用的占位 user_id(老数据没有 user: tag 的情况)
 UNKNOWN_USER = "unknown"
 
+#: 🆕 2026-11-04: "这条话否定了某个既有事实" 的标记 tag。
+#:
+#: 承载"张女士不再是我朋友了"这类**修正语义**的入口。
+#: Step 1 只标记,Step 3(实体消解 + 图)才做真正的自动消解。
+INVALIDATES_TAG = "invalidates:1"
+
 
 def user_tag(user_id: str | None) -> str:
     """生成主归属 tag(``user:speaker_abc``)。
@@ -154,6 +160,158 @@ def task_started_at_tag(started_at: str | None) -> str:
     """生成 task 起始时间 tag(``task_started_at:2026-11-01T10:00:00``)。"""
     ts = (started_at or "").strip()
     return f"task_started_at:{ts}" if ts else ""
+
+
+# ---------------------------------------------------------------------------
+# 时间 tag(2026-11-04)
+# ---------------------------------------------------------------------------
+#
+# 设计依据:Zep / Graphiti 的**双时态**模型。
+#
+# 我们只落其中两条(第三步"图相关的失效修正"暂不做):
+#
+# - ``spoken_at`` —— **系统时间**:这条事实是**什么时候被说出来的**。
+#   客观、可由代码直接取(task_messages.spoken_at),不依赖 LLM。
+#   用途:回答"这件事我是什么时候跟你说的"、"上次的对话是什么时候"。
+#
+# - ``valid_at``  —— **世界时间**:这件事**本身在什么时候成立/生效**。
+#   需要 LLM 把"明天""下周一"绝对化,语义有四种:
+#
+#     ① 精确时间点  : "2026年1月1号是我领证了"
+#        → valid_at:2026-01-01
+#     ② 时间范围    : "下周我想吃龙虾"
+#        → valid_at:2026-11-09/2026-11-15   (ISO 区间,闭区间)
+#     ③ 周期性      : "1月29号是我生日"  (每年都成立)
+#        → valid_at:recurring:01-29
+#     ④ 永久/普适事实: "张女士是我朋友"  (没有时间语义)
+#        → valid_at:permanent
+#
+# 为什么用 **tag** 而不是 payload 字段:
+# - 跟现有的归属 tag(user:/task:/participants:)体系一致,升格时**代码重写一遍**
+# - Qdrant 的 tags 数组支持服务端 MatchValue 过滤,能直接按时间查
+# - 区间/周期/永久统一编码成字符串,不需要改 payload schema
+#
+# 为什么 valid_at 用**字符串**而不是 datetime:
+# - ②区间不是一个时刻,③周期更不是 —— datetime 表达不了
+# - 字符串编码简单、可读、可比较(ISO 前缀排序对①②有效)
+
+
+def spoken_at_tag(spoken_at: str | None) -> str:
+    """生成 spoken_at tag(``spoken_at:2026-11-03T10:00:00+00:00``)。
+
+    事实的**说话时间**(客观,代码直接取)。空值返回 ""(不写该 tag)。
+    """
+    ts = (spoken_at or "").strip()
+    return f"spoken_at:{ts}" if ts else ""
+
+
+#: valid_at 的四种形态标记
+VALID_AT_PERMANENT = "permanent"          # 永久/普适事实("张女士是我朋友")
+VALID_AT_RECURRING_PREFIX = "recurring:"  # 周期事实("1月29号是我生日")
+
+
+def valid_at_tag(valid_at: str | None) -> str:
+    """生成 valid_at tag(``valid_at:2026-01-01``)。
+
+    支持四种形态(见上方设计说明):
+
+    - 精确点   ``2026-01-01`` / ``2026-01-01T10:00:00+00:00``
+    - 区间     ``2026-11-09/2026-11-15``(ISO 区间,闭区间:两端都含)
+    - 周期     ``recurring:01-29``
+    - 永久     ``permanent``
+
+    空值返回 ""(不写该 tag)—— 表示"没能抽出时间",而不是"永久"。
+    这两个语义必须区分,所以**空值不写 tag**,由 LLM 明确输出 ``permanent``。
+    """
+    ts = (valid_at or "").strip()
+    return f"valid_at:{ts}" if ts else ""
+
+
+# ---------------------------------------------------------------------------
+# 失效 / 修正 tag(2026-11-04,Step 1)
+# ---------------------------------------------------------------------------
+#
+# 问题:用户说"张女士不再是我朋友了,我们掰了" —— 这条话**否定**了一条旧事实。
+#
+# 如果只往库里追加一条新 fact,库里的状态就是:
+#
+#     F1: 张女士是我朋友            (permanent)
+#     F2: 张女士不再是我朋友了,我们掰了 (permanent)
+#
+# 两条**互相矛盾**且都"永久成立" —— LLM 召回时看到这两条,无法判断该信哪条。
+#
+# 解法(双时态的经典做法,对应 Zep 的 ``invalid_at``):
+#
+#     F1: valid_at=permanent, invalid_at=2026-11-04  ← 到 11-04 失效
+#     F2: valid_at=permanent                          ← 从 11-04 起生效
+#
+# 这样"现在"问"张女士是不是我朋友" → F1 已失效,F2 生效 → 答案唯一。
+# 而"以前呢"(2026 年 10 月问)→ F1 当时有效,F2 当时还不存在 → 答案也唯一。
+#
+# **历史没有被改写,只是被加了一个失效时间** —— 这是 bi-temporal 的核心。
+#
+# Step 1 只负责**承载**这些字段(写 tag / 解析 tag)。
+# 「自动发现 F2 否定 F1」需要实体消解 + 图,属于 Step 3,现在不做。
+# 但字段和 prompt 现在就位,Step 3 接入时不用改 schema。
+
+
+def invalid_at_tag(invalid_at: str | None) -> str:
+    """生成 invalid_at tag(``invalid_at:2026-11-04T10:00:00+00:00``)。
+
+    事实**失效的时间**(世界时间)。空值返回 ""(还没失效)。
+    """
+    ts = (invalid_at or "").strip()
+    return f"invalid_at:{ts}" if ts else ""
+
+
+def supersedes_tag(supersedes: str | None) -> str:
+    """生成 supersedes tag(``supersedes:fact_abc123``)。
+
+    标记"这条 fact **修正/否定**了另一条 fact"。用来给 Step 3 的
+    矛盾消解留线索 —— 现在只标记,不做自动消解。
+
+    支持多个 key(逗号分隔),排序去重保证值稳定。
+    """
+    if not supersedes:
+        return ""
+    keys = sorted({k.strip() for k in supersedes.split(",") if k.strip()})
+    return f"supersedes:{','.join(keys)}" if keys else ""
+
+
+def parse_invalid_at(tags: list[str] | tuple[str, ...] | None) -> str:
+    """从 tags 里解析 invalid_at(ISO 字符串),取不到返回 ""。"""
+    for tag in tags or ():
+        if tag.startswith("invalid_at:"):
+            return tag[len("invalid_at:") :].strip()
+    return ""
+
+
+def parse_supersedes(tags: list[str] | tuple[str, ...] | None) -> list[str]:
+    """从 tags 里解析被这条 fact 修正的 key 列表。"""
+    for tag in tags or ():
+        if tag.startswith("supersedes:"):
+            raw = tag[len("supersedes:") :]
+            return [k for k in (x.strip() for x in raw.split(",")) if k]
+    return []
+
+
+def parse_spoken_at(tags: list[str] | tuple[str, ...] | None) -> str:
+    """从 tags 里解析 spoken_at(ISO 字符串),取不到返回 ""。"""
+    for tag in tags or ():
+        if tag.startswith("spoken_at:"):
+            return tag[len("spoken_at:") :].strip()
+    return ""
+
+
+def parse_valid_at(tags: list[str] | tuple[str, ...] | None) -> str:
+    """从 tags 里解析 valid_at(原始值,不含 ``valid_at:`` 前缀)。
+
+    取不到返回 ""。返回值可能是四种形态之一,调用方按需解析。
+    """
+    for tag in tags or ():
+        if tag.startswith("valid_at:"):
+            return tag[len("valid_at:") :].strip()
+    return ""
 
 
 def parse_user_tag(tags: list[str] | tuple[str, ...] | None) -> str | None:
@@ -269,6 +427,7 @@ __all__ = [
     "importance_to_levels",
     # 归属 tag(2026-11-02)
     "UNKNOWN_USER",
+    "INVALIDATES_TAG",
     "user_tag",
     "task_tag",
     "participants_tag",
@@ -277,4 +436,15 @@ __all__ = [
     "parse_task_tags",
     "parse_participants_tag",
     "parse_task_started_at",
+    # 时间 tag(2026-11-04)
+    "VALID_AT_PERMANENT",
+    "VALID_AT_RECURRING_PREFIX",
+    "spoken_at_tag",
+    "valid_at_tag",
+    "invalid_at_tag",
+    "supersedes_tag",
+    "parse_spoken_at",
+    "parse_valid_at",
+    "parse_invalid_at",
+    "parse_supersedes",
 ]

@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from typing import Any
 
 from smartbutler.capabilities.embedding.base import Embedder, EmbedderError
@@ -156,7 +156,7 @@ class MemoryRetriever:
             return []
         now = now or datetime.now(UTC)
         # 客户端重排:用 importance + 时间衰减 + 原始相似度
-        ranked: list[RetrievalHit] = []
+        ranked: list[dict[str, Any]] = []
         for h in hits:
             created_str = h.get("created_at", "")
             try:
@@ -197,7 +197,7 @@ class MemoryRetriever:
                 continue
             # 综合:similarity(0-1) * time_decay(0-1) * importance_weight(0.5-1.0)
             final = raw_norm * decay * (0.5 + importance / 2.0)
-            ranked.append(RetrievalHit(
+            hit = RetrievalHit(
                 key=h["key"],
                 content=h.get("content", ""),
                 raw_score=float(h.get("score", 0.0)),
@@ -205,9 +205,18 @@ class MemoryRetriever:
                 tags=list(h.get("tags", [])),
                 created_at=created_at,
                 final_score=final,
-            ))
-        ranked.sort(key=lambda x: x.final_score, reverse=True)
-        return [h.to_dict() for h in ranked[:k]]
+            ).to_dict()
+            # 🆕 2026-11-04: 时间语义透传给上层(LLM 渲染 / 失效判定要用)。
+            #
+            # 为什么透传而不是让上层再解析 tags:
+            # 上层要判断"这条事实在**当前**是否成立",那是**热路径**
+            # (每次召回都跑),多一层字符串解析不划算。
+            for f in ("valid_at", "invalid_at", "invalidates"):
+                if f in h:
+                    hit[f] = h[f]
+            ranked.append(hit)
+        ranked.sort(key=lambda x: x["score"], reverse=True)
+        return ranked[:k]
 
     @staticmethod
     def _make_key(source: str) -> str:

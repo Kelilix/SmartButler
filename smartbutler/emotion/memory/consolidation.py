@@ -45,17 +45,22 @@ from smartbutler.emotion.memory.hooks import MemoryEventType, MemoryHooks
 from smartbutler.emotion.memory.levels import (
     CONSOLIDATION_TTL_THRESHOLD,
     DAILY_TO_WEEKLY_DAYS,
+    INVALIDATES_TAG,
     UNKNOWN_USER,
     WEEKLY_TO_MONTHLY_DAYS,
     MemoryLevel,
     level_tag,
     parse_participants_tag,
+    parse_spoken_at,
     parse_task_started_at,
     parse_task_tags,
     parse_user_tag,
+    parse_valid_at,
     participants_tag,
+    spoken_at_tag,
     task_tag,
     user_tag,
+    valid_at_tag,
 )
 from smartbutler.emotion.memory.long_term import (
     PAYLOAD_CREATED_AT,
@@ -125,6 +130,23 @@ class SubjectGroup:
     #: 组内 fact 按 task 归组后的段落:[(task_id, [fact, ...]), ...]
     #: task_id 为 "" 表示无 task 归属的 fact(老数据)
     segments: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
+    #: 🆕 2026-11-04: 组内**最早**的说话时间(ISO)。
+    #:
+    #: 日报覆盖的是一段时间,它的"这组事实最早是什么时候说的"取组内最小值。
+    #: 写成 tag 后,升格链路上时间信息不会因为摘要压缩而丢。
+    spoken_at: str = ""
+    #: 🆕 2026-11-04: 组内的 valid_at 集合(去重)。
+    #:
+    #: 一个日报可能包含多条不同的事件("下周去上海" + "1月29号是我生日")。
+    #: 这里**全部保留**(而不是取一个),因为日报是多事件的容器。
+    #: 召回时 LLM 看正文就能知道细节;tag 里的集合用于"这个日报涉及哪些时间语义"。
+    valid_ats: list[str] = field(default_factory=list)
+    #: 🆕 2026-11-04: 组内是否含"否定/修正"类事实。
+    #:
+    #: 日报里如果出现"张女士不再是我朋友了",这个标记必须**跟着升格上去** ——
+    #: 否则日报正文会被 LLM 压成"张女士是我朋友",把修正语义**洗掉**。
+    #: (LLM 摘要有时会把"不再"这种否定词丢掉 —— 这正是"代码承担事实"的场景。)
+    has_invalidates: bool = False
 
     @property
     def fact_count(self) -> int:
@@ -417,15 +439,63 @@ class Consolidator:
         """扫时间窗内的 fact(按 level 精确过滤)。
 
         Args:
-            level: 源层级;"daily" 层级传 ``None`` 表示"无 level 字段"
+            level: 源层级;"daily" 层级传 ``None`` 表示"**无 level 字段**"
                 (即 auto_extract 刚写的原始 fact)。
             since: 窗口起(含)。
             now: 窗口止(不含 future)。
             limit: 扫描上限。
         """
+        # 🆕 2026-11-04:修「日汇总重复压缩」bug。
+        #
+        # 旧实现:``level=None`` 直接透传给 ``list_keys_by_level``,
+        # 而后者的语义是"must 为空 → **不过滤 → 滚动全表**"。
+        #
+        # 于是 daily 汇总的候选里混进了**上一轮生成的日报/周报/月报本身**:
+        #
+        #     D+1 03:00 生成日报 R1(R1.created_at = D+1 03:00)
+        #     D+2 03:00 生成日报 R2,窗口 = [D+1 00:00, D+2 00:00)
+        #        → R1 的 created_at 落在窗口内 → R1 被当成源 fact 再压一遍
+        #     D+3 ... 日复一日,越滚越大
+        #
+        # 而且 R1 里已经带了 `level:daily` / `user:X` / `task:Y` tag,
+        # 再压一层会**重写归属**,把"日报里按项目分段的结构"压成扁平摘要。
+        #
+        # 修法:``level=None`` 时**只扫"payload 里没有 level 字段"的条目**。
+        # 原始 fact 由 ``store_memory(level=None)`` 写入,压根不带 level key;
+        # 任何升格产物都带 level key,天然被排除。
+        #
+        # 为什么不用 `exclude_levels=["daily","weekly","monthly"]`:
+        # 那样只能排除**已知的**三个层级,新增层级(或 level 为空串的老数据)
+        # 会漏。`only_unleveled=True` 是**白名单**语义,更稳。
+        only_unleveled = level is None
+
         all_items = self._store.list_keys_by_level(
-            level=level, include_deleted=False, limit=limit,
+            level=level,
+            include_deleted=False,
+            limit=limit,
+            only_unleveled=only_unleveled,
         )
+        # 🆕 2026-11-04:客户端兜底 —— 不依赖服务端过滤一定生效。
+        #
+        # 为什么要双保险:
+        # - 服务端 `only_unleveled` 是主防线(Qdrant 层精确匹配,省内存)
+        # - 但 `self._store` 是个鸭子类型接口,测试里的 MagicMock / 其他
+        #   实现可能不支持新参数(抛 TypeError)或忽略它
+        # - 客户端这层用 `has_level` 标志判断"payload 里有没有 level 字段",
+        #   语义精确(不依赖 level 的**值*),能区分:
+        #     · 无 level 字段  → 原始 fact → 扫
+        #     · level = "daily" → 升格产物 → 排除
+        #     · level = ""      → 字段存在但值为空 → 也排除(与服务端一致)
+        #
+        # ⚠️ 关于 `level = ""`:服务端 Qdrant 的 ``IsEmptyCondition`` 实测
+        # **只匹配"key 缺失"**,不匹配"key 存在但值为空串"。所以 `level=""`
+        # 在服务端被排除,客户端用 ``has_level`` 判断也排除 —— 两侧一致。
+        #
+        # 这不是问题:生产代码里 ``store_memory`` 只在 ``level is not None``
+        # 时才写 PAYLOAD_LEVEL,压根没有写空串的路径(见 long_term.store_memory)。
+        # 注释里保留这个说明,是为了避免以后有人误以为 `level=""` 会被扫到。
+        if only_unleveled:
+            all_items = [it for it in all_items if not _has_level_field(it)]
         # 🆕 2026-10-12:_resolve_window 返回的是本地时区(Asia/Shanghai)datetime,
         # 而 Qdrant.created_at 是 UTC iso 字符串(可能 +00:00 也可能 +08:00),
         # 直接字典序比较会跨时区乱套。统一转 UTC 后再 iso 化再比较。
@@ -572,11 +642,35 @@ class Consolidator:
                 else:
                     participants.add(it["user"])
 
+            # 🆕 2026-11-04: 聚合时间字段
+            #
+            # - ``spoken_at``:组内**最早**的说话时间(这条日报覆盖的事实里,
+            #   最早是什么时候说的)
+            # - ``valid_at``:组内所有不同的 valid_at(去重保序)。
+            #   日报是多事件容器,可能有多个不同的事件时间,全部保留。
+            spoken_values: list[str] = []
+            valid_values: list[str] = []
+            has_invalidates = False
+            for it in items:
+                f_tags = list(it["fact"].get("tags", []) or [])
+                sp = parse_spoken_at(f_tags)
+                if sp and sp not in spoken_values:
+                    spoken_values.append(sp)
+                va = parse_valid_at(f_tags)
+                if va and va not in valid_values:
+                    valid_values.append(va)
+                if INVALIDATES_TAG in f_tags:
+                    has_invalidates = True
+            spoken_at = min(spoken_values) if spoken_values else ""
+
             g = SubjectGroup(
                 primary_user=user,
                 task_ids=task_ids,
                 participants=sorted(p for p in participants if p),
                 facts=facts,
+                spoken_at=spoken_at,
+                valid_ats=valid_values,
+                has_invalidates=has_invalidates,
             )
             g.segments = self._build_segments(items)
             groups.append(g)
@@ -747,6 +841,22 @@ class Consolidator:
                 t = task_tag(tid)
                 if t:
                     tags.append(t)
+            # 🆕 2026-11-04: 时间 tag —— 同样由代码写(LLM 只负责正文措辞)
+            #
+            # 归属和时间是同一类东西:都是**客观元数据**,不能靠 LLM 在
+            # 摘要正文里"写上时间" —— 那会漂移、无法断言、跨层衰减。
+            #
+            # spoken_at 取组内最早;valid_at 全部保留(日报是多事件容器)。
+            sp = spoken_at_tag(group.spoken_at)
+            if sp:
+                tags.append(sp)
+            for va in group.valid_ats:
+                v = valid_at_tag(va)
+                if v:
+                    tags.append(v)
+            # 否定/修正标记跟着升格走 —— 防止 LLM 摘要把"不再"洗掉
+            if group.has_invalidates:
+                tags.append(INVALIDATES_TAG)
 
         # key 里带上归属,人工排查时一眼看出这条日报是谁的
         key_suffix = f"{group.primary_user}:" if group is not None else ""
@@ -788,6 +898,34 @@ class Consolidator:
             f"{header}{period}(由 {source_count} 条记忆汇总)\n\n"
             f"{summary}"
         )
+
+
+def _has_level_field(item: dict[str, Any]) -> bool:
+    """判断一条 store 条目**是否带 level 字段**(升格产物 vs 原始 fact)。
+
+    🆕 2026-11-04。修「日汇总重复压缩」bug 的客户端兜底。
+
+    语义要精确区分三种情况:
+
+    ====================  ========  ====================================
+    情况                   结果      理由
+    ====================  ========  ====================================
+    无 ``level`` 字段      False     原始 fact(auto_extract 写的),该扫
+    ``level = "daily"``    True      升格产物,该排除
+    ``level = ""``         True      字段存在(空值),与服务端过滤一致,排除
+    ====================  ========  ====================================
+
+    所以**不能只看 ``level`` 的值** —— 必须看"字段在不在"。
+    (``level=""`` 在生产代码里不会出现:``store_memory`` 只在 ``level is not None``
+    时才写这个字段。保留这条分支是为了语义明确。)
+
+    实现上优先用 ``has_level`` 标志(由 :meth:`LongTermStore.list_keys_by_level`
+    直接给出,最准);拿不到该标志时退化为看 ``level`` 值是否非空。
+    """
+    if "has_level" in item:
+        return bool(item["has_level"])
+    # 兜底:没有 has_level 标志的老 store / MagicMock → 看 level 值
+    return bool((item.get("level") or "").strip())
 
 
 __all__ = [
