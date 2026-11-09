@@ -37,6 +37,7 @@ from smartbutler.emotion.memory.consolidation import Consolidator
 from smartbutler.emotion.memory.facade import MemoryFacade
 from smartbutler.emotion.memory.forgetting import ForgettingService
 from smartbutler.emotion.memory.hooks import MemoryHooks
+from smartbutler.emotion.memory.graph.paths import resolve_graph_db_path
 from smartbutler.emotion.memory.long_term import create_long_term_store
 from smartbutler.emotion.memory.retrieval import MemoryRetriever
 from smartbutler.emotion.memory.short_term import ShortTermMemory
@@ -76,6 +77,12 @@ class MemorySystem:
     consolidator: Consolidator | None = None
     #: 遗忘服务
     forgetting: ForgettingService | None = None
+    #: 🆕 Phase 9:记忆图的存储(SQLite)。None = 图未启用。
+    graph_store: Any = None
+    #: 🆕 Phase 9:图的抽取 hook
+    graph_extract: Any = None
+    #: 🆕 Phase 9:声纹绑定器
+    graph_binding: Any = None
     #: 事件钩子
     hooks: MemoryHooks = field(default_factory=MemoryHooks)
     #: 装配过程中的告警(非致命问题)
@@ -247,6 +254,95 @@ async def build_memory_system(
         )
         auto_extract.register(hooks)
 
+    # ---- 🆕 Phase 9:记忆图(人物关系图)----
+    #
+    # 总开关 ``graph_enabled`` 默认 False —— 图是**增强层**,灰度打开。
+    # 关闭时零副作用:不建表、不抽取、不召回,**并且把 resolve_person
+    # tool 注销掉** —— 让 LLM 看不见它,避免它白跑一趟再返回
+    # "记忆图功能未启用"。
+    graph_store = None
+    graph_extract = None
+    graph_binding = None
+    if bool(getattr(settings, "graph_enabled", False)):
+        try:
+            from smartbutler.capabilities.tools.graph import resolve_person as graph_tool
+            from smartbutler.emotion.memory.graph.binding import VoiceBinding
+            from smartbutler.emotion.memory.graph.contradiction import (
+                ContradictionResolver,
+            )
+            from smartbutler.emotion.memory.graph.extractor import GraphExtractor
+            from smartbutler.emotion.memory.graph.hooks import GraphExtractHook
+            from smartbutler.emotion.memory.graph.resolver import PersonResolver
+            from smartbutler.emotion.memory.graph.store import GraphStore
+            from smartbutler.emotion.memory.graph.writer import GraphWriter
+
+            # 路径解析统一走 paths.resolve_graph_db_path(CLI 也用同一个)
+            graph_db_path = resolve_graph_db_path(
+                getattr(settings, "graph_db_path", "graph.db"),
+                data_dir=data_dir,
+            )
+
+            graph_store = GraphStore(graph_db_path)
+            graph_resolver = PersonResolver(store=graph_store)
+            graph_contradiction = ContradictionResolver(
+                store=graph_store,
+                llm=llm,
+                dedupe_threshold=float(
+                    getattr(settings, "graph_dedupe_threshold", 0.85)
+                ),
+            )
+            graph_writer = GraphWriter(
+                store=graph_store,
+                resolver=graph_resolver,
+                contradiction=graph_contradiction,
+            )
+            graph_binding = VoiceBinding(store=graph_store, resolver=graph_resolver)
+
+            # tool 依赖注入(resolve_person 是对话中建关系的入口)
+            graph_tool.set_graph_dependencies(
+                store=graph_store,
+                resolver=graph_resolver,
+                writer=graph_writer,
+            )
+            # 重新注册(可能被之前"图关闭"的装配注销过)
+            _reregister_graph_tool()
+
+            graph_extract = GraphExtractHook(
+                extractor=GraphExtractor(
+                    llm=llm,
+                    max_edges=int(
+                        getattr(settings, "graph_edge_max_per_task", 20)
+                    ),
+                ),
+                writer=graph_writer,
+                task_index=task_index,
+                enabled=True,
+                max_edges_per_task=int(
+                    getattr(settings, "graph_edge_max_per_task", 20)
+                ),
+            )
+            graph_extract.register(hooks)
+
+            # 召回通道:把图边作为**补充**注入 prompt
+            facade.bind_graph_store(
+                graph_store,
+                max_edges=int(getattr(settings, "graph_recall_max_edges", 10)),
+            )
+
+            logger.info(
+                "memory_system.graph_enabled db=%s", graph_db_path,
+            )
+        except Exception as e:  # noqa: BLE001
+            warnings.append(f"graph_init_failed: {e}")
+            logger.warning("memory_system.graph_init_failed err=%s", e)
+            graph_store = None
+            graph_extract = None
+            graph_binding = None
+            _unregister_graph_tool()
+    else:
+        # 图关闭 → 注销 tool,让 LLM 看不见它
+        _unregister_graph_tool()
+
     # ---- 升格管道(fact → 日报 → 周报 → 月报)----
     consolidator = Consolidator(
         store=long_term,
@@ -296,6 +392,9 @@ async def build_memory_system(
         auto_extract=auto_extract,
         consolidator=consolidator,
         forgetting=forgetting,
+        graph_store=graph_store,
+        graph_extract=graph_extract,
+        graph_binding=graph_binding,
         hooks=hooks,
         warnings=warnings,
     )
@@ -305,6 +404,74 @@ async def build_memory_system(
         auto_extract is not None, llm is not None, len(warnings),
     )
     return system
+
+
+def _reregister_graph_tool() -> None:
+    """🆕 Phase 9: 重新注册 ``resolve_person`` tool(图开启时)。
+
+    **为什么需要**:tool 是模块级 ``@register_tool`` 注册的 —— 只在
+    import 时执行一次。若之前有一次装配把图关掉了(→ 注销了 tool),
+    后来再开启时不会自动注册回来。
+
+    重新注册的代价是覆盖注册表里的同�� tool(实现不变,只是依赖更新),
+    不会有副作用。
+    """
+    try:
+        from smartbutler.capabilities.tools.graph.resolve_person import (
+            resolve_person,
+        )
+        from smartbutler.capabilities.tools.registry import ToolRegistry
+
+        registry = ToolRegistry.get_default()
+        if registry.try_get("resolve_person") is not None:
+            return
+        # 重新走一遍注册流程
+        from smartbutler.capabilities.tools.decorator import register_tool
+
+        tool = register_tool(
+            name="resolve_person",
+            description=(
+                "登记或查询一个人,并建立人与人之间的关系。\n"
+                "场景:用户提到某个人(如'我妈''我同事李雷'),"
+                "当需要建立人际关系、或系统不知道这个人是谁时调用。\n"
+                "参数:\n"
+                "  display_name      —— 对方的名字(必填)\n"
+                "  relation_type     —— 关系类型(必填),如 IS_MOTHER_OF / "
+                "IS_FRIEND_OF / WORKS_WITH / IS_FATHER_OF / IS_COLLEAGUE_OF / KNOWS\n"
+                "  speaker           —— 说话人的 user_id(从上下文取,必填)\n"
+                "  candidate_node_id —— 可选。**第二轮确认时传**:用户已确认是哪一个候选人\n"
+                "返回值 status=needs_confirmation 表示图里已有同名的人,"
+                "请把 candidates 里的描述转述给用户听(如'是不是这个人:张伟,我的同事?'),"
+                "等用户回答后再调用一次。\n"
+                "  - 用户说'是' → 带上 candidate_node_id 再调一次\n"
+                "  - 用户说'不是'/'同名' → **不要**带 candidate_node_id,直接再调一次"
+                "(系统会自动建新节点区分这两个人)"
+            ),
+        )(resolve_person)
+        logger.info("memory_system.graph_tool_reregistered tool=%s", tool.name)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("memory_system.graph_tool_reregister_failed err=%s", e)
+
+
+def _unregister_graph_tool() -> None:
+    """🆕 Phase 9: 注销 ``resolve_person`` tool(图关闭时)。
+
+    **为什么**:tool 是模块级 ``@register_tool`` 注册的 —— 进程启动就
+    在注册表里了,和 ``graph_enabled`` 无关。图关闭时 LLM 仍能看到它,
+    调它只会得到"记忆图功能未启用",白烧一次工具调用。
+
+    注销掉,LLM 就看不见它了(它本来也用不了)。
+    """
+    try:
+        from smartbutler.capabilities.tools.registry import ToolRegistry
+
+        registry = ToolRegistry.get_default()
+        if registry.try_get("resolve_person") is None:
+            return
+        registry.unregister("resolve_person")
+        logger.info("memory_system.graph_tool_unregistered")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("memory_system.graph_tool_unregister_skipped err=%s", e)
 
 
 def _build_embedder(warnings: list[str]) -> Any:

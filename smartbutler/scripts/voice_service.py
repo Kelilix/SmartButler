@@ -245,6 +245,11 @@ async def create_voice_service(config: VoiceServiceConfig):
     #              → find_best_match 判"更新 or 新建" → 落库
     #
     # 关键:这一步在**后台**完成,不阻塞 LLM —— LLM 那轮对话早就返回了。
+    #
+    # 🆕 Phase 9: 注册成功后顺便把这个人**绑定到记忆图节点**。
+    # 用可变容器延迟取 memory_system —— 回调定义在记忆系统装配**之前**,
+    # 但实际执行时(采集完成)记忆系统早已就绪。
+    graph_binding_holder: dict[str, object] = {}
     if speaker_registry is not None and embedder is not None:
         try:
             from smartbutler.capabilities.tools.voice.enroll_speaker import (
@@ -301,6 +306,19 @@ async def create_voice_service(config: VoiceServiceConfig):
                         "抱歉，没听清，方便再说一次吗？"
                     )
 
+                # 🆕 Phase 9: 绑定到记忆图节点。
+                #
+                # ⚠️ **同名消歧在这里做不了** —— 采集完成时用户已经不在
+                # 对话里了,没法问"是不是这个人"。所以这里只做**安全路径**:
+                # 图里没有同名节点 → 直接建节点(声纹锚定)。
+                # 图里有同名节点 → 跳过,留给对话中的 `resolve_person`
+                # tool 走两步确认流程(那里有用户在场)。
+                await _bind_voice_to_graph(
+                    graph_binding_holder.get("binding"),
+                    user_id=result.user_id,
+                    display_name=result.display_name or name,
+                )
+
             voice_adapter.set_enrollment_callback(_on_enrollment_complete)
             logger.info("  ✓ 声纹自动注册已启用")
         except Exception as e:
@@ -350,6 +368,9 @@ async def create_voice_service(config: VoiceServiceConfig):
     # 现在统一在这里装配。失败不阻断启动(记忆挂了管家还能聊天)。
     memory_system = await _build_memory_system(llm, speaker_registry)
     if memory_system is not None:
+        # 🆕 Phase 9: 把图的声纹绑定器交给声纹采集回调。
+        # 采集完成时 → 绑定到图节点(见 ``_bind_voice_to_graph``)。
+        graph_binding_holder["binding"] = getattr(memory_system, "graph_binding", None)
         attach = getattr(orchestrator, "attach_memory_system", None)
         if callable(attach):
             attach(memory_system)
@@ -377,6 +398,44 @@ async def create_voice_service(config: VoiceServiceConfig):
     server.set_answer_router(answer_router)
 
     return voice_adapter, server, event_bus, speaker_registry
+
+
+async def _bind_voice_to_graph(
+    binding: object,
+    *,
+    user_id: str,
+    display_name: str,
+) -> None:
+    """🆕 Phase 9: 声纹注册成功后绑定到记忆图节点。
+
+    ⚠️ **只做安全路径**:
+    - 图里**没有**同名节点 → 直接建声纹锚定节点(``person:<user_id>``)
+    - 图里**有**同名节点 → **跳过**。采集完成时用户不在对话里,
+      没法问"是不是这个人";留给对话中的 ``resolve_person`` tool
+      走两步确认流程(那里用户在场)。
+
+    失败只记日志 —— 图是增强层,不该让声纹注册流程失败。
+
+    Args:
+        binding: :class:`VoiceBinding` 实例;None = 图未启用。
+        user_id: 声纹 user_id。
+        display_name: 名字。
+    """
+    if binding is None or not user_id:
+        return
+    try:
+        outcome = await binding.bind(  # type: ignore[attr-defined]
+            user_id=user_id,
+            display_name=display_name,
+            confirm=False,  # ⚠️ 不询问 → 同名时建区分节点
+        )
+        logger.info(
+            "🗺 声纹已绑定到记忆图: status=%s node_id=%s",
+            outcome.status,
+            outcome.node_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("⚠ 声纹绑定到图失败: %s", e)
 
 
 async def _build_memory_system(llm: object, speaker_registry: object) -> object | None:

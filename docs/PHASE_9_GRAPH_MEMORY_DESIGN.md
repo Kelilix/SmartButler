@@ -1,6 +1,7 @@
 # Phase 9 技术方案:记忆图(Graph Memory)
 
-> **状态**:草稿,待用户确认后实施
+> **状态**:✅ **已实施**(2026-11-09,Step 3.1 → 3.9 全部完成)
+> **实施记录**:见 `docs/PHASE_9_GRAPH_MEMORY_ROADMAP.md` §12(含 6 处实施中发现的设计修正)
 > **日期**:2026-11-09
 > **范围**:在现有 fact 长期记忆之上,新增**人物关系图** —— 节点(人)/ 边(人与人之间的关系)/ 时态消解 / 图召回
 > **不包含**:非人物实体(公司/小区/物品/事件 —— 后续再议)、社区层(日报/周报/月报已等价)、知识图谱问答的产品化
@@ -406,7 +407,14 @@ DeepWiki 对 Graphiti bulk 模式的诚实评价:
 
 ### 6.1 选型:SQLite,不引入图数据库
 
-**决策:独立文件 `data/graph.db`,不引入 Neo4j / FalkorDB / Amazon Neptune。**
+**决策:独立文件 `data/memory/graph.db`,不引入 Neo4j / FalkorDB / Amazon Neptune。**
+
+> **路径说明(2026-11-09 修正)**:默认 `graph_db_path="graph.db"`,相对路径基准是
+> **运行时数据目录** `data/memory/` → 实际落盘 `data/memory/graph.db`。
+> 解析逻辑统一在 `smartbutler/emotion/memory/graph/paths.py::resolve_graph_db_path`
+> (运行时 wiring 与 CLI 共用同一份,避免分叉)。
+> 兼容写法 `"data/graph.db"` → `<项目根>/data/graph.db`。
+> ⚠️ 早期版本默认值是 `"data/graph.db"`,会拼成 `data/memory/data/graph.db`(多一层 `data/`),已修复。
 
 理由:
 - 个人管家场景,人物节点几百、边几千 —— SQLite 绰绰有余
@@ -1022,7 +1030,49 @@ async def resolve_person(
 
 ---
 
-## 15. 已定事项汇总
+## 15. 运维:查看与清理记忆图
+
+图是**独立的子系统**(独立 SQLite 文件),所以 `memory_cli clear-all` 默认**不动**它。
+
+### 15.1 查看
+
+```bash
+# 图规模体检(节点 / 边 / 活跃边 / 声纹绑定数)
+python -m smartbutler.scripts.memory_cli graph-stats
+
+# 翻出图里的节点与关系边(看"到底存了什么关系")
+python -m smartbutler.scripts.memory_cli graph-dump
+python -m smartbutler.scripts.memory_cli graph-dump --all --limit 200
+```
+
+### 15.2 清理
+
+```bash
+# 【推荐】只清图,不动长短期记忆
+python -m smartbutler.scripts.memory_cli graph-clear --confirm yes
+python -m smartbutler.scripts.memory_cli graph-clear --confirm yes --no-dry-run
+
+# 清图 + 清所有记忆(一揽子)
+python -m smartbutler.scripts.memory_cli clear-all \
+    --include-graph --confirm yes --yes-i-know-this-deletes-everything
+```
+
+> ⚠️ **清图会连节点上的声纹绑定一起丢**(`user_id` / `voice_bound` 字段)。
+> 声纹库(`data/speakers.db`)**本身不受影响** —— 重新采集声纹后可再次绑定。
+
+### 15.3 开关
+
+```bash
+# .env
+SMARTBUTLER_MEMORY_GRAPH_ENABLED=true
+```
+
+关闭时是**零副作用**:不建表、不抽取、不召回,并且把 `resolve_person` tool
+从注册表里注销掉(LLM 看不见它,不会白跑一次工具调用)。
+
+---
+
+## 16. 已定事项汇总
 
 | # | 事项 | 决定 |
 |---|------|------|
@@ -1031,7 +1081,7 @@ async def resolve_person(
 | ③ | task 是否细分 | **不细分**,转向优化切分能力 |
 | ④ | 时间字段 | **复用 task/fact** 的 `valid_at` / `spoken_at` |
 | ⑤ | 节点范围 | **只做 Person**;非人关系的边整条丢弃;无独立人物表 |
-| ⑥ | 存储位置 | **独立 `data/graph.db`** |
+| ⑥ | 存储位置 | **独立 `data/memory/graph.db`** |
 | ⑦ | 未知人物 | 建**名字锚点**节点,后续声纹绑定升级(§8) |
 | ⑧ | 人物关系确认 | LLM 主动询问 + `resolve_person` tool(§9) |
 | ⑨ | 同名消歧 | **立即询问 + 三态确认**(§8.4):命中候选就问,不做延迟;用户不在时放弃本次绑定 |
@@ -1039,7 +1089,7 @@ async def resolve_person(
 
 ---
 
-## 16. 参考资料
+## 17. 参考资料
 
 | 来源 | 关键借鉴 |
 |------|---------|

@@ -48,6 +48,30 @@ from smartbutler.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# 🆕 Phase 9: 图通道辅助
+# ---------------------------------------------------------------------------
+
+#: 谓词 → 中文标签(给 LLM 看的关系描述)
+_RELATION_LABELS: dict[str, str] = {
+    "IS_FAMILY_OF": "是家人",
+    "IS_MOTHER_OF": "是母亲",
+    "IS_FATHER_OF": "是父亲",
+    "IS_PARENT_OF": "是父母",
+    "IS_CHILD_OF": "是子女",
+    "IS_SIBLING_OF": "是兄弟姐妹",
+    "IS_SPOUSE_OF": "是配偶",
+    "IS_PARTNER_OF": "是伴侣",
+    "IS_FRIEND_OF": "是朋友",
+    "KNOWS": "认识",
+    "WORKS_WITH": "是同事",
+    "REPORTS_TO": "是上级",
+    "IS_COLLEAGUE_OF": "是同事",
+    "MANAGES": "是管理者",
+    "RELATES_TO": "有关系",
+}
+
+
 def _resolve_max_fact_chars() -> int | None:
     """从 :class:`MemorySettings` 读单条 fact 注入上限,0 → ``None``(不截断)。
 
@@ -196,6 +220,9 @@ class MemoryFacade:
         # 签名: ``Callable[[str], str]`` —— 传 user_id,返回可读名字。
         # 由 wiring 层绑定声纹库(voiceprint registry)。
         self._name_resolver: Any = None
+        # 🆕 Phase 9: 记忆图存储(可选,None 时无图通道)
+        self._graph_store: Any = None
+        self._graph_max_edges: int = 10
 
     def set_min_score(self, min_score: float) -> None:
         """设置 recall 默认相似度下限(0-1,由 wiring 层调一次)。"""
@@ -248,6 +275,23 @@ class MemoryFacade:
         None = 老行为(只 recall 长期)。
         """
         self._short_term_view = view
+
+    def bind_graph_store(self, store: Any, *, max_edges: int = 10) -> None:
+        """🆕 Phase 9: 注入记忆图存储(人物关系图通道)。
+
+        注入后,``format_for_prompt`` 会在长期 recall 之外**追加**一段
+        人物关系块(见 ``_render_graph_block``)。
+
+        图通道是**补充**不是替代 —— 它解决向量召回解决不了的问题:
+        "我妈是谁""谁是我同事""我朋友的老婆是谁"这类**关系型**问题,
+        向量检索命中的是"张女士是我朋友"这种**文本**,不是关系本身。
+
+        Args:
+            store: :class:`GraphStore` 实例;None = 关闭图通道(老行为)。
+            max_edges: 注入 prompt 的边条数上限。
+        """
+        self._graph_store = store
+        self._graph_max_edges = max_edges
 
     def bind_short_term_factory(self, factory: Any) -> None:
         """注入异步 saver 工厂(Phase 6.3 P2,2.5.1.2)。
@@ -492,7 +536,10 @@ class MemoryFacade:
         if hits:
             long_block = self._render_long_block(hits)
 
-        # ---- 3. 拼装 ----
+        # ---- 3. 🆕 Phase 9: 图通道(人物关系)----
+        graph_block = self._render_graph_block(query, ctx=ctx)
+
+        # ---- 4. 拼装 ----
         #
         # 🆕 2026-10-12 用户决策:**召回优先于 prompt 预算**。
         # 原来这里按 `max_chars` 拆分 short/long 配额再各自截断,但实测会
@@ -508,7 +555,140 @@ class MemoryFacade:
             parts.append(short_block)
         if long_block:
             parts.append(long_block)
+        if graph_block:
+            parts.append(graph_block)
         return "\n\n".join(parts)
+
+    def _render_graph_block(
+        self,
+        query: str,
+        *,
+        ctx: MemoryContext | None = None,
+    ) -> str:
+        """🆕 Phase 9: 渲染人物关系块。
+
+        图通道解决向量召回解决不了的问题:
+
+        - "我妈是谁" → 需要**关系边**,不是相似文本
+        - "谁是我同事" → 同上
+        - "我朋友的老婆是谁" → 需要 2 跳遍历
+
+        向量检索命中的是"张女士是我朋友"这种**文本**,而不是关系本身;
+        而且这类问题往往没有足够的语义相似度(问的是"我妈",库里写的是
+        "我妈妈")。图能精确回答。
+
+        渲染成自然语言(不是节点/边的 JSON)—— LLM 读自然语言最准。
+
+        Args:
+            query: 用户 query(用于挑选相关节点)。
+            ctx: 记忆上下文(拿 user_id)。
+
+        Returns:
+            markdown 字符串(没有可用边时返回 "")。
+        """
+        if self._graph_store is None:
+            return ""
+        try:
+            edges = self._collect_graph_edges(query, ctx=ctx)
+            if not edges:
+                return ""
+            lines = ["### 人物关系"]
+            for edge in edges:
+                lines.append(f"- {self._render_graph_edge(edge)}")
+            return "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("facade.graph_block_failed: %s", e)
+            return ""
+
+    def _collect_graph_edges(
+        self,
+        query: str,
+        *,
+        ctx: MemoryContext | None = None,
+    ) -> list[Any]:
+        """收集与 query 相关的图边。
+
+        策略:
+        1. **说话人锚定** —— 优先取当前用户(user_id)关联的边
+           (问"我妈是谁"时,答案就在"我"的关系里)
+        2. **名字匹配** —— query 里提到的人名 → 查该节点的边
+        3. 合并去重,按关联度排序,截断到上限
+
+        Args:
+            query: 用户 query。
+            ctx: 记忆上下文。
+
+        Returns:
+            边列表(活跃边)。
+        """
+        if self._graph_store is None:
+            return []
+
+        edges: list[Any] = []
+        seen: set[str] = set()
+
+        # 1) 说话人锚定
+        user_id = getattr(ctx, "user_id", "") if ctx else ""
+        if user_id:
+            node = self._graph_store.find_node_by_user_id(user_id)
+            if node is not None:
+                for e in self._graph_store.find_edges_for_node(
+                    node.node_id, only_active=True, limit=self._graph_max_edges * 2
+                ):
+                    if e.edge_id not in seen:
+                        seen.add(e.edge_id)
+                        edges.append(e)
+
+        # 2) query 里出现**图里已有的人名**
+        #
+        # ⚠️ **不从 query 里猜人名** —— 中文没有空格,纯正则分不出
+        # "张伟最近怎么样" 里的"张伟"和"最近"。猜错会拉出无关关系。
+        #
+        # 反过来做:遍历图里的节点,看它的名字是否出现在 query 里。
+        # 图里有哪些人我们是知道的 —— 这比猜准得多。
+        for node in self._iter_all_nodes():
+            if not node.name:
+                continue
+            if node.name not in query:
+                continue
+            for e in self._graph_store.find_edges_for_node(
+                node.node_id, only_active=True, limit=self._graph_max_edges
+            ):
+                if e.edge_id not in seen:
+                    seen.add(e.edge_id)
+                    edges.append(e)
+
+        return edges[: self._graph_max_edges]
+
+    def _iter_all_nodes(self) -> list[Any]:
+        """遍历图里所有节点(召回时找名字用)。
+
+        图规模小(个人管家场景几百个节点),直接全扫最简单可靠 ——
+        不需要额外的索引维护。
+        """
+        try:
+            return self._graph_store.list_nodes()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("facade.iter_graph_nodes_failed: %s", e)
+            return []
+
+    def _render_graph_edge(self, edge: Any) -> str:
+        """把一条边渲染成一句自然语言。
+
+        ``"我 --IS_MOTHER_OF--> 妈妈(事实上:我妈妈是我的母亲)"``
+        """
+        source = self._graph_store.get_node(edge.source_id)
+        target = self._graph_store.get_node(edge.target_id)
+        src_name = source.name if source else edge.source_id
+        tgt_name = target.name if target else edge.target_id
+
+        rel_cn = _RELATION_LABELS.get(edge.relation_type, edge.relation_type)
+        text = f"{src_name} —{rel_cn}→ {tgt_name}"
+        if edge.fact and edge.fact not in text:
+            text = f"{text}({edge.fact})"
+        if edge.valid_at:
+            text = f"{text}[关系成立于 {edge.valid_at}]"
+        return text
 
     def _render_long_block(self, hits: list[dict[str, Any]]) -> str:
         """把长期记忆命中渲染成 prompt 块 —— **按 task 分组**。

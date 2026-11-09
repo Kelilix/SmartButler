@@ -208,6 +208,50 @@ class MemorySettings(SmartButlerBaseSettings, BaseSettings):
     )
 
 
+    # ---- Phase 9: 记忆图(graph memory) ----
+    #
+    # 🆕 2026-11-09:节点范围收敛为 **只有 Person**。
+    # 非人关系的边整条丢弃(信息留在 fact 层);task 只做边的溯源属性。
+    # 详见 docs/PHASE_9_GRAPH_MEMORY_DESIGN.md。
+
+    # 总开关:是否启用记忆图(抽取 + 召回)。默认 False —— 图是增强层,
+    # 灰度打开;关闭时零副作用(不建表、不抽取、不召回)。
+    graph_enabled: bool = Field(
+        default=False,
+        description="是否启用记忆图(人物关系图)",
+    )
+
+    # 单个 task 最多抽多少条边(防边数爆炸)
+    graph_edge_max_per_task: int = Field(
+        default=20, ge=1, le=100,
+        description="单 task 抽取边的数量上限",
+    )
+
+    # 慢路径判重阈值(向量相似度)。快路径(事实句完全相同)不走这个。
+    graph_dedupe_threshold: float = Field(
+        default=0.85, ge=0.0, le=1.0,
+        description="慢路径(向量)判重的相似度阈值",
+    )
+
+    # 召回时注入 prompt 的图边条数上限(图通道不挤占主召回预算)
+    graph_recall_max_edges: int = Field(
+        default=10, ge=0, le=100,
+        description="召回时注入的图边条数上限",
+    )
+
+    # 图数据库文件路径(独立于 task_index.db —— 写负载不同)
+    #
+    # ⚠️ 相对路径的基准是**运行时数据目录**(``data/memory/``)。
+    #   - "graph.db"      → data/memory/graph.db        (推荐)
+    #   - "data/graph.db" → <项目根>/data/graph.db       (兼容写法)
+    #   - 绝对路径        → 原样使用
+    # 解析逻辑见 smartbutler/emotion/memory/graph/paths.py
+    graph_db_path: str = Field(
+        default="graph.db",
+        description="记忆图 SQLite 文件路径(相对路径基准=运行时数据目录)",
+    )
+
+
 def load_memory_settings() -> MemorySettings:
     """加载记忆子模块配置。"""
     return MemorySettings()

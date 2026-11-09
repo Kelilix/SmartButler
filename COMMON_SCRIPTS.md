@@ -20,6 +20,13 @@ python -m smartbutler.scripts.memory_cli dump --all
 python -m smartbutler.scripts.memory_cli age-summary
 ```
 
+**清理(全套清空,含图):**
+
+```bash
+python -m smartbutler.scripts.memory_cli clear-all --include-graph \
+    --confirm yes --yes-i-know-this-deletes-everything --no-dry-run
+```
+
 下面所有命令都是这 3 条的展开。
 
 ---
@@ -134,6 +141,35 @@ python -m smartbutler.scripts.memory_cli vacuum --dry-run
 | `stm-stats` | 短期库容量体检 | `python -m smartbutler.scripts.memory_cli stm-stats` |
 | `st-raw <prefix>` | 打印某个 checkpoint 的原始 state JSON(深排查) | `python -m smartbutler.scripts.memory_cli st-raw 0c12345 -v` |
 
+### 2.3 记忆图(Phase 9 人物关系图,`data/memory/graph.db`)
+
+> 图是独立子系统,读图不锁 dev_chat。
+
+| 子命令 | 作用 | 典型命令 |
+|--------|------|---------|
+| `graph-stats` | 图规模体检 | `python -m smartbutler.scripts.memory_cli graph-stats` |
+| `graph-dump` | 翻出节点与关系边 | `python -m smartbutler.scripts.memory_cli graph-dump` |
+| `graph-dump --all` | 连已失效的边一起显示 | `python -m smartbutler.scripts.memory_cli graph-dump --all` |
+
+### 2.4 记忆图的开关(`.env`)
+
+图默认**关闭**(`graph_enabled=False`)。开启方式:
+
+```bash
+# .env 里加一行
+SMARTBUTLER_MEMORY_GRAPH_ENABLED=true
+```
+
+| 环境变量 | 默认值 | 说明 |
+|---------|-------|------|
+| `SMARTBUTLER_MEMORY_GRAPH_ENABLED` | `false` | 总开关。开启后:task 完成时 LLM 抽人物关系入库 + 召回注入 + 注册 `resolve_person` tool;关闭时**零副作用**(不建表、不抽取、不召回,tool 对 LLM 不可见) |
+| `SMARTBUTLER_MEMORY_GRAPH_EDGE_MAX_PER_TASK` | `20` | 单 task 抽边上限(防边数爆炸) |
+| `SMARTBUTLER_MEMORY_GRAPH_DEDUPE_THRESHOLD` | `0.85` | 慢路径(向量)判重阈值 |
+| `SMARTBUTLER_MEMORY_GRAPH_RECALL_MAX_EDGES` | `10` | 召回时注入 prompt 的图边条数上限 |
+| `SMARTBUTLER_MEMORY_GRAPH_DB_PATH` | `graph.db` | 图库路径(相对路径基准 = `data/memory/`,见 §3.5) |
+
+开启后建议先观察日志里的 `graph_extract.summary` / `graph_writer.written` 两行,确认 LLM 抽边质量。
+
 ---
 
 ## 3. memory_cli — 清理 / 升格(写操作,需先关 dev_chat)
@@ -205,7 +241,44 @@ python -m smartbutler.scripts.memory_cli clear-all --confirm yes --yes-i-know-th
 
 # 3) 含 task_index.db(6.5 task scheduler 状态)也一并清
 python -m smartbutler.scripts.memory_cli clear-all --confirm yes --yes-i-know-this-deletes-everything --no-dry-run --include-task-index
+
+# 4) 含记忆图(Phase 9 人物关系图)也一并清
+python -m smartbutler.scripts.memory_cli clear-all --confirm yes --yes-i-know-this-deletes-everything --no-dry-run --include-graph
 ```
+
+### 3.5 记忆图(Phase 9 人物关系图)— 只清图,不动记忆
+
+图是**独立子系统**(独立 SQLite 文件 `data/memory/graph.db`),所以 `clear-all` 默认**不动**它。
+
+| 子命令 | 作用 | 典型命令 |
+|--------|------|---------|
+| `graph-stats` | 图规模体检(节点/边/活跃边/声纹绑定数) | `python -m smartbutler.scripts.memory_cli graph-stats` |
+| `graph-dump` | 翻出节点与关系边(看存了什么关系) | `python -m smartbutler.scripts.memory_cli graph-dump` |
+| `graph-dump --all` | 连已失效的边一起显示 | `python -m smartbutler.scripts.memory_cli graph-dump --all --limit 200` |
+| `graph-clear` | **只清图**,长短期记忆全保留 | `python -m smartbutler.scripts.memory_cli graph-clear --confirm yes --no-dry-run` |
+
+```bash
+# 1) 先看看图里有什么
+python -m smartbutler.scripts.memory_cli graph-stats
+python -m smartbutler.scripts.memory_cli graph-dump
+
+# 2) dry-run(默认就是,只打印会清什么)
+python -m smartbutler.scripts.memory_cli graph-clear --confirm yes
+
+# 3) 真跑(只清图)
+python -m smartbutler.scripts.memory_cli graph-clear --confirm yes --no-dry-run
+```
+
+> ⚠️ **清图会连节点上的声纹绑定一起丢**(`user_id` / `voice_bound`)。
+> 声纹库 `data/speakers.db` **本身不受影响** —— 重新采集声纹后可再次绑定。
+
+图路径解析(相对路径基准 = 运行时数据目录 `data/memory/`):
+
+| 配置值 | 实际路径 |
+|--------|---------|
+| `graph.db`(默认) | `data/memory/graph.db` |
+| `data/graph.db` | `<项目根>/data/graph.db` |
+| 绝对路径 | 原样使用 |
 
 ---
 
@@ -284,6 +357,8 @@ python -m smartbutler.scripts.memory_cli list-deleted --limit 50
 │ 短库容量  python -m smartbutler.scripts.memory_cli stm-stats   │
 │ 容量统计  python -m smartbutler.scripts.memory_cli stats       │
 │ 该清的    python -m smartbutler.scripts.memory_cli age-summary │
+│ 看记忆图  python -m smartbutler.scripts.memory_cli graph-stats │
+│ 翻关系边  python -m smartbutler.scripts.memory_cli graph-dump  │
 ├──────────────────────────────────────────────────────────────┤
 │                     memory_cli 写操作(先关 dev_chat)         │
 ├──────────────────────────────────────────────────────────────┤
@@ -294,6 +369,7 @@ python -m smartbutler.scripts.memory_cli list-deleted --limit 50
 │ 批量删   ... purge-before --older-than-days 30 --confirm yes  │
 │ 一键清空 ... clear-all --confirm yes --yes-i-know-this-       │
 │              deletes-everything --no-dry-run                   │
+│ 只清图   ... graph-clear --confirm yes --no-dry-run           │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -310,12 +386,17 @@ python -m smartbutler.scripts.memory_cli list-deleted --limit 50
 | `--live` 模式不响应 | `.env` 没配 `SMARTBUTLER_LLM_*` | 配 `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` |
 | 短期库 stm-dump 显示"0 含 messages 的 checkpoint" | 反序列化失败(LangChain 对象 vs dict 判错) | 7.4 已修(走 `model_dump()` 降级);如仍 0,试 `--all-checkpoints` |
 | 改了 `vector_size` 后报 dimension mismatch | Qdrant collection 不能改维度 | 走 §4 "改向量维度" 重建 |
+| `clear-all` 跑完图还在 | 图是**独立子系统**(`data/memory/graph.db`),默认不动 | 加 `--include-graph`,或用 `graph-clear` 只清图 |
+| `graph-clear` 后管家认不出人了 | 清图连**声纹绑定**(`user_id`)一起丢 | 声纹库没坏;重新采集声纹 → `resolve_person` 会重新绑定 |
+| 找不到图库 / 图库路径对不上 | 相对路径基准是运行时数据目录 `data/memory/` | 用 `graph-stats` 看 CLI 解析出的实际路径;配置见 §3.5 |
 
 ---
 
 ## 8. 详细文档
 
 - **架构 / 设计**:`docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1(含 §2.5.1.16 vacuum 治理)
+- **记忆图设计**:`docs/PHASE_9_GRAPH_MEMORY_DESIGN.md`(§6 存储 / §8 声纹绑定 / §15 运维清理)
+- **记忆图路线图**:`docs/PHASE_9_GRAPH_MEMORY_ROADMAP.md`
 - **CLI 源码**:`smartbutler/scripts/memory_cli.py`(顶部 docstring 列出 7+5+2 个子命令)
 - **7.4 实施**:`docs/PHASE_7_TECHNICAL_DESIGN.md` §3 + §12.6
 - **dev_chat 源码**:`scripts/dev_chat.py`(顶部 docstring 列出所有启动方式 + REPL 命令)

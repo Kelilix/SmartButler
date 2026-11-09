@@ -490,7 +490,33 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
 #   跟"长短期记忆"是不同子系统,所以默认不动。
 #   加 ``--include-task-index`` 才一并清(用户决策:
 #   "管家所有内部状态全清"才传这个开关)。
+#
+# 可选 [5]:data/graph.db(Phase 9 记忆图)——
+#   同样是独立子系统,默认不动,加 ``--include-graph`` 才一并清。
+#   ⚠️ 清图会连**声纹绑定关系**一起丢(节点上的 user_id / voice_bound),
+#      声纹库本身不受影响 —— 重新采集声纹后可再次绑定。
 # ===========================================================================
+
+
+def _resolve_graph_db_path(args: argparse.Namespace) -> Path:
+    """解析记忆图 SQLite 路径。
+
+    ⚠️ 必须走 ``graph/paths.py`` 的 :func:`resolve_graph_db_path` ——
+    那是运行时(``wiring.py``)与 CLI 的**单一事实来源**。
+    曾经两边各写一份,导致运行时落盘 ``data/memory/data/graph.db``,
+    CLI 却去找 ``data/graph.db``,清图命令找不到文件。
+    """
+    from smartbutler.emotion.memory.graph.paths import resolve_graph_db_path
+
+    raw = getattr(args, "graph_db_path", None)
+    if not raw:
+        try:
+            from smartbutler.config.memory import load_memory_settings
+
+            raw = load_memory_settings().graph_db_path
+        except Exception:  # noqa: BLE001
+            raw = "graph.db"
+    return resolve_graph_db_path(raw)
 
 
 def cmd_clear_all(args: argparse.Namespace) -> int:
@@ -550,6 +576,16 @@ def cmd_clear_all(args: argparse.Namespace) -> int:
         print()
         print(f"  [ℹ️ ] Task 切分索引 (data/task_index.db) 默认不动。")
         print(f"        加 --include-task-index 一并清空(同时清空 tasks / task_messages / _processed_cursor)。")
+    if getattr(args, "include_graph", False):
+        print()
+        print(f"  [5] 记忆图 SQLite(Phase 9 人物关系图)")
+        gp = _resolve_graph_db_path(args)
+        print(f"      path       = {gp}")
+        print(f"      ⚠️  会一并丢失节点上的声纹绑定(user_id / voice_bound)。")
+    else:
+        print()
+        print(f"  [ℹ️ ] 记忆图 (data/graph.db) 默认不动。")
+        print(f"        加 --include-graph 一并清空(人物节点 / 关系边 / 抽取日志)。")
     print()
 
     if dry:
@@ -682,12 +718,31 @@ def cmd_clear_all(args: argparse.Namespace) -> int:
                 return 1
             print(f"      ✅ 删了 {n} 行")
 
+    # ----- 可选 [5]:记忆图 -----
+    if getattr(args, "include_graph", False):
+        gp = _resolve_graph_db_path(args)
+        print("[5/5] 清空记忆图 SQLite ...")
+        if not gp.exists():
+            print(f"      ℹ️  图库文件不存在,跳过:{gp}")
+        else:
+            from smartbutler.emotion.memory.graph.store import GraphStore
+
+            gs = GraphStore(gp)
+            c = gs.clear_all()
+            print(
+                f"      ✅ 删了 {c['entities']} 个节点 / "
+                f"{c['edges']} 条边 / {c['task_log']} 条抽取日志"
+            )
+            print(f"      ⚠️  声纹绑定关系已丢失(声纹库本身不受影响)")
+
     print()
     print("=" * 60)
+    cleared = ["长短期记忆"]
     if getattr(args, "include_task_index", False):
-        print(" ✅ clear-all 完成。所有长短期记忆 + Task 索引已清空。")
-    else:
-        print(" ✅ clear-all 完成。所有长短期记忆已清空(Task 索引未动)。")
+        cleared.append("Task 索引")
+    if getattr(args, "include_graph", False):
+        cleared.append("记忆图")
+    print(f" ✅ clear-all 完成。已清空:{' + '.join(cleared)}。")
     print("=" * 60)
     return 0
 
@@ -919,6 +974,139 @@ def _wipe_sqlite(path: Path) -> int | None:
         return None
     finally:
         conn.close()
+
+
+def cmd_graph_clear(args: argparse.Namespace) -> int:
+    """graph-clear: 只清空记忆图(不动长短期记忆)。
+
+    与 ``clear-all --include-graph`` 的区别:这个**只**碰图库,
+    长期记忆(Qdrant)/短期记忆/archived 备份全都保留。
+
+    ⚠️ 会丢失节点上的**声纹绑定**(`user_id` / `voice_bound`)。
+    声纹库本身(``data/speakers.db``)不受影响 —— 重新采集后可再次绑定。
+    """
+    if args.confirm != "yes":
+        print(
+            "ERROR: --confirm must be 'yes' to proceed.\n"
+            "  Example: memory_cli graph-clear --confirm yes",
+            file=sys.stderr,
+        )
+        return 2
+
+    gp = _resolve_graph_db_path(args)
+    print("=" * 60)
+    print(" graph-clear: 计划清空的项")
+    print("=" * 60)
+    print(f"  记忆图 SQLite(Phase 9 人物关系图)")
+    print(f"      path = {gp}")
+    print(f"      ⚠️  节点上的声纹绑定(user_id / voice_bound)会一并丢失。")
+    print(f"      ℹ️  声纹库本身不受影响。")
+    print()
+
+    if args.dry_run:
+        print("⚠️  DRY RUN: 实际未执行。去掉 --dry-run 并加 --confirm yes 真跑。")
+        return 0
+
+    if not gp.exists():
+        print(f"      ℹ️  图库文件不存在,跳过:{gp}")
+        print("\n✅ 无需清理。")
+        return 0
+
+    from smartbutler.emotion.memory.graph.store import GraphStore
+
+    gs = GraphStore(gp)
+    before = gs.stats()
+    print(f"  清空前: {before['nodes']} 个节点 / {before['edges']} 条边")
+    c = gs.clear_all()
+    print(
+        f"      ✅ 删了 {c['entities']} 个节点 / "
+        f"{c['edges']} 条边 / {c['task_log']} 条抽取日志"
+    )
+    print()
+    print("=" * 60)
+    print(" ✅ graph-clear 完成。记忆图已清空(记忆库未动)。")
+    print("=" * 60)
+    return 0
+
+
+def cmd_graph_stats(args: argparse.Namespace) -> int:
+    """graph-stats: 记忆图规模体检(节点/边/活跃边/绑定数)。"""
+    from smartbutler.emotion.memory.graph.store import GraphStore
+
+    gp = _resolve_graph_db_path(args)
+    if not gp.exists():
+        print(f"Graph DB 不存在:{gp}")
+        print("  💡 图库在首次启用记忆图并抽取时会自动创建。")
+        return 0
+    gs = GraphStore(gp)
+    s = gs.stats()
+    size = gp.stat().st_size
+    print(f"Graph memory: {gp}\n")
+    print(f"  {'nodes':<26} {s['nodes']:>12,}")
+    print(f"  {'edges':<26} {s['edges']:>12,}")
+    print(f"  {'active_edges':<26} {s['active_edges']:>12,}")
+    print(f"  {'invalidated_edges':<26} {s['edges'] - s['active_edges']:>12,}")
+    print(f"  {'extracted_tasks':<26} {s['tasks']:>12,}")
+    print(f"  {'voice_bound_nodes':<26} {s['voice_bound_nodes']:>12,}")
+    print(f"  {'file_size':<26} {size:>12,} bytes  ({size / 1024:.1f} KB)")
+    return 0
+
+
+def cmd_graph_dump(args: argparse.Namespace) -> int:
+    """graph-dump: 翻出图里的节点与边(看"到底存了什么关系")。"""
+    from smartbutler.emotion.memory.graph.store import GraphStore
+
+    gp = _resolve_graph_db_path(args)
+    if not gp.exists():
+        print(f"Graph DB 不存在:{gp}")
+        return 0
+    gs = GraphStore(gp)
+
+    nodes = gs.list_nodes()
+    node_map = {n.node_id: n for n in nodes}
+    print(f"Graph dump: {gp}\n")
+    print(f"  {len(nodes)} node(s):\n")
+    for n in nodes[: args.limit]:
+        bound = "🔊" if n.voice_bound else "  "
+        print(f"  {bound} {n.node_id}")
+        print(f"      name={n.name!r} type={n.type} user_id={n.user_id or '-'}")
+        if n.aliases:
+            print(f"      aliases={n.aliases}")
+        if n.summary:
+            print(f"      summary={n.summary[: args.width]}")
+
+    # 边:直接读 sqlite(GraphStore 没有"列出全部边"的公开 API)
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{gp.as_posix()}?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        sql = "SELECT * FROM graph_edges"
+        params: list[Any] = []
+        if args.only_active:
+            sql += " WHERE invalid_at IS NULL"
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(args.limit)
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+    print(f"\n  {len(rows)} edge(s):\n")
+    for r in rows:
+        src = node_map.get(r["source_id"])
+        tgt = node_map.get(r["target_id"])
+        src_name = src.name if src else r["source_id"]
+        tgt_name = tgt.name if tgt else r["target_id"]
+        dead = " [INVALID]" if r["invalid_at"] else ""
+        print(f"  {src_name} --[{r['relation_type']}]--> {tgt_name}{dead}")
+        print(f"      edge_id={r['edge_id'][:16]}… speaker={r['speaker'] or '-'}")
+        print(f"      fact: {r['fact'][: args.width]}")
+        print(
+            f"      valid_at={r['valid_at'] or '-'} "
+            f"invalid_at={r['invalid_at'] or '-'} "
+            f"task_ids={r['task_ids']}"
+        )
+    return 0
 
 
 def cmd_dump(args: argparse.Namespace) -> int:
@@ -1455,6 +1643,13 @@ def main(argv: list[str] | None = None) -> int:
         "--task-index-path", default="data/task_index.db",
         help="Task 切分索引 SQLite 路径(clear-all --include-task-index 用)",
     )
+    parser.add_argument(
+        "--graph-db-path", default=None,
+        help=(
+            "记忆图 SQLite 路径(Phase 9)。默认读 "
+            "SMARTBUTLER_MEMORY_GRAPH_DB_PATH,相对路径挂到 data/ 下。"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="cmd", required=True)
 
     # list-deleted
@@ -1739,7 +1934,59 @@ def main(argv: list[str] | None = None) -> int:
             "默认不动,需显式 opt-in"
         ),
     )
+    p_clear.add_argument(
+        "--include-graph", dest="include_graph",
+        action="store_true", default=False,
+        help=(
+            "额外清空记忆图 data/graph.db(Phase 9 人物节点 / 关系边 / 抽取日志)。"
+            "默认不动,需显式 opt-in。"
+            "⚠️ 会一并丢失节点上的声纹绑定(user_id / voice_bound)"
+        ),
+    )
     p_clear.set_defaults(func=cmd_clear_all)
+
+    # ===== 记忆图(Phase 9)=====
+
+    # graph-clear
+    p_gc = subparsers.add_parser(
+        "graph-clear",
+        help="只清空记忆图(人物节点/关系边/抽取日志),不动长短期记忆",
+    )
+    p_gc.add_argument(
+        "--confirm", default="no", choices=["yes", "no"],
+        help="必须是 'yes' 才执行",
+    )
+    p_gc.add_argument(
+        "--dry-run", dest="dry_run", action="store_true", default=True,
+        help="(默认) 只显示会清什么,不动数据",
+    )
+    p_gc.add_argument(
+        "--no-dry-run", dest="dry_run", action="store_false",
+        help="真跑(慎用!清空后无法恢复)",
+    )
+    p_gc.set_defaults(func=cmd_graph_clear)
+
+    # graph-stats
+    p_gs = subparsers.add_parser(
+        "graph-stats", help="记忆图规模体检(节点/边/活跃边/声纹绑定数)",
+    )
+    p_gs.set_defaults(func=cmd_graph_stats)
+
+    # graph-dump
+    p_gd = subparsers.add_parser(
+        "graph-dump", help="翻出记忆图里的节点与关系边(看存了什么)",
+    )
+    p_gd.add_argument(
+        "--limit", type=int, default=50, help="最多显示多少条边(默认 50)",
+    )
+    p_gd.add_argument(
+        "--width", type=int, default=120, help="fact 截断宽度(默认 120)",
+    )
+    p_gd.add_argument(
+        "--all", dest="only_active", action="store_false", default=True,
+        help="连已失效的边一起显示(默认只显示活跃边)",
+    )
+    p_gd.set_defaults(func=cmd_graph_dump)
 
     args = parser.parse_args(argv)
     return args.func(args)
