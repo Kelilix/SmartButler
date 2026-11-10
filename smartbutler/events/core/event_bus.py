@@ -101,6 +101,32 @@ class EventBus(ABC):
         """
         ...
 
+    # -------------------------------------------------------------------------
+    # 🆕 2026-11-10:代次追踪(Generation)—— L1/L2 打断
+    # -------------------------------------------------------------------------
+    #
+    # 为什么放在 EventBus 上:
+    #   代次号是**事件流**的概念 —— 它的作用就是回答
+    #   "队列里这条事件 / 这条待播的回复,还新鲜吗?"
+    #   而 EventBus 是发布端(VoiceAdapter)和消费端(ButlerServer)
+    #   **都能访问**的公共对象 —— 挂在它上面两边都能拿到。
+    #
+    # 挂在 VoiceAdapter 上不行:ButlerServer 拿不到 VoiceAdapter。
+    # 用全局变量不行:多设备/多实例会串。
+
+    @property
+    def generation_tracker(self) -> Any:
+        """用户输入代次追踪器(可选)。
+
+        实现方可以返回 ``None``(不支持代次追踪)——
+        此时所有过期检查自动跳过,行为退化为改造前的老逻辑。
+
+        返回类型用 ``Any`` 是为了避免 core 层反向依赖 voice 层
+        (core 是底层,voice 是上层)。具体类型见
+        :class:`smartbutler.voice.generation.GenerationTracker`。
+        """
+        return None
+
 
 class EventBusError(RuntimeError):
     """事件总线操作失败(连接断开 / 权限不足 / 序列化失败)。"""

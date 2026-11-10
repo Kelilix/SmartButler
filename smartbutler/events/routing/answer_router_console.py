@@ -39,6 +39,7 @@ from dataclasses import dataclass
 import structlog
 
 from smartbutler.events.core.event import BaseEvent, EventPriority
+from smartbutler.events.core.reply_metadata import event_metadata as _event_metadata
 from smartbutler.events.routing.answer_router import (
     AnswerRouter,
     EchoInputStrategy,
@@ -225,6 +226,9 @@ class StrategyChainAnswerRouter(AnswerRouter):
                 content=answer,
                 user_id=event.user_id,
                 source="proactive",
+                # 🆕 2026-11-10:带上输入代次(L2 打断用)。
+                # 播放端据此判断"LLM 算的这段时间用户是否又说了新话"。
+                metadata=_event_metadata(event),
             )
             await adapter.push(reply)
             return RouteResult(
@@ -256,6 +260,8 @@ class StrategyChainAnswerRouter(AnswerRouter):
                     content=answer,
                     user_id=event.user_id,
                     source="proactive",
+                    # 🆕 2026-11-10:带上输入代次(L2 打断用)
+                    metadata=_event_metadata(event),
                 )
                 await ad.push(reply)
                 return (self._registry._device_id(ad), True, None)
@@ -306,7 +312,7 @@ class StrategyChainAnswerRouter(AnswerRouter):
 def build_default_chain_answer_router(
     registry: DeviceRegistry,
     presence_service,
-) -> "StrategyChainAnswerRouter":
+) -> StrategyChainAnswerRouter:
     """7.5 默认策略链:
 
     1. EchoInputStrategy(event.device_id 同址)

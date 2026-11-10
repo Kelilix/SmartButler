@@ -55,7 +55,18 @@ def _topic_matches(pattern: str, topic: str) -> bool:
 class InMemoryEventBus(EventBus):
     """内存版 EventBus — 满足抽象接口,无外部依赖。"""
 
-    def __init__(self, *, history_maxsize: int = 1000) -> None:
+    def __init__(
+        self,
+        *,
+        history_maxsize: int = 1000,
+        generation_tracker: Any | None = None,
+    ) -> None:
+        """
+        Args:
+            history_maxsize: 历史事件保留条数。
+            generation_tracker: 用户输入代次追踪器(L1/L2 打断用)。
+                None → 不做代次追踪,行为与改造前一致。
+        """
         self._subscriptions: list[tuple[str, str, EventHandler]] = []
         # (pattern, consumer_group, handler)
         self._queue: asyncio.Queue[BaseEvent] = asyncio.Queue()
@@ -63,6 +74,61 @@ class InMemoryEventBus(EventBus):
         self._history_maxsize = history_maxsize
         self._consumer_task: asyncio.Task[None] | None = None
         self._stopped = True
+        # 🆕 2026-11-10:代次追踪(L1/L2 打断)
+        self._generation_tracker = generation_tracker
+
+    # ----------------- 代次追踪(L1/L2 打断) -----------------
+
+    @property
+    def generation_tracker(self) -> Any:
+        """用户输入代次追踪器(见 :class:`EventBus` 说明)。"""
+        return self._generation_tracker
+
+    async def drop_stale_pending(self) -> int:
+        """丢弃队列里**已过期**的待处理事件(L1)。
+
+        ⚠️ 这不是必须的 —— 消费端在处理前检查代次也能达到同样效果。
+        但在**队列层**丢弃有两个好处:
+            1. 过期事件根本不会占用 LLM 的处理时间
+            2. 队列不会因为堆积旧事件而"看起来很忙"
+
+        什么时候用:
+            - 队列积压时(用户连续说了很多句),定期清一次
+            - 或者干脆每 publish 一次就清一次(开销小,队列本来就不长)
+
+        Returns:
+            被丢弃的事件数。
+        """
+        tracker = self._generation_tracker
+        if tracker is None:
+            return 0
+
+        # 把队列里的事件取出来检查,过期的丢弃,不过期的放回去
+        kept: list[BaseEvent] = []
+        dropped = 0
+        while True:
+            try:
+                evt = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            generation = getattr(evt, "generation", 0)
+            if generation and tracker.is_stale(generation):
+                dropped += 1
+                tracker.note_dropped_stale()
+                continue
+            kept.append(evt)
+
+        # 放回去(保持顺序)
+        for evt in kept:
+            self._queue.put_nowait(evt)
+
+        if dropped:
+            _logger.info(
+                "in_memory_eventbus.dropped_stale_pending",
+                dropped=dropped,
+                kept=len(kept),
+            )
+        return dropped
 
     # ----------------- EventBus 协议 -----------------
 
@@ -79,6 +145,19 @@ class InMemoryEventBus(EventBus):
         self._history.append(actual_event)
         if len(self._history) > self._history_maxsize:
             self._history = self._history[-self._history_maxsize :]
+
+        # 🆕 2026-11-10 (L1):入队前先清掉队列里已过期的事件。
+        #
+        # 场景:用户连说三句 → 队列里 seq=1,2,3。LLM 正在处理 seq=1。
+        #       此时 publish(seq=3) → 先把队列里的 seq=2 清掉(它已过时),
+        #       只留 seq=3 → 消费端接下来只处理 seq=3。
+        #
+        # 为什么在这里做(而不是只在消费端检查):
+        #   消费端检查 = 过期事件仍会占一次 handler 调用(虽然不进 LLM),
+        #   队列层清理 = 过期事件**根本没进过队列**,更彻底。
+        #   两个都做:队列层清理省内存,消费端检查兜底(防止漏清)。
+        await self.drop_stale_pending()
+
         await self._queue.put(actual_event)
 
     async def subscribe(
@@ -156,6 +235,35 @@ class InMemoryEventBus(EventBus):
                 event = await self._queue.get()
             except asyncio.CancelledError:
                 break
+
+            # 🆕 2026-11-10 (L1 兜底):取出后再检查一次代次。
+            #
+            # 为什么 publish 时清过一次还要再查:
+            #   时序 —— publish(seq=1) → 队列[seq=1] → consumer 取出 seq=1
+            #   → **此时**用户说了 seq=2(publish)→ 队列清理时 seq=1 已经被取走了,
+            #   清理不到它 → seq=1 仍会被处理。
+            #
+            #   这个窗口正好覆盖"LLM 正在算 seq=1,用户又说了 seq=2"的场景 ——
+            #   也正是我们要丢弃 seq=1 的场景。
+            tracker = self._generation_tracker
+            if tracker is not None:
+                generation = getattr(event, "generation", 0)
+                if generation and tracker.is_stale(generation):
+                    tracker.note_dropped_stale()
+                    _logger.info(
+                        "in_memory_eventbus.skip_stale_event",
+                        event_id=event.event_id,
+                        topic=event.topic,
+                        generation=generation,
+                        latest_seq=tracker.latest_seq(),
+                    )
+                    # no-op ack(与下面正常路径保持一致)
+                    try:
+                        await self.ack(event)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    continue
+
             for pattern, _group, handler in list(self._subscriptions):
                 if not _topic_matches(pattern, event.topic):
                     continue

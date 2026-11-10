@@ -111,6 +111,8 @@ class VoiceServiceConfig:
     silence_timeout_ms: int = 1500
     max_segment_duration_ms: int = 30000
     vad_threshold: float = 0.02
+    #: 🆕 2026-11-10:L1/L2 代次过期宽松窗口(秒)。0=严格模式。
+    stale_window_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         """从 .env / 环境变量读取默认值(只在 dataclass 默认值时生效)。
@@ -121,31 +123,34 @@ class VoiceServiceConfig:
         # 只在 dataclass 默认值时填入, 避免覆盖 CLI/显式传入的值。
         # ⚠️ 这几个哨兵值必须和上面 dataclass 字段默认值严格一致,
         # 否则会出现"显式传了值却被 env 覆盖"的诡异行为。
-        _DEFAULT_VAD = 0.02
-        _DEFAULT_SILENCE = 1500
-        _DEFAULT_MAX_SEGMENT = 30000
-        if self.vad_threshold == _DEFAULT_VAD:
+        _default_vad = 0.02
+        _default_silence = 1500
+        _default_max_segment = 30000
+        _default_stale_window = 0.0
+        if self.vad_threshold == _default_vad:
             self.vad_threshold = settings.vad_threshold
-        if self.silence_timeout_ms == _DEFAULT_SILENCE:
+        if self.silence_timeout_ms == _default_silence:
             self.silence_timeout_ms = settings.silence_timeout_ms
-        if self.max_segment_duration_ms == _DEFAULT_MAX_SEGMENT:
+        if self.max_segment_duration_ms == _default_max_segment:
             self.max_segment_duration_ms = settings.max_segment_duration_ms
+        if self.stale_window_seconds == _default_stale_window:
+            self.stale_window_seconds = settings.stale_window_seconds
 
 
 async def create_voice_service(config: VoiceServiceConfig):
     """创建语音服务。"""
+    from smartbutler.emotion.personality.bootstrap import build_orchestrator
     from smartbutler.events.routing import (
         DeviceRegistry,
         SimplePresenceService,
         build_default_chain_answer_router,
     )
-    from smartbutler.emotion.personality.bootstrap import build_orchestrator
-    from smartbutler.server.adapters import ButlerReply, OutputAdapter
     from smartbutler.server.bus import InMemoryEventBus
     from smartbutler.server.runtime import ButlerServer
     from smartbutler.voice.adapter.config import VoiceAdapterConfig
     from smartbutler.voice.adapter.tts_output_adapter import TTSOutputAdapter
     from smartbutler.voice.adapter.voice_adapter import VoiceAdapter
+    from smartbutler.voice.generation import GenerationTracker
     from smartbutler.voice.tts.base import TTSVoice
 
     logger.info("=" * 60)
@@ -188,7 +193,25 @@ async def create_voice_service(config: VoiceServiceConfig):
 
     # 4. 创建 EventBus
     logger.info("[2/5] 初始化事件总线...")
-    event_bus = InMemoryEventBus()
+    # 🆕 2026-11-10:代次追踪器(L1/L2 打断)。
+    #
+    # **必须与 VoiceAdapter 共用同一个实例** —— VoiceAdapter 负责分配代次,
+    # EventBus / ButlerServer 负责判断是否过期。
+    #
+    # stale_window_seconds: 宽松过期窗口(秒)。
+    #   0   = 严格模式(任何新输入都让旧回复作废)
+    #   >0  = 只有"最近该窗口内的新输入"才作废旧回复
+    #         (避免用户 30 秒前随口一句"嗯"就把等了 10s 的回复丢掉)
+    generation_tracker = GenerationTracker(
+        stale_window_seconds=config.stale_window_seconds,
+    )
+    logger.info(
+        "代次追踪器: stale_window=%.1fs (%s)",
+        config.stale_window_seconds,
+        "严格模式" if config.stale_window_seconds <= 0 else "宽松模式",
+    )
+
+    event_bus = InMemoryEventBus(generation_tracker=generation_tracker)
 
     # 5. 创建 VoiceAdapter
     logger.info("[3/5] 初始化 VoiceAdapter...")
@@ -220,6 +243,7 @@ async def create_voice_service(config: VoiceServiceConfig):
         config=voice_config,
         event_bus=event_bus,
         speaker_registry=speaker_registry,  # 🆕 Phase 7.6: 接入声纹识别
+        generation_tracker=generation_tracker,  # 🆕 2026-11-10: L1/L2 打断
     )
 
     # 🆕 Phase 7.6: 把 voice_adapter 和 speaker_registry 注入到 enroll_speaker Tool
@@ -331,6 +355,8 @@ async def create_voice_service(config: VoiceServiceConfig):
         player=player,
         voice=tts_voice,
         device_id=config.device_id,
+        # 🆕 2026-11-10:同一个 tracker → 播报前能判断回复是否已过时(L2)
+        generation_tracker=generation_tracker,
     )
 
     # 7. 创建 DeviceRegistry + AnswerRouter
@@ -517,7 +543,6 @@ def _create_voice_components(config: VoiceServiceConfig):
 
 def _create_fake_components(config: VoiceServiceConfig):
     """创建 Fake 组件(开发模式)。"""
-    import numpy as np
 
     from smartbutler.voice.asr.funasr import FakeASR
     from smartbutler.voice.capture.mic_capture import FakeMicCapture
@@ -826,6 +851,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--stale-window-seconds",
+        type=float,
+        default=None,
+        help=(
+            "代次过期宽松窗口(秒),0=严格模式。"
+            "默认从 .env SMARTBUTLER_VOICE_STALE_WINDOW_SECONDS 读取(0)。"
+            "严格模式:用户说了任何新话,旧回复都不播。"
+            "宽松模式(>0):只有'最近该窗口内'说了新话才打断旧回复 —— "
+            "避免用户随口一句'嗯'让等了 10 秒的回复白白作废。"
+        ),
+    )
+    parser.add_argument(
         "--device",
         type=int,
         default=None,
@@ -862,6 +899,8 @@ def main():
         config.silence_timeout_ms = args.silence_timeout_ms  # type: ignore[attr-defined]
     if args.max_segment_ms is not None:
         config.max_segment_duration_ms = args.max_segment_ms  # type: ignore[attr-defined]
+    if args.stale_window_seconds is not None:
+        config.stale_window_seconds = args.stale_window_seconds  # type: ignore[attr-defined]
 
     config.mic_device = args.device  # type: ignore[attr-defined]
 
@@ -877,6 +916,14 @@ def main():
     logger.info(
         "  Max segment:      %sms (env=SMARTBUTLER_VOICE_MAX_SEGMENT_DURATION_MS)",
         config.max_segment_duration_ms,
+    )
+    logger.info(
+        "  Stale window:     %s (env=SMARTBUTLER_VOICE_STALE_WINDOW_SECONDS)",
+        (
+            "严格模式(任何新输入都丢弃旧回复)"
+            if config.stale_window_seconds <= 0
+            else f"{config.stale_window_seconds:.1f}s 宽松模式"
+        ),
     )
 
     asyncio.run(run_voice_service(config))

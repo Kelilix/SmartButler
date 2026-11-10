@@ -107,6 +107,29 @@ class VoiceEvent(BaseEvent):
         default="",
         description="建议询问登记声纹的原因(如 stranger / empty_registry)",
     )
+    # 🆕 2026-11-10:输入代次号(Generation)—— L1/L2 打断的基础设施。
+    #
+    # 语义:同一个设备上**用户又说了新话**的标识(严格单调递增)。
+    #   0 = 未知(不是 VoiceAdapter 产生的,或旧版本事件)
+    #   N = 本次发言的 monotonic 毫秒时间戳
+    #
+    # 为什么用时间戳而不是简单计数器:
+    #   - 自带时间语义(能直接算"这次发言距今多久")
+    #   - 跨进程/重启可比(计数器会归零)
+    #   - 日志可读(能直接看到发言时刻)
+    #
+    # 用途:
+    #   - L1(不积压):消费时若 generation < 最新代次 → 已过期,丢弃不处理
+    #   - L2(不播过期回复):LLM 算完后若 generation < 最新代次 → 不播这条
+    #
+    # 为什么放在事件里而不是用外部映射:
+    #   事件可能被 normalizer 重建(model_copy),外部映射会失联;
+    #   放字段里能保证"同一条事件在任何环节都是同一个代次"。
+    generation: int = Field(
+        default=0,
+        ge=0,
+        description="用户输入代次(严格单调递增的毫秒时间戳,0=未知)",
+    )
 
     @classmethod
     def make(
@@ -127,6 +150,7 @@ class VoiceEvent(BaseEvent):
         speakers: list[SpeakerInfo] | None = None,
         suggest_enrollment: bool = False,
         enrollment_reason: str = "",
+        generation: int = 0,
     ) -> VoiceEvent:
         """工厂方法。
 
@@ -135,6 +159,8 @@ class VoiceEvent(BaseEvent):
 
         🆕 2026-11-01 (Phase 7.6.1): ``suggest_enrollment`` / ``enrollment_reason``
         告诉 Agent"这个人是陌生人,可以问要不要录声纹"。**不代表已采集**。
+
+        🆕 2026-11-10: ``generation`` 传入用户输入代次号(L1/L2 打断用)。
         """
         topic = f"voice.{action.value}"
         return cls(
@@ -155,6 +181,7 @@ class VoiceEvent(BaseEvent):
             speakers=speakers or [],
             suggest_enrollment=suggest_enrollment,
             enrollment_reason=enrollment_reason,
+            generation=generation,
         )
 
     def to_user_input(self) -> str:

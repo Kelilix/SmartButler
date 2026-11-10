@@ -24,7 +24,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # 数据类
 # ---------------------------------------------------------------------------
@@ -106,6 +105,9 @@ class ButlerReply:
             - 含 TTS(7.7) → ``["text", "audio"]``
         - ``latency_ms: float``  —— 后续 7.5 性能监控
         - ``tool_call_count: int`` —— 后续 7.5 工具调用统计
+        - 🆕 2026-11-10 ``generation: int`` —— 用户输入代次号(L2 打断用)。
+            播放前用它判断"这条回复是否已过时"。
+            见 :class:`smartbutler.voice.generation.GenerationTracker`。
     """
 
     content: str
@@ -114,6 +116,26 @@ class ButlerReply:
     source: str = "reactive"
     related_event_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    # -------------------------------------------------------------------------
+    # 🆕 2026-11-10:输入代次(L2 打断)
+    # -------------------------------------------------------------------------
+
+    @property
+    def generation(self) -> int:
+        """用户输入代次号(0 = 未知)。
+
+        从 ``metadata["generation"]`` 取 —— 沿用「不动 dataclass 字段」的
+        协议稳定不变量(见类 docstring)。
+
+        播放端(TTSOutputAdapter)用它判断:LLM 算完这段时间里,
+        用户是不是又说了新话?是的话这条回复就过时了,不该播。
+        """
+        value = self.metadata.get("generation", 0)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
 
 
 # ---------------------------------------------------------------------------

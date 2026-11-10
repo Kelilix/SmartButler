@@ -45,6 +45,7 @@ from smartbutler.events.core.event_bus import EventBus
 from smartbutler.events.protocol.voice_event import VoiceAction, VoiceEvent
 from smartbutler.voice.adapter.config import VoiceAdapterConfig
 from smartbutler.voice.capture.base import AudioSegment
+from smartbutler.voice.generation import GenerationTracker
 from smartbutler.voice.player.base import BaseAudioPlayer
 from smartbutler.voice.speaker.base import BaseSpeakerEmbedder
 from smartbutler.voice.tts.base import TTSVoice
@@ -104,8 +105,20 @@ class VoiceAdapter:
         self,
         config: VoiceAdapterConfig,
         event_bus: EventBus,
-        speaker_registry: "SpeakerRegistry | None" = None,
+        speaker_registry: SpeakerRegistry | None = None,
+        generation_tracker: GenerationTracker | None = None,
     ) -> None:
+        """
+        Args:
+            config: VoiceAdapter 配置。
+            event_bus: 事件总线(发布 VoiceEvent)。
+            speaker_registry: 声纹注册表(可选)。
+            generation_tracker: 🆕 2026-11-10 用户输入代次追踪器。
+                **应该与 EventBus 用同一个实例** —— 这样消费端
+                (ButlerServer)才能通过 ``event_bus.generation_tracker``
+                判断事件是否过期。
+                None → 自己建一个(此时跨组件的过期检查会失效)。
+        """
         self._cfg = config
         self._bus = event_bus
         self._registry = speaker_registry
@@ -131,6 +144,16 @@ class VoiceAdapter:
 
         # 打断标志
         self._interrupt_event = asyncio.Event()
+
+        # 🆕 2026-11-10:用户输入代次追踪(L1/L2 打断)。
+        #
+        # 每次用户说新话 → generation.issue() 分配新代次。
+        # 下游(消费端/播放端)用它判断"我这条是不是已经过时了"。
+        #
+        # 见 smartbutler/voice/generation.py 顶部的问题说明。
+        self._generation = generation_tracker or GenerationTracker()
+        # 播放端(L2)要能查到代次,所以把 tracker 暴露出去
+        self._last_generation = 0
 
         # 播放锁
         self._speaking_lock = asyncio.Lock()
@@ -267,6 +290,22 @@ class VoiceAdapter:
     def state(self) -> str:
         """当前状态。"""
         return self._state
+
+    @property
+    def generation_tracker(self) -> GenerationTracker:
+        """用户输入代次追踪器(L1/L2 打断用)。
+
+        下游(消费端 / 播放端)通过它判断"我处理的这条输入是否已过时"。
+
+        - ``tracker.latest_seq()`` — 当前最新代次
+        - ``tracker.is_stale(seq)`` — 该代次是否已过期
+        """
+        return self._generation
+
+    @property
+    def latest_generation(self) -> int:
+        """最新一次用户输入的代次号(0 = 还没发过言)。"""
+        return self._generation.latest_seq()
 
     # -------------------------------------------------------------------------
     # Internal:State Machine
@@ -532,6 +571,19 @@ class VoiceAdapter:
         elif not asr_result:
             logger.info("🔇 ASR 结果为空，跳过声纹识别")
 
+        # 🆕 2026-11-10:分配输入代次号(L1/L2 打断)。
+        #
+        # 时机很重要:必须在**发布事件之前**分配 —— 这样事件一旦入队,
+        # 就已经带着"我是第几句"的标记,下游随时能判断自己是否过时。
+        #
+        # 例:用户连说三句 → seq=1,2,3。消费端处理 seq=1 时发现
+        # latest_seq 已经是 3 → 直接丢弃,不进 LLM(L1)。
+        #
+        # 用 issue_for 而不是手写 generation=await issue():
+        # 保证代次号只有 tracker 一个来源,不会与事件字段脱节。
+        generation = await self._generation.issue()
+        self._last_generation = generation
+
         # 发布 VoiceEvent
         # 🆕 2026-11-01: user_id 传声纹识别出的说话人(不再是写死的设备归属人)
         #
@@ -551,6 +603,7 @@ class VoiceAdapter:
                 effective_user_id
             ),
             enrollment_reason=enroll_reason,
+            generation=generation,
         )
         await self._bus.publish(event)
 

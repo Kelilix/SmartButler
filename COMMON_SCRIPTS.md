@@ -57,6 +57,7 @@ python -m smartbutler.scripts.voice_service --no-fake
 | `--vad-threshold` | env | VAD 语音概率阈值(默认 0.02,**不要低于 0.01**) |
 | `--silence-timeout-ms` | env | 静音超时(默认 1500) |
 | `--max-segment-ms` | env | 单段最大时长(默认 30000) |
+| `--stale-window-seconds` | env | 代次过期宽松窗口(默认 0=严格模式,见 §1.6) |
 | `--device` | 系统默认 | 音频输入设备 ID |
 | `--list-devices` | - | 列出所有音频设备后退出 |
 
@@ -106,6 +107,60 @@ python -m smartbutler.scripts.memory_cli vacuum --dry-run
 | 说话没反应 / 一直等 | VAD 阈值太低,把静音当语音 | 调高 `SMARTBUTLER_VOICE_VAD_THRESHOLD`(别低于 0.01) |
 | 回复很碎 / 一次说半句 | 静默超时太短 | 调大 `SMARTBUTLER_VOICE_SILENCE_TIMEOUT_MS` |
 | 管家说话不像"英国贵族管家" | Personality 没注入 orchestrator | 已修(2026-11-09)。看启动日志有没有 `personality.loaded name=杰贝兹`,见 §2.5 |
+
+### 1.6 打断策略(L1/L2 代次过期)
+
+**背景**:用户连续说话时,管家会把旧回复陆续播出来(L1 队列积压 + L2 播过期回复)。
+已通过**代次号(generation)** 机制解决:每次发言分配一个严格单调递增的
+**毫秒时间戳**,下游用它判断"我这条是不是已经过时了"。
+
+| 层 | 位置 | 行为 |
+|---|---|---|
+| **L1** | `InMemoryEventBus` 队列层 | 队列里的过期事件直接丢弃,**不进 LLM**(省算力) |
+| **L2** | `TTSOutputAdapter` 播放层 | LLM 算完后若已过期,**跳过 TTS 合成**(省时省钱,不播) |
+
+**两种过期模式**(`--stale-window-seconds` / `SMARTBUTLER_VOICE_STALE_WINDOW_SECONDS`):
+
+| 模式 | 值 | 语义 | 适合 |
+|---|---|---|---|
+| **严格** | `0`(默认) | 用户说了**任何**新话 → 旧回复不播 | 用户明确换话题,想立刻听到新回答 |
+| **宽松** | `>0`(秒) | 只有"**最近该窗口内**"说了新话 → 旧回复才作废 | 用户会随口说"嗯/对",不想让这些把回复作废 |
+
+**宽松模式的关键语义**(2026-11-10 修):
+
+判定看的是「**最新那次更新距今多久**」,而不是「两个代次间隔了多久」。
+
+```
+T=0   用户:"帮我查天气"   → gen1
+T=5   用户:"嗯"            → gen2
+T=100 LLM 算完 gen1
+
+- 若按"间隔"判(5s ≤ window) → gen1 过期 ❌ (白等 100 秒啥也没听到)
+- 按"距今"判(95s > window)  → gen1 不过期 ✅
+```
+
+**怎么调**:
+
+```bash
+# 严格模式(默认)
+python -m smartbutler.scripts.voice_service --no-fake
+
+# 宽松模式(3 秒窗口):随口说"嗯"不打断,真正换话题才打断
+python -m smartbutler.scripts.voice_service --no-fake --stale-window-seconds 3
+
+# 或者写进 .env
+# SMARTBUTLER_VOICE_STALE_WINDOW_SECONDS=3
+```
+
+**怎么确认生效**:启动日志会打印
+
+```
+代次追踪器: stale_window=0.0s (严格模式)
+```
+
+**⚠️ 已知局限**:L1/L2 只管"管家播报之间"。管家**正在说话时**插嘴,
+当前这句会**播完**(播报已开始,L2 只在播报**前**检查)。要真正截断正在播的音频,
+需要后续的 waveOut 打断(L3)。
 
 ---
 
@@ -433,6 +488,7 @@ python -m smartbutler.scripts.memory_cli list-deleted --limit 50
 | `graph-clear` 后管家认不出人了 | 清图连**声纹绑定**(`user_id`)一起丢 | 声纹库没坏;重新采集声纹 → `resolve_person` 会重新绑定 |
 | 找不到图库 / 图库路径对不上 | 相对路径基准是运行时数据目录 `data/memory/` | 用 `graph-stats` 看 CLI 解析出的实际路径;配置见 §3.5 |
 | **管家说话不像"英国贵族管家"** | Personality **没注入** orchestrator → 回落内置通用人设 | 已修(`bootstrap.build_orchestrator`)。自查:启动日志应出现 `personality.loaded name=杰贝兹`;见 §2.5 |
+| 插一句嘴,等了半天**啥也没听到** | 严格模式下"任何新话"都作废旧回复 | 用户随口说的"嗯/对"也算新话 → 调 `--stale-window-seconds 3` 改宽松模式;见 §1.6 |
 
 ---
 

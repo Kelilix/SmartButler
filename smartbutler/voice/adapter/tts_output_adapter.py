@@ -54,6 +54,7 @@ from smartbutler.utils import get_logger
 from smartbutler.voice.tts.base import BaseTTS, TTSVoice
 
 if TYPE_CHECKING:
+    from smartbutler.voice.generation import GenerationTracker
     from smartbutler.voice.player.base import BaseAudioPlayer
 
 logger = get_logger(__name__)
@@ -82,10 +83,11 @@ class TTSOutputAdapter(OutputAdapter):
     def __init__(
         self,
         tts: BaseTTS,
-        player: "BaseAudioPlayer | None" = None,
+        player: BaseAudioPlayer | None = None,
         voice: TTSVoice | None = None,
         device_id: str = "tts_output",
         block_while_speaking: bool = True,
+        generation_tracker: GenerationTracker | None = None,
     ) -> None:
         """构造 TTSOutputAdapter。
 
@@ -96,12 +98,17 @@ class TTSOutputAdapter(OutputAdapter):
             device_id: 设备 ID(OutputAdapter 接口需要)。
             block_while_speaking: 是否在播放时阻塞后续 push。
                 True=语音期间忽略新指令;False=立即处理新指令(可能打断)。
+            generation_tracker: 🆕 2026-11-10 用户输入代次追踪器(L2 打断用)。
+                **必须与 VoiceAdapter / EventBus 用同一个实例**。
+                播报前用它判断"这条回复是否已过时"。
+                None → 不做 L2 检查(行为与改造前一致)。
         """
         self._tts = tts
         self._player = player
         self._voice = voice or TTSVoice(id="zh-CN-XiaoxiaoNeural", lang="zh-CN")
         self._device_id = device_id
         self._block_while_speaking = block_while_speaking
+        self._generation_tracker = generation_tracker
 
         # 播放锁:防止同时播放多段音频
         self._speaking_lock = asyncio.Lock()
@@ -111,6 +118,27 @@ class TTSOutputAdapter(OutputAdapter):
     def device_id(self) -> str:
         """OutputAdapter 接口:设备 ID。"""
         return self._device_id
+
+    def _is_reply_stale(self, reply: ButlerReply) -> bool:
+        """判断这条回复是否已过时(L2)。
+
+        场景:LLM 算了 10 秒,期间用户又说了新话 → 这条回复对应的
+        已经不是用户当前的诉求了,播出来只会让人困惑("我不想听这个")。
+
+        Args:
+            reply: 待播报的回复(``metadata["generation"]`` 带代次号)。
+
+        Returns:
+            True = 已过时,不该播。
+        """
+        tracker = self._generation_tracker
+        if tracker is None:
+            return False
+        generation = reply.generation
+        if generation <= 0:
+            # 没有代次信息(非语音事件 / 老路径)→ 不做判断
+            return False
+        return tracker.is_stale(generation)
 
     async def push(self, reply: ButlerReply) -> None:
         """推送 TTS 语音。
@@ -125,6 +153,27 @@ class TTSOutputAdapter(OutputAdapter):
             logger.debug("TTSOutputAdapter received empty content, skipping")
             return
 
+        # 🆕 2026-11-10 (L2):播报前检查这条回复是否已过时。
+        #
+        # 场景:LLM 算了 10 秒,期间用户又说了新话 → 这条回复已经不对题了,
+        # 播出来只会让人困惑("我不想听这个")。
+        #
+        # 放在 TTS 生成**之前** —— 过期回复连音频都不生成,省时省钱。
+        if self._is_reply_stale(reply):
+            tracker = self._generation_tracker
+            if tracker is not None:
+                tracker.note_dropped_speech()
+            logger.info(
+                "TTSOutputAdapter 跳过过期回复",
+                generation=reply.generation,
+                latest_seq=(
+                    self._generation_tracker.latest_seq()
+                    if self._generation_tracker is not None
+                    else 0
+                ),
+                content=reply.content[:50],
+            )
+            return
         # 如果正在播放,选择是否等待
         if self._block_while_speaking:
             # 等待上一个播放完成

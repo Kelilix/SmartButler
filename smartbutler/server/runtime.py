@@ -30,7 +30,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -39,6 +38,7 @@ import structlog
 from smartbutler.events.core.event import BaseEvent, EventPriority, EventSource
 from smartbutler.events.core.event_bus import EventBus
 from smartbutler.events.core.normalizer import EventNormalizer
+from smartbutler.events.core.reply_metadata import event_metadata as _event_metadata
 from smartbutler.events.core.trigger import EventTrigger
 from smartbutler.events.routing.answer_router import AnswerRouter
 from smartbutler.server.adapters import (
@@ -82,8 +82,8 @@ class ServerConfig:
         enable_event_bus: bool = True,
         auto_subscribe_proactive: bool = True,
         # 🆕 7.4 字段
-        normalizer: "EventNormalizer | None" = None,
-        trigger: "EventTrigger | None" = None,
+        normalizer: EventNormalizer | None = None,
+        trigger: EventTrigger | None = None,
         enable_normalizer: bool = True,
         enable_trigger: bool = True,
         normalizer_window_sec: float = 5.0,
@@ -382,7 +382,7 @@ class ButlerServer:
         self._answer_router = router
 
     def set_presence_service(
-        self, presence_service: "PresenceService"  # noqa: F821
+        self, presence_service: PresenceService  # noqa: F821
     ) -> None:
         """运行时注入 PresenceService(给 AnswerRouter 用,7.5 D3)。
 
@@ -541,6 +541,8 @@ class ButlerServer:
             session_id=f"{reply_source}-{event.event_id}",
             source=reply_source,
             related_event_id=event.event_id,
+            # 🆕 2026-11-10:带上输入代次(L2 打断用)
+            metadata=_event_metadata(event),
         )
         await self._dispatch_reply(reply)
 
