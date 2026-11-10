@@ -41,13 +41,10 @@ from smartbutler.emotion.memory.consolidation import Consolidator
 from smartbutler.emotion.memory.hooks import MemoryHooks
 from smartbutler.emotion.memory.long_term import LongTermStore
 from smartbutler.emotion.memory.summarizer import (
-    FiveW1HExtractor,
-    HeuristicSummarizer,
     LLMScorer,
     LLMSummarizer,
 )
 from smartbutler.emotion.memory.vacuum import VacuumService
-from smartbutler.storage.qdrant import QdrantStorage
 
 
 def _build_store(args: argparse.Namespace) -> LongTermStore:
@@ -63,6 +60,37 @@ def _build_store(args: argparse.Namespace) -> LongTermStore:
     )
 
 
+# ---------------------------------------------------------------------------
+# 路径解析(与运行时共用 smartbutler.emotion.memory.paths)
+#
+# ⚠️ 2026-11-09 事故:CLI 默认用 ``data/short_term.db``,
+#    运行时用 ``data/memory/short_term.db`` —— 差一层目录,
+#    导致"全清理"清的是空壳库,真实数据纹丝不动。
+#    现在两者都走 ``paths.resolve_*``,不会再分叉。
+# ---------------------------------------------------------------------------
+
+
+def _archive_path(args: argparse.Namespace) -> Path:
+    """archived 备份库路径(默认 ``data/memory/deleted_archive.db``)。"""
+    from smartbutler.emotion.memory.paths import resolve_archive_db_path
+
+    return resolve_archive_db_path(getattr(args, "archive_path", None))
+
+
+def _stm_path(args: argparse.Namespace) -> Path:
+    """短期记忆库路径(默认 ``data/memory/short_term.db``)。"""
+    from smartbutler.emotion.memory.paths import resolve_short_term_db_path
+
+    return resolve_short_term_db_path(getattr(args, "stm_path", None))
+
+
+def _task_index_path(args: argparse.Namespace) -> Path:
+    """Task 索引库路径(默认 ``data/memory/task_index.db``)。"""
+    from smartbutler.emotion.memory.paths import resolve_task_index_db_path
+
+    return resolve_task_index_db_path(getattr(args, "task_index_path", None))
+
+
 def _try_build_llm() -> Any | None:
     """尽力建一个 LLM 实例,失败返回 None(调用方降级)。
 
@@ -70,8 +98,8 @@ def _try_build_llm() -> Any | None:
     返回 None 时 :class:`LLMSummarizer` 自动退化为拼接兜底。
     """
     try:
-        from smartbutler.config.llm import load_llm_settings
         from smartbutler.capabilities.llm.factory import create_llm
+        from smartbutler.config.llm import load_llm_settings
 
         return create_llm(load_llm_settings())
     except Exception as e:  # noqa: BLE001
@@ -82,7 +110,7 @@ def _try_build_llm() -> Any | None:
 def cmd_list_deleted(args: argparse.Namespace) -> int:
     """list-deleted: 列出软删除的事实(支持 --by-age 分桶显示)。"""
     store = _build_store(args)
-    archive = ArchiveStore(Path(args.archive_path))
+    archive = ArchiveStore(_archive_path(args))
     vs = VacuumService(store=store, archive=archive, embedder=None)
     # --by-age 优先走分桶
     if args.by_age:
@@ -152,7 +180,7 @@ def _print_age_buckets(vs: VacuumService, level: str, header: str = "") -> int:
 def cmd_age_summary(args: argparse.Namespace) -> int:
     """age-summary: 按软删除时长分桶统计(快速看有多少"该清"的了)。"""
     store = _build_store(args)
-    archive = ArchiveStore(Path(args.archive_path))
+    archive = ArchiveStore(_archive_path(args))
     vs = VacuumService(store=store, archive=archive, embedder=None)
     return _print_age_buckets(vs, args.level)
 
@@ -175,7 +203,7 @@ def cmd_purge_before(args: argparse.Namespace) -> int:
         )
         return 2
     store = _build_store(args)
-    archive = ArchiveStore(Path(args.archive_path))
+    archive = ArchiveStore(_archive_path(args))
     vs = VacuumService(store=store, archive=archive, embedder=None)
     # 先 dry-run 报告
     if args.dry_run:
@@ -191,7 +219,7 @@ def cmd_purge_before(args: argparse.Namespace) -> int:
             print(f"   [{age}] {it.key}: {it.content[:60]}")
         if len(items) > 10:
             print(f"   ... and {len(items) - 10} more")
-        print(f"\nPass --no-dry-run --confirm yes to apply.")
+        print("\nPass --no-dry-run --confirm yes to apply.")
         return 0
     # 真跑
     print(
@@ -220,7 +248,7 @@ def cmd_purge_archived(args: argparse.Namespace) -> int:
         )
         return 2
     store = _build_store(args)
-    archive = ArchiveStore(Path(args.archive_path))
+    archive = ArchiveStore(_archive_path(args))
     vs = VacuumService(store=store, archive=archive, embedder=None)
     if args.dry_run:
         items = archive.list_all(older_than_days=args.older_than_days, limit=50_000)
@@ -233,7 +261,7 @@ def cmd_purge_archived(args: argparse.Namespace) -> int:
             print(f"   [{arc_at}] {it.key}: {it.content[:60]}")
         if len(items) > 10:
             print(f"   ... and {len(items) - 10} more")
-        print(f"\nPass --no-dry-run --confirm yes to apply.")
+        print("\nPass --no-dry-run --confirm yes to apply.")
         return 0
     print(
         f"Purging all archived items older than {args.older_than_days} days..."
@@ -252,7 +280,7 @@ def cmd_purge_archived(args: argparse.Namespace) -> int:
 def cmd_stats(args: argparse.Namespace) -> int:
     """stats: 显示容量统计。"""
     store = _build_store(args)
-    archive = ArchiveStore(Path(args.archive_path))
+    archive = ArchiveStore(_archive_path(args))
     vs = VacuumService(store=store, archive=archive, embedder=None)
     stats = vs.vacuum_stats()
     print("Memory stats:\n")
@@ -282,19 +310,19 @@ def cmd_stats(args: argparse.Namespace) -> int:
     elif stats['deleted_recoverable'] > 0 or stats['archived'] > 0:
         to_clean = stats['deleted_recoverable'] + stats['archived']
         print(f"  💡 {to_clean} soft-deleted/archived items pending cleanup.")
-        print(f"     Run `memory_cli age-summary` to see what to purge.")
+        print("     Run `memory_cli age-summary` to see what to purge.")
     return 0
 
 
 def cmd_vacuum(args: argparse.Namespace) -> int:
     """vacuum: 跑一次 vacuum。"""
     store = _build_store(args)
-    archive = ArchiveStore(Path(args.archive_path))
+    archive = ArchiveStore(_archive_path(args))
     vs = VacuumService(store=store, archive=archive, embedder=None)
     dry = args.dry_run
     print(f"Running vacuum (dry_run={dry})...")
     report = vs.vacuum_once(dry_run=dry)
-    print(f"\nVacuum report:")
+    print("\nVacuum report:")
     print(f"  scanned_total    {report.scanned_total:>6}")
     print(f"  to_archive       {report.to_archive:>6}")
     print(f"  to_purge         {report.to_purge:>6}")
@@ -323,7 +351,7 @@ def cmd_purge(args: argparse.Namespace) -> int:
         )
         return 2
     store = _build_store(args)
-    archive = ArchiveStore(Path(args.archive_path))
+    archive = ArchiveStore(_archive_path(args))
     vs = VacuumService(store=store, archive=archive, embedder=None)
     ok = vs.purge_now(args.key, confirm=args.confirm)
     if ok:
@@ -418,10 +446,11 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
         # 🆕 2026-10-12:CLI dry_run 与正式 schedule 行为分离
         # - schedule consolidate():[本地昨日 00:00, 本地今日 00:00) 锁死
         # - CLI dry_run          :[本地昨日 00:00, 当前) 扫到当下,方便手工测试
-        from zoneinfo import ZoneInfo as _ZI
-        _LOCAL_TZ = _ZI("Asia/Shanghai")
+        from zoneinfo import ZoneInfo
+
+        local_tz = ZoneInfo("Asia/Shanghai")
         now_utc = datetime.now(UTC)
-        now_local = now_utc.astimezone(_LOCAL_TZ)
+        now_local = now_utc.astimezone(local_tz)
         lvl = ConsolidationLevel(level)
         window = c._resolve_window(lvl, now_utc)
         source_level = {
@@ -462,7 +491,7 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
     if report.errors:
         print(f"  errors               {len(report.errors):>6} 条(见 logs)")
     if report.new_keys:
-        print(f"\n  new_keys:")
+        print("\n  new_keys:")
         for nk in report.new_keys:
             print(f"    - {nk}")
     return 0
@@ -552,7 +581,7 @@ def cmd_clear_all(args: argparse.Namespace) -> int:
     print("=" * 60)
     print(" clear-all: 计划清空的项")
     print("=" * 60)
-    print(f"  [1] 长期记忆 Qdrant collection")
+    print("  [1] 长期记忆 Qdrant collection")
     print(f"      collection = {collection!r}")
     print(f"      mode       = {'server' if long_url else 'embedded'}")
     if long_path is not None:
@@ -560,32 +589,32 @@ def cmd_clear_all(args: argparse.Namespace) -> int:
     if long_url is not None:
         print(f"      url        = {long_url}")
     print()
-    print(f"  [2] 长期记忆 archived SQLite 备份表")
-    archive_path = Path(args.archive_path)
+    print("  [2] 长期记忆 archived SQLite 备份表")
+    archive_path = _archive_path(args)
     print(f"      path       = {archive_path}")
     print()
-    print(f"  [3] 短期记忆 short-term SQLite")
-    stm_path = Path(args.stm_path)
+    print("  [3] 短期记忆 short-term SQLite")
+    stm_path = _stm_path(args)
     print(f"      path       = {stm_path}")
     if getattr(args, "include_task_index", False):
         print()
-        print(f"  [4] Task 切分索引 SQLite(6.5 task scheduler 状态)")
-        ti_path = Path(args.task_index_path)
+        print("  [4] Task 切分索引 SQLite(6.5 task scheduler 状态)")
+        ti_path = _task_index_path(args)
         print(f"      path       = {ti_path}")
     else:
         print()
-        print(f"  [ℹ️ ] Task 切分索引 (data/task_index.db) 默认不动。")
-        print(f"        加 --include-task-index 一并清空(同时清空 tasks / task_messages / _processed_cursor)。")
+        print(f"  [ℹ️ ] Task 切分索引 ({_task_index_path(args)}) 默认不动。")
+        print("        加 --include-task-index 一并清空(同时清空 tasks / task_messages / _processed_cursor)。")
     if getattr(args, "include_graph", False):
         print()
-        print(f"  [5] 记忆图 SQLite(Phase 9 人物关系图)")
+        print("  [5] 记忆图 SQLite(Phase 9 人物关系图)")
         gp = _resolve_graph_db_path(args)
         print(f"      path       = {gp}")
-        print(f"      ⚠️  会一并丢失节点上的声纹绑定(user_id / voice_bound)。")
+        print("      ⚠️  会一并丢失节点上的声纹绑定(user_id / voice_bound)。")
     else:
         print()
-        print(f"  [ℹ️ ] 记忆图 (data/graph.db) 默认不动。")
-        print(f"        加 --include-graph 一并清空(人物节点 / 关系边 / 抽取日志)。")
+        print(f"  [ℹ️ ] 记忆图 ({_resolve_graph_db_path(args)}) 默认不动。")
+        print("        加 --include-graph 一并清空(人物节点 / 关系边 / 抽取日志)。")
     print()
 
     if dry:
@@ -653,9 +682,11 @@ def cmd_clear_all(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             # 用 QdrantStorage 直接构造拿 _path(不需要构造 client)
-            from smartbutler.emotion.memory.long_term import create_long_term_store as _cls2  # noqa: F401
-            from smartbutler.storage.qdrant import QdrantStorage
             from smartbutler.config.base import PROJECT_ROOT
+            from smartbutler.emotion.memory.long_term import (
+                create_long_term_store as _cls2,  # noqa: F401
+            )
+            from smartbutler.storage.qdrant import QdrantStorage
             qp = (
                 Path(args.qdrant_path)
                 if args.qdrant_path
@@ -708,7 +739,7 @@ def cmd_clear_all(args: argparse.Namespace) -> int:
 
     # ----- 可选 [4]:Task 切分索引 -----
     if getattr(args, "include_task_index", False):
-        ti_path = Path(args.task_index_path)
+        ti_path = _task_index_path(args)
         print("[4/4] 清空 Task 切分索引 SQLite ...")
         if not ti_path.exists():
             print(f"      ℹ️  索引文件不存在,跳过:{ti_path}")
@@ -733,7 +764,7 @@ def cmd_clear_all(args: argparse.Namespace) -> int:
                 f"      ✅ 删了 {c['entities']} 个节点 / "
                 f"{c['edges']} 条边 / {c['task_log']} 条抽取日志"
             )
-            print(f"      ⚠️  声纹绑定关系已丢失(声纹库本身不受影响)")
+            print("      ⚠️  声纹绑定关系已丢失(声纹库本身不受影响)")
 
     print()
     print("=" * 60)
@@ -997,10 +1028,10 @@ def cmd_graph_clear(args: argparse.Namespace) -> int:
     print("=" * 60)
     print(" graph-clear: 计划清空的项")
     print("=" * 60)
-    print(f"  记忆图 SQLite(Phase 9 人物关系图)")
+    print("  记忆图 SQLite(Phase 9 人物关系图)")
     print(f"      path = {gp}")
-    print(f"      ⚠️  节点上的声纹绑定(user_id / voice_bound)会一并丢失。")
-    print(f"      ℹ️  声纹库本身不受影响。")
+    print("      ⚠️  节点上的声纹绑定(user_id / voice_bound)会一并丢失。")
+    print("      ℹ️  声纹库本身不受影响。")
     print()
 
     if args.dry_run:
@@ -1405,7 +1436,7 @@ def _msg_meta(msg: dict[str, Any]) -> str:
 
 def cmd_st_threads(args: argparse.Namespace) -> int:
     """stm-threads: 列出短期记忆里所有 thread + 各自的 checkpoint 数。"""
-    conn = _open_stm_db(Path(args.stm_path))
+    conn = _open_stm_db(_stm_path(args))
     try:
         rows = conn.execute(
             "SELECT thread_id, checkpoint_ns, COUNT(*) AS n, "
@@ -1420,7 +1451,7 @@ def cmd_st_threads(args: argparse.Namespace) -> int:
 
         total_ck = sum(r[2] for r in rows)
         total_wr = sum(write_counts.values())
-        print(f"Short-term memory: {args.stm_path}")
+        print(f"Short-term memory: {_stm_path(args)}")
         print(f"  threads(checkpoint groups)={len(rows)}  "
               f"checkpoints={total_ck}  writes={total_wr}\n")
         print(f"  {'thread_id':<44} {'ns':<10} {'ckpt':>6} {'writes':>7}")
@@ -1429,7 +1460,7 @@ def cmd_st_threads(args: argparse.Namespace) -> int:
                   f"{write_counts.get(tid, 0):>7}")
         if args.detail:
             print("\n  checkpoint_id range (每 thread 最新/最旧):")
-            for tid, ns, _n, mn, mx in rows:
+            for tid, _ns, _n, mn, mx in rows:
                 print(f"    {tid:<44} {mn[:24]} … {mx[:24]}")
         return 0
     finally:
@@ -1438,7 +1469,7 @@ def cmd_st_threads(args: argparse.Namespace) -> int:
 
 def cmd_st_dump(args: argparse.Namespace) -> int:
     """stm-dump: 全量翻出短期记忆里的对话消息流。"""
-    conn = _open_stm_db(Path(args.stm_path))
+    conn = _open_stm_db(_stm_path(args))
     try:
         sql = (
             "SELECT thread_id, checkpoint_ns, checkpoint_id, type, checkpoint "
@@ -1463,7 +1494,7 @@ def cmd_st_dump(args: argparse.Namespace) -> int:
             print("No checkpoints matched.")
             return 0
 
-        print(f"Short-term dump: {args.stm_path}")
+        print(f"Short-term dump: {_stm_path(args)}")
         print(f"  matched={len(rows)} checkpoint(s)\n")
 
         shown_msgs = 0
@@ -1502,11 +1533,10 @@ def cmd_st_dump(args: argparse.Namespace) -> int:
 
 def cmd_st_stats(args: argparse.Namespace) -> int:
     """stm-stats: 短期记忆容量体检(表/thread/消息数)。"""
-    import os
 
-    conn = _open_stm_db(Path(args.stm_path))
+    conn = _open_stm_db(_stm_path(args))
     try:
-        path = Path(args.stm_path)
+        path = _stm_path(args)
         size = path.stat().st_size if path.exists() else 0
         n_ck = conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
         n_wr = conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]
@@ -1582,7 +1612,7 @@ def cmd_st_raw(args: argparse.Namespace) -> int:
     """st-raw: 打印某个 checkpoint 的原始 state(排查用,深)。"""
     import json as _json
 
-    conn = _open_stm_db(Path(args.stm_path))
+    conn = _open_stm_db(_stm_path(args))
     try:
         row = conn.execute(
             "SELECT thread_id, checkpoint_ns, checkpoint_id, type, checkpoint, metadata "
@@ -1632,22 +1662,31 @@ def main(argv: list[str] | None = None) -> int:
         "--vector-size", type=int, default=1024, help="向量维度"
     )
     parser.add_argument(
-        "--archive-path", default="data/deleted_archive.db",
-        help="archived SQLite 备份表路径",
+        "--archive-path", default=None,
+        help=(
+            "archived SQLite 备份表路径。"
+            "默认 data/memory/deleted_archive.db(与运行时一致)"
+        ),
     )
     parser.add_argument(
-        "--stm-path", default="data/short_term.db",
-        help="短期记忆 SQLite 路径(短期记忆子命令用)",
+        "--stm-path", default=None,
+        help=(
+            "短期记忆 SQLite 路径(短期记忆子命令用)。"
+            "默认 data/memory/short_term.db(与运行时一致)"
+        ),
     )
     parser.add_argument(
-        "--task-index-path", default="data/task_index.db",
-        help="Task 切分索引 SQLite 路径(clear-all --include-task-index 用)",
+        "--task-index-path", default=None,
+        help=(
+            "Task 切分索引 SQLite 路径(clear-all --include-task-index 用)。"
+            "默认 data/memory/task_index.db(与运行时一致)"
+        ),
     )
     parser.add_argument(
         "--graph-db-path", default=None,
         help=(
             "记忆图 SQLite 路径(Phase 9)。默认读 "
-            "SMARTBUTLER_MEMORY_GRAPH_DB_PATH,相对路径挂到 data/ 下。"
+            "SMARTBUTLER_MEMORY_GRAPH_DB_PATH,相对路径挂到 data/memory/ 下。"
         ),
     )
     subparsers = parser.add_subparsers(dest="cmd", required=True)

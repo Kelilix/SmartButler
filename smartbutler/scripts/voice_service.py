@@ -139,10 +139,10 @@ async def create_voice_service(config: VoiceServiceConfig):
         SimplePresenceService,
         build_default_chain_answer_router,
     )
+    from smartbutler.emotion.personality.bootstrap import build_orchestrator
     from smartbutler.server.adapters import ButlerReply, OutputAdapter
     from smartbutler.server.bus import InMemoryEventBus
     from smartbutler.server.runtime import ButlerServer
-    from smartbutler.thinking.loop.orchestrator import ButlerOrchestrator
     from smartbutler.voice.adapter.config import VoiceAdapterConfig
     from smartbutler.voice.adapter.tts_output_adapter import TTSOutputAdapter
     from smartbutler.voice.adapter.voice_adapter import VoiceAdapter
@@ -352,7 +352,14 @@ async def create_voice_service(config: VoiceServiceConfig):
 
         llm_settings = load_llm_settings()
         llm = create_llm(llm_settings)
-        orchestrator = ButlerOrchestrator(llm=llm, llm_settings=llm_settings)
+        # 🆕 2026-11-09: 走 build_orchestrator —— 自动注入 Personality。
+        #
+        # ⚠️ 之前这里直接 `ButlerOrchestrator(llm=llm, llm_settings=llm_settings)`,
+        #    **没传 personality** → `self._personality is None` →
+        #    `personality_block` 渲染成空串 → `ButlerPromptBuilder` 回落
+        #    到内置的通用 `_BUTLER_PERSONA`("你是 SmartButler 管家…")。
+        # 结果:用户配置的"英国贵族管家(杰贝兹)"人设**完全没生效**。
+        orchestrator = build_orchestrator(llm=llm, llm_settings=llm_settings)
         logger.info("  LLM: %s / %s", llm_settings.provider, llm_settings.model)
     except Exception as e:
         logger.warning("LLM 初始化失败: %s", e)

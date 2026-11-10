@@ -1,17 +1,20 @@
 # COMMON_SCRIPTS — SmartButler 日常常用命令速查
 
-> **目标**:把"启动 dev_chat 验证 → 翻记忆库 → 清理"这一条最常用工作流,所有命令汇总在一处,
-> 复制即用。每个命令都标了**前置依赖**(是否要先关 dev_chat / 是否走真 Qdrant 等)。
+> **目标**:把"启动语音服务验证 → 翻记忆库 → 清理"这一条最常用工作流,所有命令汇总在一处,
+> 复制即用。每个命令都标了**前置依赖**(是否要先关语音服务 / 是否走真 Qdrant 等)。
 >
 > 适用范围:`D:\soft\0project\test\SmartButler`(本仓库根目录)。所有命令**默认在项目根目录执行**(`cd D:\soft\0project\test\SmartButler`)。
+>
+> ⚠️ **2026-11-09 更新**:`scripts/dev_chat.py` 已从仓库移除(dev_chat 是开发期 REPL,
+> 生产入口是 `smartbutler.scripts.voice_service`)。本文档已全部改成 voice_service 的命令。
 
 ---
 
 ## 0. 一句话总结(最常用 3 条)
 
 ```bash
-# 1) 启动 REPL(默认 mock LLM,不烧 token)
-python -m scripts.dev_chat
+# 1) 启动语音服务(真硬件 + 真 LLM)
+python -m smartbutler.scripts.voice_service --no-fake
 
 # 2) 看完库里有啥
 python -m smartbutler.scripts.memory_cli dump --all
@@ -31,60 +34,53 @@ python -m smartbutler.scripts.memory_cli clear-all --include-graph \
 
 ---
 
-## 1. dev_chat 启动与验证(7.4 真实 EventBus)
+## 1. voice_service 启动与验证
 
-### 1.1 最小启动(mock LLM,默认)
+> **唯一生产入口**。`scripts/dev_chat.py` 已移除(dev_chat 是开发期 REPL,不再维护)。
+
+### 1.1 最小启动(真硬件)
 
 ```bash
 cd D:\soft\0project\test\SmartButler
-python -m scripts.dev_chat
+python -m smartbutler.scripts.voice_service --no-fake
 ```
 
-进入 REPL 后可用命令(`/help` 也能看到):
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--no-fake` | 关 | **必须加** —— 不加则用 Fake 组件(麦克风/ASR/TTS 都是假的) |
+| `--device-id` | `speaker_01` | 设备 ID |
+| `--user-id` | `gaotianyu` | 默认用户 ID(声纹未识别时的兜底) |
+| `--tts` | `edge` | TTS 实现(`edge` / `piper`) |
+| `--embedder` | `resemblyzer` | 声纹实现(`resemblyzer` / `ecapa`) |
+| `--wake-word` | `hey_butler` | 唤醒词 |
+| `--energy-threshold` | `0.0` | 唤醒能量阈值(0-1,0=任何声音都触发) |
+| `--vad-threshold` | env | VAD 语音概率阈值(默认 0.02,**不要低于 0.01**) |
+| `--silence-timeout-ms` | env | 静音超时(默认 1500) |
+| `--max-segment-ms` | env | 单段最大时长(默认 30000) |
+| `--device` | 系统默认 | 音频输入设备 ID |
+| `--list-devices` | - | 列出所有音频设备后退出 |
 
-| 命令 | 作用 |
-|------|------|
-| `/help` | 显示帮助 |
-| `/remember <text>` | 显式写一条长期记忆 |
-| `/recall <query>` | 召回 3 条相关记忆 |
-| `/stats` | 短期/长期记忆条数 |
-| `/quit` / `/exit` | 退出 |
-
-### 1.2 带 user 维度启动(多 user 场景,推荐)
+### 1.2 开发模式(Fake 组件,不碰硬件)
 
 ```bash
-# 方式 A:命令行
-python -m scripts.dev_chat --user u-male --session dev-u-male-1
-
-# 方式 B:环境变量(写到 .env 最省事)
-set SMARTBUTLER_DEV_USER_ID=u-male
-set SMARTBUTLER_DEV_SESSION_ID=dev-u-male-1
-python -m scripts.dev_chat
+python -m smartbutler.scripts.voice_service
 ```
 
-### 1.3 走真实 LLM(烧 token,调试用)
+麦克风/ASR/TTS/声纹全是 Fake —— 只用来验证链路能不能跑通,不产生真实语音。
+
+### 1.3 查音频设备
 
 ```bash
-# .env 必须配 SMARTBUTLER_LLM_* (API key / base_url / model)
-python -m scripts.dev_chat --live --user u-male
+python -m smartbutler.scripts.voice_service --list-devices
 ```
 
-### 1.4 关闭 memory 注入(只跑基础 chat,排查"是不是记忆污染"用)
+### 1.4 验证流程(端到端)
+
+启动 voice_service 后,在**另一个终端**跑 memory_cli 验证持久化:
 
 ```bash
-python -m scripts.dev_chat --no-memory
-# 或
-set SMARTBUTLER_DEV_NO_MEMORY=1
-python -m scripts.dev_chat
-```
-
-### 1.5 7.4 验证流程(EventBus 端到端 5 case)
-
-启动 dev_chat 后,在**另一个终端**跑 memory_cli 验证持久化:
-
-```bash
-# 1) 启动 dev_chat(必须先启,否则库里没数据)
-python -m scripts.dev_chat --user u-test --session dev-u-test-1
+# 1) 启动语音服务(必须先启,否则库里没数据)
+python -m smartbutler.scripts.voice_service --no-fake
 
 # 2) 另一个终端 —— 看长期库
 python -m smartbutler.scripts.memory_cli dump --all
@@ -92,18 +88,24 @@ python -m smartbutler.scripts.memory_cli dump --all
 # 3) 跑语义检索
 python -m smartbutler.scripts.memory_cli recall "上次聊的事" --k 5
 
-# 4) 退出 dev_chat(必须先退!),再清软删
+# 4) 看人物关系图
+python -m smartbutler.scripts.memory_cli graph-stats
+python -m smartbutler.scripts.memory_cli graph-dump
+
+# 5) 退出语音服务(必须先退!),再清软删
 python -m smartbutler.scripts.memory_cli age-summary
 python -m smartbutler.scripts.memory_cli vacuum --dry-run
 ```
 
-### 1.6 dev_chat 启动失败排查(7.4 已知问题清单)
+### 1.5 启动失败排查
 
 | 症状 | 原因 | 解决 |
 |------|------|------|
-| `_repl() missing 1 required positional argument: 'task_scheduler'` | 6.5 加了 task_scheduler 参数,旧测试用例没同步 | **已遗留**,不在 7.4 范围;短期解:用最新 `scripts/dev_chat.py` |
-| `AlreadyLocked` / `PermissionError(WinError 32)` / `another instance` | dev_chat 还活着,锁住 `data/qdrant/` 目录 | **关掉 dev_chat 再跑 CLI**;CLI 有兜底:截断 `storage.sqlite` 让下次启动自动重头初始化 |
+| `AlreadyLocked` / `PermissionError(WinError 32)` / `another instance` | 语音服务还活着,锁住 `data/qdrant/` 目录 | **关掉语音服务再跑 CLI**;CLI 有兜底:截断 `storage.sqlite` 让下次启动自动重头初始化 |
 | `Qdrant dimension mismatch` | `.env` 里 `vector_size` 跟老 collection 不一致 | 看 §4 "改向量维度" 走 `clear-all --include-task-index` 重头 |
+| 说话没反应 / 一直等 | VAD 阈值太低,把静音当语音 | 调高 `SMARTBUTLER_VOICE_VAD_THRESHOLD`(别低于 0.01) |
+| 回复很碎 / 一次说半句 | 静默超时太短 | 调大 `SMARTBUTLER_VOICE_SILENCE_TIMEOUT_MS` |
+| 管家说话不像"英国贵族管家" | Personality 没注入 orchestrator | 已修(2026-11-09)。看启动日志有没有 `personality.loaded name=杰贝兹`,见 §2.5 |
 
 ---
 
@@ -111,7 +113,7 @@ python -m smartbutler.scripts.memory_cli vacuum --dry-run
 
 **入口**:`python -m smartbutler.scripts.memory_cli <cmd>`
 
-**前置**:dev_chat 可以**同时**跑(只读不锁),但写操作(vacuum / purge / clear-all)要**先关 dev_chat**。
+**前置**:语音服务可以**同时**跑(只读不锁),但写操作(vacuum / purge / clear-all)要**先关语音服务**。
 
 ### 2.1 长期记忆(Qdrant)
 
@@ -119,10 +121,10 @@ python -m smartbutler.scripts.memory_cli vacuum --dry-run
 |--------|------|---------|
 | `dump` | **全量翻页看库里到底存了什么** | `python -m smartbutler.scripts.memory_cli dump --all` |
 | `dump` | 只看某个 level | `python -m smartbutler.scripts.memory_cli dump --level daily --all` |
-| `dump` | 按 tag 过滤 | `python -m smartbutler.scripts.memory_cli dump --tag "user:u-male" --all` |
+| `dump` | 按 tag 过滤 | `python -m smartbutler.scripts.memory_cli dump --tag "user:gaotianyu" --all` |
 | `dump-fields` | payload 字段分布体检(level / tag / importance 分布) | `python -m smartbutler.scripts.memory_cli dump-fields` |
 | `recall <query>` | 语义检索(facade.recall 包装) | `python -m smartbutler.scripts.memory_cli recall "宠物" --k 5` |
-| `recall` | 按 source 过滤 | `python -m smartbutler.scripts.memory_cli recall "宠物" --source u-male` |
+| `recall` | 按 source 过滤 | `python -m smartbutler.scripts.memory_cli recall "宠物" --source gaotianyu` |
 | `recall` | 调相似度门槛(默认 0.55) | `python -m smartbutler.scripts.memory_cli recall "宠物" --min-score 0.3` |
 | `list-deleted` | 列出软删除的事实 | `python -m smartbutler.scripts.memory_cli list-deleted --limit 20` |
 | `list-deleted --by-age` | 按软删除时长分桶 | `python -m smartbutler.scripts.memory_cli list-deleted --by-age` |
@@ -136,14 +138,14 @@ python -m smartbutler.scripts.memory_cli vacuum --dry-run
 | `stm-threads` | 列所有 thread + checkpoint 数 | `python -m smartbutler.scripts.memory_cli stm-threads` |
 | `stm-threads --detail` | 加上 checkpoint_id 范围 | `python -m smartbutler.scripts.memory_cli stm-threads --detail` |
 | `stm-dump` | 全量翻对话消息流(按 checkpoint) | `python -m smartbutler.scripts.memory_cli stm-dump --limit 5` |
-| `stm-dump` | 只看某个 thread | `python -m smartbutler.scripts.memory_cli stm-dump --thread dev-u-test-1` |
+| `stm-dump` | 只看某个 thread | `python -m smartbutler.scripts.memory_cli stm-dump --thread <thread_id>` |
 | `stm-dump -v` | 加上 state 字段名 | `python -m smartbutler.scripts.memory_cli stm-dump -v --limit 3` |
 | `stm-stats` | 短期库容量体检 | `python -m smartbutler.scripts.memory_cli stm-stats` |
 | `st-raw <prefix>` | 打印某个 checkpoint 的原始 state JSON(深排查) | `python -m smartbutler.scripts.memory_cli st-raw 0c12345 -v` |
 
 ### 2.3 记忆图(Phase 9 人物关系图,`data/memory/graph.db`)
 
-> 图是独立子系统,读图不锁 dev_chat。
+> 图是独立子系统,读图不锁语音服务。
 
 | 子命令 | 作用 | 典型命令 |
 |--------|------|---------|
@@ -152,7 +154,6 @@ python -m smartbutler.scripts.memory_cli vacuum --dry-run
 | `graph-dump --all` | 连已失效的边一起显示 | `python -m smartbutler.scripts.memory_cli graph-dump --all` |
 
 ### 2.4 记忆图的开关(`.env`)
-
 图默认**关闭**(`graph_enabled=False`)。开启方式:
 
 ```bash
@@ -170,12 +171,50 @@ SMARTBUTLER_MEMORY_GRAPH_ENABLED=true
 
 开启后建议先观察日志里的 `graph_extract.summary` / `graph_writer.written` 两行,确认 LLM 抽边质量。
 
+### 2.5 Personality(管家形象/人设)
+
+人设配置文件 = 仓库根的 **`personality.md`**(YAML frontmatter,body 是自由注释)。
+
+默认人设是 **杰贝兹(Jeeves)** —— 英国伍斯特郡管家世家出身的资深总管家。
+
+**加载顺序**(找到即停):
+
+1. `<cwd>/personality.md`
+2. `~/.smartbutler/personality.md`
+3. 都找不到 → 用内存默认值(也是杰贝兹)
+
+**怎么改**:直接编辑 `personality.md` 的 YAML 部分:
+
+| 字段 | 含义 |
+|------|------|
+| `name` | 管家称呼(如"杰贝兹") |
+| `identity` | 人设文本,回答"我是谁",注入 system prompt 最前方(推荐 2-5 句) |
+| `formality` | 0=口语化,1=正式用敬语(默认 0.85) |
+| `humor` | 0=严肃,1=爱开玩笑(默认 0.30) |
+| `verbosity` | 0=一句话答完,1=长篇大论(默认 0.55) |
+| `warmth` | 0=公事公办,1=热情体贴(默认 0.75) |
+| `proactiveness` | 0=只答所问,1=主动建议(默认 0.65) |
+| `guidelines` | 行为准则列表(独立于 trait) |
+
+**怎么确认人设生效**:
+
+```bash
+# 看启动日志有没有这一行(personality.loaded)
+python -m smartbutler.scripts.voice_service --no-fake 2>&1 | Select-String "personality"
+```
+
+应输出类似 `personality.loaded name=杰贝兹 traits=formality,humor,...`。
+
+> ⚠️ **已修的坑(2026-11-09)**:之前入口脚本构造 orchestrator 时没传 `personality`,
+> 导致 `personality_block` 为空、回落内置的通用人设("你是 SmartButler 管家…"),
+> **用户配的人设完全不生效**。现在统一走 `emotion/personality/bootstrap.py::build_orchestrator`。
+
 ---
 
-## 3. memory_cli — 清理 / 升格(写操作,需先关 dev_chat)
+## 3. memory_cli — 清理 / 升格(写操作,需先关语音服务)
 
 > ⚠️ **所有写操作前必做**:
-> 1. **关掉 dev_chat**(否则 Qdrant 锁冲突,CLI 走文件级兜底,可能丢点)
+> 1. **关掉语音服务**(否则 Qdrant 锁冲突,CLI 走文件级兜底,可能丢点)
 > 2. **先跑 `--dry-run`**(默认就是 dry-run,但显式写出来更稳)
 > 3. **加 `--confirm yes`**(必须,否则直接 exit 2)
 
@@ -217,7 +256,7 @@ python -m smartbutler.scripts.memory_cli vacuum --no-dry-run
 
 ```bash
 # 单条:立即物理删某条(必须 --confirm yes)
-python -m smartbutler.scripts.memory_cli purge --key "mem:u-male:abc123" --confirm yes
+python -m smartbutler.scripts.memory_cli purge --key "mem:gaotianyu:abc123" --confirm yes
 
 # 批量按软删除时长:Qdrant 主体里 deleted > N 天的全清(N 必须 >= 7)
 python -m smartbutler.scripts.memory_cli purge-before --older-than-days 30 --dry-run
@@ -287,8 +326,11 @@ python -m smartbutler.scripts.memory_cli graph-clear --confirm yes --no-dry-run
 `vector_size` 跟老 collection 不一致时,只能**删 collection 重建**(Qdrant 不支持改维度)。
 
 ```bash
-# 1) 关掉 dev_chat
+# 1) 关掉语音服务
 # 2) 备份(可选)
+#    PowerShell:
+Copy-Item -Recurse data\qdrant data\qdrant.bak.20261014
+#    cmd:
 copy data\qdrant data\qdrant.bak.20261014
 
 # 3) clear-all(连同 short_term.db / archive.db 一起清)
@@ -297,8 +339,8 @@ python -m smartbutler.scripts.memory_cli clear-all --confirm yes --yes-i-know-th
 # 4) 改 .env 的 vector_size
 #    SMARTBUTLER_STORAGE_QDRANT_VECTOR_SIZE=1024  ->  768
 
-# 5) 启动 dev_chat,会按新 vector_size 重建 collection
-python -m scripts.dev_chat
+# 5) 启动语音服务,会按新 vector_size 重建 collection
+python -m smartbutler.scripts.voice_service --no-fake
 ```
 
 ---
@@ -308,7 +350,7 @@ python -m scripts.dev_chat
 ### 5.1 召回问题(命不中 / 命太多 / 命错 source)
 
 ```bash
-# 1) 直接用 recall 复现(绕开 dev_chat,排除前端干扰)
+# 1) 直接用 recall 复现(绕开语音服务,排除前端干扰)
 python -m smartbutler.scripts.memory_cli recall "原 query" --k 10
 
 # 2) 调 min-score 看是不是门槛把"正确但弱相关"的也挡了
@@ -318,7 +360,7 @@ python -m smartbutler.scripts.memory_cli recall "原 query" --k 10 --min-score 0
 python -m smartbutler.scripts.memory_cli dump --all --width 300
 
 # 4) 按 source 拆开看
-python -m smartbutler.scripts.memory_cli dump --tag "source:u-male" --all
+python -m smartbutler.scripts.memory_cli dump --tag "source:gaotianyu" --all
 ```
 
 ### 5.2 软删 / 恢复(被自动 TTL / conflict 删了)
@@ -341,12 +383,13 @@ python -m smartbutler.scripts.memory_cli list-deleted --limit 50
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                     dev_chat 启动                              │
+│                   voice_service 启动                        │
 ├──────────────────────────────────────────────────────────────┤
-│ 基础      python -m scripts.dev_chat                          │
-│ 带 user   python -m scripts.dev_chat --user u1 --session s1   │
-│ 走 LLM    python -m scripts.dev_chat --live --user u1         │
-│ 关 memory python -m scripts.dev_chat --no-memory              │
+│ 真硬件   python -m smartbutler.scripts.voice_service         │
+│              --no-fake                                       │
+│ Fake     python -m smartbutler.scripts.voice_service         │
+│ 查设备   python -m smartbutler.scripts.voice_service         │
+│              --list-devices                                  │
 ├──────────────────────────────────────────────────────────────┤
 │                     memory_cli 只读                            │
 ├──────────────────────────────────────────────────────────────┤
@@ -360,7 +403,7 @@ python -m smartbutler.scripts.memory_cli list-deleted --limit 50
 │ 看记忆图  python -m smartbutler.scripts.memory_cli graph-stats │
 │ 翻关系边  python -m smartbutler.scripts.memory_cli graph-dump  │
 ├──────────────────────────────────────────────────────────────┤
-│                     memory_cli 写操作(先关 dev_chat)         │
+│                   memory_cli 写操作(先关语音服务)             │
 ├──────────────────────────────────────────────────────────────┤
 │ 升格日报  python -m smartbutler.scripts.memory_cli consolidate │
 │ vacuum   python -m smartbutler.scripts.memory_cli vacuum      │
@@ -379,16 +422,17 @@ python -m smartbutler.scripts.memory_cli list-deleted --limit 50
 
 | 坑 | 原因 | 规避 |
 |---|------|------|
-| 写操作报 `another instance` | dev_chat 锁着 `data/qdrant` | **先关 dev_chat** |
-| `dump` 看到旧数据,以为 `clear-all` 没生效 | 嵌入式 Qdrant 删 collection 只清内存,`storage.sqlite` 残留 | 7.4 已加物理兜底:truncate `storage.sqlite` + 删 `.lock` / `meta.json`;**关掉 dev_chat** 走完 |
+| 写操作报 `another instance` | 语音服务锁着 `data/qdrant` | **先关语音服务** |
+| `dump` 看到旧数据,以为 `clear-all` 没生效 | 嵌入式 Qdrant 删 collection 只清内存,`storage.sqlite` 残留 | 7.4 已加物理兜底:truncate `storage.sqlite` + 删 `.lock` / `meta.json`;**关掉语音服务** 走完 |
 | `recall` 啥都召回不出来 | `min-score=0.55` 把弱相关全挡了 | 加 `--min-score 0.0` 看真基线 |
-| 7.4 `_repl() missing 'task_scheduler'` | dev_chat 测试用例没跟 6.5 同步 | 不在 7.4 范围,用最新 dev_chat.py 即可 |
-| `--live` 模式不响应 | `.env` 没配 `SMARTBUTLER_LLM_*` | 配 `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` |
+| 语音服务不响应 / 一直等 | `.env` 没配 `SMARTBUTLER_LLM_*` | 配 `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` |
+| 说话没反应、回复很碎 | VAD 阈值太低(把静音当语音)/ 静默超时太短 | 调 `SMARTBUTLER_VOICE_VAD_THRESHOLD`(≥0.01)、`SMARTBUTLER_VOICE_SILENCE_TIMEOUT_MS` |
 | 短期库 stm-dump 显示"0 含 messages 的 checkpoint" | 反序列化失败(LangChain 对象 vs dict 判错) | 7.4 已修(走 `model_dump()` 降级);如仍 0,试 `--all-checkpoints` |
 | 改了 `vector_size` 后报 dimension mismatch | Qdrant collection 不能改维度 | 走 §4 "改向量维度" 重建 |
 | `clear-all` 跑完图还在 | 图是**独立子系统**(`data/memory/graph.db`),默认不动 | 加 `--include-graph`,或用 `graph-clear` 只清图 |
 | `graph-clear` 后管家认不出人了 | 清图连**声纹绑定**(`user_id`)一起丢 | 声纹库没坏;重新采集声纹 → `resolve_person` 会重新绑定 |
 | 找不到图库 / 图库路径对不上 | 相对路径基准是运行时数据目录 `data/memory/` | 用 `graph-stats` 看 CLI 解析出的实际路径;配置见 §3.5 |
+| **管家说话不像"英国贵族管家"** | Personality **没注入** orchestrator → 回落内置通用人设 | 已修(`bootstrap.build_orchestrator`)。自查:启动日志应出现 `personality.loaded name=杰贝兹`;见 §2.5 |
 
 ---
 
@@ -397,7 +441,8 @@ python -m smartbutler.scripts.memory_cli list-deleted --limit 50
 - **架构 / 设计**:`docs/PHASE_6.2-6.5_TECHNICAL_DESIGN.md` §2.5.1(含 §2.5.1.16 vacuum 治理)
 - **记忆图设计**:`docs/PHASE_9_GRAPH_MEMORY_DESIGN.md`(§6 存储 / §8 声纹绑定 / §15 运维清理)
 - **记忆图路线图**:`docs/PHASE_9_GRAPH_MEMORY_ROADMAP.md`
-- **CLI 源码**:`smartbutler/scripts/memory_cli.py`(顶部 docstring 列出 7+5+2 个子命令)
+- **CLI 源码**:`smartbutler/scripts/memory_cli.py`(顶部 docstring 列出所有子命令)
+- **语音服务源码**:`smartbutler/scripts/voice_service.py`(顶部 docstring 有架构图 + 启动方式)
+- **人设配置**:`personality.md`(仓库根,YAML frontmatter)
 - **7.4 实施**:`docs/PHASE_7_TECHNICAL_DESIGN.md` §3 + §12.6
-- **dev_chat 源码**:`scripts/dev_chat.py`(顶部 docstring 列出所有启动方式 + REPL 命令)
 - **变更历史**:`README.md` §10 变更记录

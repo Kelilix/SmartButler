@@ -36,8 +36,8 @@ from smartbutler.emotion.memory.auto_extract import AutoExtractHook
 from smartbutler.emotion.memory.consolidation import Consolidator
 from smartbutler.emotion.memory.facade import MemoryFacade
 from smartbutler.emotion.memory.forgetting import ForgettingService
-from smartbutler.emotion.memory.hooks import MemoryHooks
 from smartbutler.emotion.memory.graph.paths import resolve_graph_db_path
+from smartbutler.emotion.memory.hooks import MemoryHooks
 from smartbutler.emotion.memory.long_term import create_long_term_store
 from smartbutler.emotion.memory.retrieval import MemoryRetriever
 from smartbutler.emotion.memory.short_term import ShortTermMemory
@@ -172,10 +172,15 @@ async def build_memory_system(
     warnings: list[str] = []
 
     # ---- 数据目录 ----
+    #
+    # ⚠️ 路径必须走 ``paths.default_data_dir``(单一事实来源)。
+    # 2026-11-09 事故:CLI 默认用 ``data/short_term.db``,运行时用
+    # ``data/memory/short_term.db``,用户执行"全清理"清的是空壳库,
+    # 真实数据纹丝不动 → 旧对话重启后又被注入 prompt。
     if data_dir is None:
-        from smartbutler.config.base import PROJECT_ROOT
+        from smartbutler.emotion.memory.paths import default_data_dir
 
-        data_dir = PROJECT_ROOT / "data" / "memory"
+        data_dir = default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Embedder(向量化)----

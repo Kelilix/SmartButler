@@ -243,9 +243,10 @@ class MemorySettings(SmartButlerBaseSettings, BaseSettings):
     #
     # ⚠️ 相对路径的基准是**运行时数据目录**(``data/memory/``)。
     #   - "graph.db"      → data/memory/graph.db        (推荐)
-    #   - "data/graph.db" → <项目根>/data/graph.db       (兼容写法)
+    #   - "data/graph.db" → data/memory/graph.db        (兼容写法,会自动重定向)
     #   - 绝对路径        → 原样使用
-    # 解析逻辑见 smartbutler/emotion/memory/graph/paths.py
+    # 解析逻辑见 smartbutler/emotion/memory/paths.py
+    # (graph/paths.py 是它的薄转发层,规则完全一致)
     graph_db_path: str = Field(
         default="graph.db",
         description="记忆图 SQLite 文件路径(相对路径基准=运行时数据目录)",

@@ -213,15 +213,26 @@ async def test_graph_path_under_data_dir(tmp_path: Path) -> None:
 async def test_graph_path_data_prefix_under_project_root(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """``"data/xxx.db"`` 写法 → 落在 **项目根/data/xxx.db**(不是 data_dir)。"""
+    """``"data/xxx.db"`` 写法 → 重定向到 **data/memory/xxx.db**。
+
+    🆕 2026-11-09:语义变更。
+
+    旧行为:``"data/graph.db"`` → ``<root>/data/graph.db``(项目根下的 data/)。
+    但**运行时实际用的是** ``<root>/data/memory/graph.db`` ——
+    两者不是同一个文件,CLI 与运行时又一次分叉(同类事故,见
+    ``smartbutler/emotion/memory/paths.py`` 顶部说明)。
+
+    新行为:``data/`` 前缀的 ``.db`` 文件统一重定向到 ``data/memory/``,
+    与短期记忆 / task 索引 / 归档库保持同一套规则。
+    """
     from smartbutler.emotion.memory.graph.paths import resolve_graph_db_path
 
     root = tmp_path / "proj"
     data_dir = root / "data" / "memory"
-    # "data/graph.db" → <root>/data/graph.db
+    # "data/graph.db" → <root>/data/memory/graph.db(重定向,与运行时一致)
     assert resolve_graph_db_path(
         "data/graph.db", data_dir=data_dir, project_root=root
-    ) == (root / "data" / "graph.db")
+    ) == (data_dir / "graph.db")
     # "graph.db" → data_dir/graph.db
     assert resolve_graph_db_path(
         "graph.db", data_dir=data_dir, project_root=root

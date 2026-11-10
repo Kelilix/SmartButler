@@ -1,4 +1,4 @@
-"""🆕 Phase 9:记忆图 SQLite 路径解析(单一事实来源)。
+"""🆕 Phase 9:记忆图 SQLite 路径解析(薄转发层)。
 
 ⚠️ 为什么要单独抽一个模块:
 
@@ -9,10 +9,11 @@
 
 现在两处都走 :func:`resolve_graph_db_path`,不会再分叉。
 
-路径解析规则(按优先级):
+路径解析规则已统一到 :mod:`smartbutler.emotion.memory.paths`
+(短期记忆 / task 索引 / 归档库 / 记忆图共用同一套规则):
+
 1. 绝对路径 → 原样使用
-2. 相对路径且**首段就是 ``data``** → 相对 ``PROJECT_ROOT``
-   (兼容 ``data/graph.db`` 这种写法)
+2. 相对路径且首段是 ``data`` 且是 ``.db`` 文件 → 重定向到 ``data/memory/``
 3. 其余相对路径 → 相对 ``data_dir``(运行时默认 ``PROJECT_ROOT/data/memory``)
 """
 
@@ -20,8 +21,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# 运行时数据目录(与 wiring.py 的默认 data_dir 一致)
-DEFAULT_DATA_DIR_NAME = "memory"
+from smartbutler.emotion.memory.paths import (
+    DEFAULT_DATA_DIR_NAME,
+    default_data_dir,
+    resolve_data_path,
+)
 
 
 def resolve_graph_db_path(
@@ -46,22 +50,17 @@ def resolve_graph_db_path(
         project_root = PROJECT_ROOT
 
     if data_dir is None:
-        data_dir = project_root / "data" / DEFAULT_DATA_DIR_NAME
+        data_dir = default_data_dir(project_root)
 
     raw_str = str(raw).strip() if raw else ""
     if not raw_str:
         raw_str = "graph.db"
 
-    path = Path(raw_str)
-    if path.is_absolute():
-        return path
-
-    # 首段是 "data" → 相对项目根(兼容 "data/graph.db" 写法)
-    parts = path.parts
-    if parts and parts[0] == "data":
-        return project_root / path
-
-    return data_dir / path
+    # 复用通用解析(与短期记忆 / task 索引 / 归档库同一套规则):
+    #   - 绝对路径 → 原样
+    #   - data/xxx.db → 重定向到 data/memory/xxx.db
+    #   - 其他相对路径 → data_dir / raw
+    return resolve_data_path(raw_str, data_dir=data_dir, project_root=project_root)
 
 
 __all__ = ["resolve_graph_db_path", "DEFAULT_DATA_DIR_NAME"]
